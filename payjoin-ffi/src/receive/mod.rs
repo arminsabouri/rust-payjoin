@@ -266,6 +266,7 @@ impl UninitializedReceiver {
         ohttp_keys: Arc<OhttpKeys>,
         expire_after: Option<u64>,
         amount: Option<u64>,
+        max_fee_rate_sat_per_vb: Option<u64>,
     ) -> InitialReceiveTransition {
         InitialReceiveTransition(Arc::new(RwLock::new(Some(
             payjoin::receive::v2::Receiver::create_session(
@@ -274,6 +275,7 @@ impl UninitializedReceiver {
                 (*ohttp_keys).clone().into(),
                 expire_after.map(Duration::from_secs),
                 amount.map(payjoin::bitcoin::Amount::from_sat),
+                max_fee_rate_sat_per_vb.and_then(FeeRate::from_sat_per_vb),
             ),
         ))))
     }
@@ -871,10 +873,13 @@ impl WantsFeeRange {
         min_fee_rate_sat_per_vb: Option<u64>,
         max_effective_fee_rate_sat_per_vb: Option<u64>,
     ) -> WantsFeeRangeTransition {
-        WantsFeeRangeTransition(Arc::new(RwLock::new(Some(self.0.clone().apply_fee_range(
-            min_fee_rate_sat_per_vb.and_then(FeeRate::from_sat_per_vb),
-            max_effective_fee_rate_sat_per_vb.and_then(FeeRate::from_sat_per_vb),
-        )))))
+        let min_fee_rate = min_fee_rate_sat_per_vb.and_then(FeeRate::from_sat_per_vb);
+        let max_effective_fee_rate =
+            max_effective_fee_rate_sat_per_vb.and_then(FeeRate::from_sat_per_vb);
+
+        WantsFeeRangeTransition(Arc::new(RwLock::new(Some(
+            self.0.clone().apply_fee_range(min_fee_rate, max_effective_fee_rate),
+        ))))
     }
 }
 

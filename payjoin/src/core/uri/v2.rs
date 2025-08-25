@@ -137,6 +137,8 @@ impl PjParam {
 
     pub fn expiration(&self) -> std::time::SystemTime { self.expiration }
 
+    pub fn short_id(&self) -> &ShortId { &self.id }
+
     pub fn endpoint(&self) -> Url {
         let mut endpoint = self.directory.clone().join(&self.id.to_string()).unwrap();
         set_receiver_pubkey(&mut endpoint, &self.receiver_pubkey);

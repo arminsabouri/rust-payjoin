@@ -24,14 +24,21 @@
 //! Note: Even fresh requests may be linkable via metadata (e.g. client IP, request timing),
 //! but request reuse makes correlation trivial for the relay.
 
+use std::borrow::Cow;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 
 use bitcoin::hashes::{sha256, Hash};
+use bitcoin::hex::DisplayHex;
 use bitcoin::psbt::Psbt;
 use bitcoin::{Address, Amount, FeeRate, OutPoint, Script, TxOut};
 pub(crate) use error::InternalSessionError;
 pub use error::SessionError;
+use nostr::event::{Event, EventBuilder, Kind, Tag};
+use nostr::filter::{Filter, SingleLetterTag};
+use nostr::key::Keys;
+use nostr::message::{ClientMessage, SubscriptionId};
+use nostr::util::JsonUtil;
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use session::InternalReplayError;
@@ -295,6 +302,16 @@ pub struct Initialized {
 impl State for Initialized {}
 
 impl Receiver<Initialized> {
+    pub fn create_nostr_wrapped_poll_request(
+        &mut self,
+        ohttp_relay: impl IntoUrl,
+    ) -> Result<(Request, ohttp::ClientResponse), Error> {
+        let (body, ohttp_ctx) =
+            self.nostr_wrapped_req_body().map_err(InternalSessionError::OhttpEncapsulation)?;
+        let req = Request::new_v2(&self.context.full_relay_url(ohttp_relay)?, &body);
+        Ok((req, ohttp_ctx))
+    }
+
     /// construct an OHTTP Encapsulated HTTP GET request for the Original PSBT
     pub fn create_poll_request(
         &mut self,
@@ -307,6 +324,44 @@ impl Receiver<Initialized> {
             self.fallback_req_body().map_err(InternalSessionError::OhttpEncapsulation)?;
         let req = Request::new_v2(&self.context.full_relay_url(ohttp_relay)?, &body);
         Ok((req, ohttp_ctx))
+    }
+
+    pub fn process_nostr_wrapped_response(
+        &mut self,
+        body: &[u8],
+        context: ohttp::ClientResponse,
+    ) -> MaybeFatalTransitionWithNoResults<
+        SessionEvent,
+        Receiver<UncheckedProposal>,
+        Receiver<Initialized>,
+        Error,
+    > {
+        let response = process_get_res(body, context).unwrap();
+        if let Some(decapsulated) = response {
+            let str_res = String::from_utf8(decapsulated).unwrap();
+            let events = str_res
+                .split("\n")
+                .map(|s| Event::from_json(s))
+                .filter_map(Result::ok)
+                .collect::<Vec<Event>>();
+            if events.is_empty() {
+                return MaybeFatalTransitionWithNoResults::no_results(self.clone());
+            }
+            // TODO: just taking the first event here assuming ephemenral keys
+            let event = events.first().unwrap().content.as_bytes();
+            let original = self.extract_proposal_from_v2(event.to_vec()).unwrap();
+            MaybeFatalTransitionWithNoResults::success(
+                SessionEvent::UncheckedProposal((original.clone(), self.context.e.clone())),
+                Receiver {
+                    state: UncheckedProposal {
+                        original: original,
+                        session_context: self.state.context.clone(),
+                    },
+                },
+            )
+        } else {
+            MaybeFatalTransitionWithNoResults::no_results(self.clone())
+        }
     }
 
     /// The response can either be an UncheckedProposal or an ACCEPTED message
@@ -373,6 +428,32 @@ impl Receiver<Initialized> {
     > {
         let fallback_target = mailbox_endpoint(&self.context.directory, &self.context.id());
         ohttp_encapsulate(&mut self.context.ohttp_keys, "GET", fallback_target.as_str(), None)
+    }
+
+    fn nostr_wrapped_req_body(
+        &mut self,
+    ) -> Result<
+        ([u8; crate::directory::ENCAPSULATED_MESSAGE_BYTES], ohttp::ClientResponse),
+        OhttpEncapsulationError,
+    > {
+        let filter = Filter::new()
+            .kind(Kind::TextNote)
+            .custom_tag(SingleLetterTag::from_str("h").unwrap(), self.context.id().to_string());
+        let subscription_id = SubscriptionId::generate();
+
+        let client_message = ClientMessage::Req {
+            subscription_id: Cow::Borrowed(&subscription_id),
+            filter: Cow::Borrowed(&filter),
+        }
+        .as_json();
+
+        let target_resource = self.context.directory.clone();
+        ohttp_encapsulate(
+            &mut self.context.ohttp_keys,
+            "GET",
+            target_resource.as_str(),
+            Some(&client_message.as_bytes()),
+        )
     }
 
     fn extract_proposal_from_v1(&mut self, response: &str) -> Result<Original, ReplyableError> {
@@ -992,6 +1073,43 @@ impl Receiver<PayjoinProposal> {
     /// The Payjoin Proposal PSBT.
     pub fn psbt(&self) -> &Psbt { &self.psbt }
 
+    pub async fn create_nostr_wrapped_post_request(
+        &mut self,
+        ohttp_relay: impl IntoUrl,
+    ) -> Result<(Request, ohttp::ClientResponse), Error> {
+        let target_resource = self.session_context.directory.clone();
+        let method: &str = "POST";
+        let reply_key = self.session_context.e.clone().expect("expecint ghtis to exist");
+        let sender_mailbox = short_id_from_pubkey(self.session_context.s.public_key());
+        let ephemeral_key = Keys::generate();
+        let tag = Tag::parse(vec!["h".to_string(), sender_mailbox.to_string()]).unwrap();
+
+        let payjoin_bytes = self.psbt.serialize();
+        let encrypted_message =
+            encrypt_message_b(payjoin_bytes, &self.session_context.s, &reply_key)?;
+
+        let event =
+            EventBuilder::text_note(encrypted_message.to_hex_string(bitcoin::hex::Case::Lower))
+                .tag(tag)
+                .sign(&ephemeral_key)
+                .await
+                .unwrap();
+        let client_message = ClientMessage::Event(Cow::Borrowed(&event)).as_json();
+        let (body, ctx) = ohttp_encapsulate(
+            &mut self.session_context.ohttp_keys,
+            method,
+            target_resource.as_str(),
+            Some(&client_message.as_bytes()),
+        )?;
+
+        let request = Request::new_nostr_wrapped_v2(
+            &self.session_context.full_relay_url(ohttp_relay)?,
+            &body,
+        );
+
+        Ok((request, ctx))
+    }
+
     /// Construct an OHTTP Encapsulated HTTP POST request for the Proposal PSBT
     pub fn create_post_request(
         &mut self,
@@ -1053,6 +1171,15 @@ impl Receiver<PayjoinProposal> {
             Ok(_) => MaybeSuccessTransition::success(()),
             Err(e) => MaybeSuccessTransition::transient(e),
         }
+    }
+
+    pub fn process_nostr_wrapped_response(
+        &mut self,
+        body: &[u8],
+        context: ohttp::ClientResponse,
+    ) -> MaybeSuccessTransition<(), Error> {
+        // Just treat as a success for now
+        MaybeSuccessTransition::success(())
     }
 }
 

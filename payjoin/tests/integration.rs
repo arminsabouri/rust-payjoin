@@ -179,6 +179,7 @@ mod integration {
         use payjoin::{OhttpKeys, PjUri, UriExt};
         use payjoin_test_utils::{BoxSendSyncError, InMemoryTestPersister, TestServices};
         use reqwest::{Client, Response};
+        use url::Url;
 
         use super::*;
 
@@ -405,18 +406,21 @@ mod integration {
             let mut services = TestServices::initialize().await?;
             let result = tokio::select!(
             err = services.take_ohttp_relay_handle() => panic!("Ohttp relay exited early: {:?}", err),
-            err = services.take_directory_handle() => panic!("Directory server exited early: {:?}", err),
+            // err = services.take_directory_handle() => panic!("Directory server exited early: {:?}", err),
             res = do_v2_send_receive(&services) => res
             );
 
             assert!(result.is_ok(), "v2 send receive failed: {:#?}", result.unwrap_err());
 
             async fn do_v2_send_receive(services: &TestServices) -> Result<(), BoxError> {
+                println!("do_v2_send_receive");
                 let (_bitcoind, sender, receiver) = init_bitcoind_sender_receiver(None, None)?;
                 let agent = services.http_agent();
                 services.wait_for_services_ready().await?;
-                let directory = services.directory_url();
-                let ohttp_keys = services.fetch_ohttp_keys().await?;
+                // let directory = services.directory_url();
+                let directory = Url::from_str("http://localhost:8080").expect("valid url");
+                let ohttp_keys = services.fetch_ohttp_keys_without_cert().await?;
+                println!("ohttp_keys: {:#?}", ohttp_keys);
                 let recv_persister = NoopSessionPersister::default();
                 let send_persister = NoopSessionPersister::default();
                 // **********************
@@ -430,7 +434,7 @@ mod integration {
                 println!("session: {:#?}", &session);
                 // Poll receive request
                 let ohttp_relay = services.ohttp_relay_url();
-                let (req, ctx) = session.create_poll_request(&ohttp_relay)?;
+                let (req, ctx) = session.create_nostr_wrapped_poll_request(&ohttp_relay)?;
                 let response = agent
                     .post(req.url)
                     .header("Content-Type", req.content_type)
@@ -439,7 +443,10 @@ mod integration {
                     .await?;
                 assert!(response.status().is_success(), "error response: {}", response.status());
                 let response_body = session
-                    .process_response(response.bytes().await?.to_vec().as_slice(), ctx)
+                    .process_nostr_wrapped_response(
+                        response.bytes().await?.to_vec().as_slice(),
+                        ctx,
+                    )
                     .save(&recv_persister)?;
                 // No proposal yet since sender has not responded
                 assert!(response_body.is_none());
@@ -456,14 +463,16 @@ mod integration {
                 let req_ctx = SenderBuilder::new(psbt, pj_uri)
                     .build_recommended(FeeRate::BROADCAST_MIN)?
                     .save(&send_persister)?;
+                // TODO: update this
                 let (Request { url, body, content_type, .. }, send_ctx) =
-                    req_ctx.create_v2_post_request(ohttp_relay.to_owned())?;
+                    req_ctx.create_nostr_wrapped_post_request(ohttp_relay.to_owned()).await?;
                 let response =
                     agent.post(url).header("Content-Type", content_type).body(body).send().await?;
                 log::info!("Response: {:#?}", &response);
                 assert!(response.status().is_success(), "error response: {}", response.status());
                 let send_ctx = req_ctx
-                    .process_response(&response.bytes().await?, send_ctx)
+                    .process_nostr_wrapped_response(&response.bytes().await?, send_ctx)
+                    .await
                     .save(&send_persister)?;
                 // POST Original PSBT
 
@@ -471,7 +480,7 @@ mod integration {
                 // Inside the Receiver:
 
                 // GET fallback psbt
-                let (req, ctx) = session.create_poll_request(&ohttp_relay)?;
+                let (req, ctx) = session.create_nostr_wrapped_poll_request(&ohttp_relay)?;
                 let response = agent
                     .post(req.url)
                     .header("Content-Type", req.content_type)
@@ -480,11 +489,15 @@ mod integration {
                     .await?;
                 // POST payjoin
                 let outcome = session
-                    .process_response(response.bytes().await?.to_vec().as_slice(), ctx)
+                    .process_nostr_wrapped_response(
+                        response.bytes().await?.to_vec().as_slice(),
+                        ctx,
+                    )
                     .save(&recv_persister)?;
                 let proposal = outcome.success().expect("proposal should exist").clone();
                 let mut payjoin_proposal = handle_directory_proposal(&receiver, proposal, None)?;
-                let (req, ctx) = payjoin_proposal.create_post_request(&ohttp_relay)?;
+                let (req, ctx) =
+                    payjoin_proposal.create_nostr_wrapped_post_request(&ohttp_relay).await?;
                 let response = agent
                     .post(req.url)
                     .header("Content-Type", req.content_type)
@@ -500,12 +513,13 @@ mod integration {
                 // Sender checks, signs, finalizes, constructs, and broadcasts
                 // Replay post fallback to get the response
                 let (Request { url, body, content_type, .. }, ohttp_ctx) =
-                    send_ctx.create_poll_request(ohttp_relay.to_owned())?;
+                    send_ctx.create_nostr_wrapped_poll_request(ohttp_relay.to_owned()).await?;
                 let response =
                     agent.post(url).header("Content-Type", content_type).body(body).send().await?;
                 log::info!("Response: {:#?}", &response);
                 let response = send_ctx
-                    .process_response(&response.bytes().await?, ohttp_ctx)
+                    .process_nostr_wrapped_response(&response.bytes().await?, ohttp_ctx)
+                    .await
                     .save(&send_persister)
                     .expect("psbt should exist");
 

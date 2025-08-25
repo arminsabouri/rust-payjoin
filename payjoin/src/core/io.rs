@@ -18,9 +18,10 @@ pub async fn fetch_ohttp_keys(
     ohttp_relay: impl IntoUrl,
     payjoin_directory: impl IntoUrl,
 ) -> Result<OhttpKeys, Error> {
-    let ohttp_keys_url = payjoin_directory.into_url()?.join("/.well-known/ohttp-gateway")?;
-    let proxy = Proxy::all(ohttp_relay.into_url()?.as_str())?;
-    let client = Client::builder().proxy(proxy).build()?;
+    let ohttp_keys_url = payjoin_directory.into_url()?.join("/ohttp-keys")?;
+    println!("ohttp_keys_url: {:#?}", ohttp_keys_url);
+    // let proxy = Proxy::all(ohttp_relay.into_url()?.as_str())?;
+    let client = Client::builder().build()?;
     let res = client.get(ohttp_keys_url).header(ACCEPT, "application/ohttp-keys").send().await?;
     parse_ohttp_keys_response(res).await
 }

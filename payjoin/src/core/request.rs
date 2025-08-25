@@ -41,4 +41,8 @@ impl Request {
     ) -> Self {
         Self { url: url.clone(), content_type: V2_REQ_CONTENT_TYPE, body: body.to_vec() }
     }
+
+    pub(crate) fn new_nostr_wrapped_v2(url: &Url, body: &[u8]) -> Self {
+        Self { url: url.clone(), content_type: V2_REQ_CONTENT_TYPE, body: body.to_vec() }
+    }
 }

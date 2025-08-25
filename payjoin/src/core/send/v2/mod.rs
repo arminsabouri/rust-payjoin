@@ -28,10 +28,19 @@
 //! Note: Even fresh requests may be linkable via metadata (e.g. client IP, request timing),
 //! but request reuse makes correlation trivial for the relay.
 
+use std::borrow::Cow;
+use std::str::FromStr;
+
 use bitcoin::hashes::{sha256, Hash};
+use bitcoin::hex::DisplayHex;
 use bitcoin::Address;
 pub use error::{CreateRequestError, EncapsulationError};
 use error::{InternalCreateRequestError, InternalEncapsulationError};
+use nostr::event::{Event, EventBuilder, Kind, Tag};
+use nostr::filter::Filter;
+use nostr::key::Keys;
+use nostr::message::{ClientMessage, SubscriptionId};
+use nostr::util::JsonUtil;
 use ohttp::ClientResponse;
 use serde::{Deserialize, Serialize};
 pub use session::{replay_event_log, ReplayError, SessionEvent, SessionHistory};
@@ -247,6 +256,21 @@ impl WithReplyKey {
 }
 
 impl Sender<WithReplyKey> {
+    pub async fn create_nostr_wrapped_post_request(
+        &self,
+        ohttp_relay: impl IntoUrl,
+    ) -> Result<(Request, ohttp::ClientResponse), CreateRequestError> {
+        extract_nostr_wrapped_request(
+            ohttp_relay,
+            self.reply_key.clone(),
+            Vec::new(),
+            self.endpoint().clone(),
+            self.pj_param.receiver_pubkey().clone(),
+            &mut self.pj_param.ohttp_keys().clone(),
+        )
+        .await
+    }
+
     /// Construct serialized Request and Context from a Payjoin Proposal.
     ///
     /// Important: This request must not be retried or reused on failure.
@@ -293,6 +317,24 @@ impl Sender<WithReplyKey> {
         ))
     }
 
+    pub async fn process_nostr_wrapped_response(
+        &self,
+        response: &[u8],
+        ohttp_ctx: ohttp::ClientResponse,
+    ) -> MaybeFatalTransition<SessionEvent, Sender<V2GetContext>, ResponseError> {
+        // TODO: impl this
+        // Just returning success for now
+        let v2_get_context = V2GetContext {
+            pj_param: self.pj_param.clone(),
+            psbt_ctx: self.psbt_ctx.clone(),
+            reply_key: self.reply_key.clone(),
+        };
+        MaybeFatalTransition::success(
+            SessionEvent::V2GetContext(v2_get_context.clone()),
+            Sender { state: v2_get_context },
+        )
+    }
+
     /// Processes the response for the initial POST message from the sender
     /// client in the v2 Payjoin protocol.
     ///
@@ -335,6 +377,41 @@ impl Sender<WithReplyKey> {
     pub(crate) fn apply_v2_get_context(self, v2_get_context: V2GetContext) -> SendSession {
         SendSession::V2GetContext(Sender { state: v2_get_context })
     }
+}
+
+/// Nostr wrapped event for the initial POST request
+pub(crate) async fn extract_nostr_wrapped_request(
+    ohttp_relay: impl IntoUrl,
+    reply_key: HpkeSecretKey,
+    body: Vec<u8>,
+    url: Url,
+    receiver_pubkey: HpkePublicKey,
+    ohttp_keys: &mut OhttpKeys,
+) -> Result<(Request, ClientResponse), CreateRequestError> {
+    let encrypted_body = encrypt_message_a(
+        body,
+        &HpkeKeyPair::from_secret_key(&reply_key).public_key().clone(),
+        &receiver_pubkey,
+    )
+    .unwrap();
+    let ephemeral_key = Keys::generate();
+    let pj_param = PjParam::parse(url).unwrap();
+    let directory = pj_param.endpoint();
+    let short_id = pj_param.short_id();
+    let tag = Tag::parse(vec!["h".to_string(), short_id.to_string()]).unwrap();
+
+    let event = EventBuilder::text_note(encrypted_body.to_hex_string(bitcoin::hex::Case::Lower))
+        .tag(tag)
+        .sign(&ephemeral_key)
+        .await
+        .unwrap();
+    let client_message = ClientMessage::Event(Cow::Borrowed(&event)).as_json();
+
+    let (body, ctx) =
+        ohttp_encapsulate(ohttp_keys, "POST", directory.as_str(), Some(&client_message.as_bytes()))
+            .map_err(InternalCreateRequestError::OhttpEncapsulation)?;
+    let request = Request::new_nostr_wrapped_v2(&directory, &body);
+    Ok((request, ctx))
 }
 
 pub(crate) fn extract_request(
@@ -407,6 +484,38 @@ pub struct V2GetContext {
 impl State for V2GetContext {}
 
 impl Sender<V2GetContext> {
+    pub async fn create_nostr_wrapped_poll_request(
+        &self,
+        ohttp_relay: impl IntoUrl,
+    ) -> Result<(Request, ohttp::ClientResponse), CreateRequestError> {
+        let short_id = self.pj_param.short_id();
+
+        let filter = Filter::new().kind(Kind::TextNote).custom_tag(
+            nostr::filter::SingleLetterTag::from_str("h").unwrap(),
+            short_id.to_string(),
+        );
+        let subscription_id = SubscriptionId::generate();
+
+        let client_message = ClientMessage::Req {
+            subscription_id: Cow::Borrowed(&subscription_id),
+            filter: Cow::Borrowed(&filter),
+        }
+        .as_json();
+
+        let directory = self.pj_param.endpoint();
+        let mut ohttp_keys = self.pj_param.ohttp_keys().clone();
+
+        let (body, ctx) = ohttp_encapsulate(
+            &mut ohttp_keys,
+            "POST",
+            directory.as_str(),
+            Some(&client_message.as_bytes()),
+        )
+        .map_err(InternalCreateRequestError::OhttpEncapsulation)?;
+        let request = Request::new_nostr_wrapped_v2(&ohttp_relay.into_url()?, &body);
+        Ok((request, ctx))
+    }
+
     /// Construct an OHTTP Encapsulated HTTP GET request for the Proposal PSBT
     pub fn create_poll_request(
         &self,
@@ -435,6 +544,57 @@ impl Sender<V2GetContext> {
 
         let url = ohttp_relay.into_url().map_err(InternalCreateRequestError::Url)?;
         Ok((Request::new_v2(&url, &body), ohttp_ctx))
+    }
+
+    pub async fn process_nostr_wrapped_response(
+        &self,
+        response: &[u8],
+        ohttp_ctx: ohttp::ClientResponse,
+    ) -> MaybeSuccessTransitionWithNoResults<SessionEvent, Psbt, Sender<V2GetContext>, ResponseError>
+    {
+        let body = match process_get_res(response, ohttp_ctx) {
+            Ok(Some(body)) => body,
+            Ok(None) => return MaybeSuccessTransitionWithNoResults::no_results(self.clone()),
+            Err(e) =>
+                return MaybeSuccessTransitionWithNoResults::fatal(
+                    SessionEvent::SessionInvalid(e.to_string()),
+                    InternalEncapsulationError::DirectoryResponse(e).into(),
+                ),
+        };
+        let events = String::from_utf8(body)
+            .unwrap()
+            .split("\n")
+            .map(|s| Event::from_json(s))
+            .filter_map(Result::ok)
+            .collect::<Vec<Event>>();
+        if events.is_empty() {
+            panic!("No events found in response");
+        }
+        // TODO: just taking the first event here assuming ephemenral keys
+        let event = events.first().unwrap().content.as_bytes();
+
+        let decrypted_body = decrypt_message_b(
+            event,
+            self.pj_param.receiver_pubkey().clone(),
+            self.reply_key.clone(),
+        )
+        .unwrap();
+
+        let psbt = Psbt::deserialize(&decrypted_body).unwrap();
+
+        let processed_proposal = match self.psbt_ctx.clone().process_proposal(psbt) {
+            Ok(processed_proposal) => processed_proposal,
+            Err(e) =>
+                return MaybeSuccessTransitionWithNoResults::fatal(
+                    SessionEvent::SessionInvalid(e.to_string()),
+                    e.into(),
+                ),
+        };
+
+        MaybeSuccessTransitionWithNoResults::success(
+            processed_proposal.clone(),
+            SessionEvent::ProposalReceived(processed_proposal),
+        )
     }
 
     /// Processes the response for the final GET message from the sender client

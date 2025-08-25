@@ -70,16 +70,16 @@ impl TestServices {
 
         let redis = init_redis().await;
         let db_host = format!("127.0.0.1:{}", redis.0);
-        let directory = init_directory(db_host, cert_key.clone()).await?;
+        // let directory = init_directory(db_host, cert_key.clone()).await?;
         let gateway_origin =
-            ohttp_relay::GatewayUri::from_str(&format!("https://localhost:{}", directory.0))?;
+            ohttp_relay::GatewayUri::from_str(&format!("https://localhost:{}", 8080))?;
         let ohttp_relay = ohttp_relay::listen_tcp_on_free_port(gateway_origin, root_store).await?;
         let http_agent: Arc<Client> = Arc::new(http_agent(cert_der)?);
 
         Ok(Self {
             cert,
             redis,
-            directory: (directory.0, Some(directory.1)),
+            directory: (8080, None),
             ohttp_relay: (ohttp_relay.0, Some(ohttp_relay.1)),
             http_agent,
         })
@@ -112,12 +112,16 @@ impl TestServices {
 
     pub async fn wait_for_services_ready(&self) -> Result<(), &'static str> {
         wait_for_service_ready(self.ohttp_relay_url(), self.http_agent()).await?;
-        wait_for_service_ready(self.directory_url(), self.http_agent()).await?;
+        // wait_for_service_ready(self.directory_url(), self.http_agent()).await?;
         Ok(())
     }
 
     pub async fn fetch_ohttp_keys(&self) -> Result<OhttpKeys, IOError> {
         fetch_ohttp_keys_with_cert(self.ohttp_relay_url(), self.directory_url(), self.cert()).await
+    }
+
+    pub async fn fetch_ohttp_keys_without_cert(&self) -> Result<OhttpKeys, IOError> {
+        payjoin::io::fetch_ohttp_keys(self.ohttp_relay_url(),self.directory_url()).await
     }
 }
 

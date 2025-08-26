@@ -5,6 +5,7 @@ use std::sync::Arc;
 use payjoin::directory::ShortId;
 
 pub(crate) mod files;
+pub(crate) mod nostr;
 
 pub trait SendableError:
     std::error::Error + std::marker::Send + std::marker::Sync + std::convert::Into<anyhow::Error>

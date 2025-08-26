@@ -16,6 +16,7 @@ pub struct Config {
     pub timeout: Duration,
     pub storage_dir: PathBuf,
     pub ohttp_keys: PathBuf, // TODO OhttpConfig struct with rotation params, etc
+    pub enable_nostr_bridge: bool,
 }
 
 impl Config {
@@ -33,6 +34,7 @@ impl Config {
             timeout: Duration::from_secs(built_config.get("timeout")?),
             storage_dir: built_config.get("storage_dir")?,
             ohttp_keys: built_config.get("ohttp_keys")?,
+            enable_nostr_bridge: built_config.get("enable_nostr_bridge")?,
         })
     }
 }

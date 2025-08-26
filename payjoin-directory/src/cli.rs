@@ -42,4 +42,12 @@ pub struct Cli {
         value_parser = value_parser!(PathBuf)
     )]
     pub ohttp_keys: PathBuf,
+
+    #[arg(
+        long,
+        env = "PJ_ENABLE_NOSTR_BRIDGE",
+        help = "Enable the nostr bridge",
+        default_value = "false"
+    )]
+    pub enable_nostr_bridge: bool,
 }

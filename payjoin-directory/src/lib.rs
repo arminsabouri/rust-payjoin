@@ -14,7 +14,8 @@ use payjoin::directory::{ShortId, ShortIdError, ENCAPSULATED_MESSAGE_BYTES};
 use tracing::{debug, error, trace, warn};
 
 pub use crate::db::files::Db as FilesDb;
-use crate::db::Db;
+pub use crate::db::nostr::Db as NostrDb;
+pub use crate::db::Db;
 pub mod key_config;
 pub use crate::key_config::*;
 

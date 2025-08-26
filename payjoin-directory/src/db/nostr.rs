@@ -2,8 +2,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::channel::oneshot;
-use futures::{future, FutureExt};
 use nostr::event::{Event, EventBuilder, Kind, Tag};
 use nostr::filter::{Filter, SingleLetterTag};
 use nostr::key::Keys;
@@ -11,6 +9,38 @@ use nostr::util::hex;
 use nostr_sdk::Client;
 
 use super::Error;
+
+struct NostrClient {}
+
+impl NostrClient {
+    async fn connect() -> Result<Client, NostrBackendError> {
+        let client = Client::new(Keys::generate());
+        // TODO: hard coded for now, should be configurable
+        let relay_url = format!("ws://127.0.0.1:8080");
+        client.add_relay(relay_url).await.map_err(NostrBackendError::ClientError)?;
+        client.connect().await;
+        Ok(client)
+    }
+
+    async fn send_event(event: Event) -> Result<(), NostrBackendError> {
+        let client = Self::connect().await?;
+        client.send_event(&event).await.map_err(NostrBackendError::ClientError)?;
+        client.disconnect().await;
+        Ok(())
+    }
+
+    async fn fetch_event(filter: Filter) -> Result<Option<Event>, NostrBackendError> {
+        let client = Self::connect().await?;
+        let events = client
+            .fetch_events(filter, Duration::from_secs(5))
+            .await
+            .map_err(NostrBackendError::ClientError)?;
+
+        let event = events.first().cloned();
+        client.disconnect().await;
+        Ok(event)
+    }
+}
 
 #[derive(Clone)]
 pub struct Db {
@@ -20,9 +50,6 @@ pub struct Db {
 
 impl Db {
     pub async fn new() -> Self { Self { key: Keys::generate(), timeout: Duration::from_secs(5) } }
-
-    // TODO: hard coded for now, should be configurable
-    pub(crate) fn nostr_relay_url(&self) -> String { format!("ws://127.0.0.1:8080") }
 
     async fn push_v2_nostr_payload(
         &self,
@@ -37,13 +64,7 @@ impl Db {
             .sign(&self.key.clone())
             .await
             .map_err(NostrBackendError::EventError)?;
-
-        let client = Client::new(self.key.clone());
-        client.add_relay(self.nostr_relay_url()).await.map_err(NostrBackendError::ClientError)?;
-
-        client.connect().await;
-        client.send_event(&event).await.unwrap();
-        client.disconnect().await;
+        NostrClient::send_event(event).await?;
 
         Ok(())
     }
@@ -52,10 +73,6 @@ impl Db {
         &self,
         mailbox_id: &payjoin::directory::ShortId,
     ) -> Result<Vec<u8>, Error<NostrBackendError>> {
-        let client = Client::new(self.key.clone());
-        client.add_relay(self.nostr_relay_url()).await.map_err(NostrBackendError::ClientError)?;
-        client.connect().await;
-
         // TODO: only assuming one event per h tag for now
         let filter = Filter::new()
             .kind(Kind::TextNote)
@@ -63,14 +80,9 @@ impl Db {
 
         let fut = async {
             loop {
-                let events = client
-                    .fetch_events(filter.clone(), self.timeout)
-                    .await
-                    .map_err(NostrBackendError::ClientError)?;
-                if !events.is_empty() {
-                    return Ok::<_, NostrBackendError>(
-                        events.first().expect("should not be empty").clone(),
-                    );
+                let event = NostrClient::fetch_event(filter.clone()).await?;
+                if let Some(event) = event {
+                    return Ok::<_, NostrBackendError>(event.clone());
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -84,8 +96,6 @@ impl Db {
 
         println!("EVENT: {:?}", event);
         let data = hex::decode(event.content.as_str()).map_err(NostrBackendError::HexError)?;
-
-        client.disconnect().await;
 
         Ok(data)
     }

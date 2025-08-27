@@ -107,6 +107,14 @@ fn short_id_from_pubkey(pubkey: &HpkePublicKey) -> ShortId {
     sha256::Hash::hash(&pubkey.to_compressed_bytes()).into()
 }
 
+pub(crate) fn process_initial_event(event: SessionEvent) -> Result<ReceiveSession, ReplayError> {
+    match event {
+        SessionEvent::Created(context) =>
+            Ok(ReceiveSession::Initialized(Receiver { state: Initialized { context } })),
+        _ => Err(InternalReplayError::InvalidEventForUninitializedSession(Box::new(event)).into()),
+    }
+}
+
 /// Represents the various states of a Payjoin receiver session during the protocol flow.
 /// Each variant parameterizes a `Receiver` with a specific state type, except for [`ReceiveSession::Uninitialized`] which
 /// has no context yet and [`ReceiveSession::TerminalFailure`] which indicates the session has ended or is invalid.
@@ -115,7 +123,6 @@ fn short_id_from_pubkey(pubkey: &HpkePublicKey) -> ShortId {
 /// and the state to be updated with the next event over a uniform interface.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReceiveSession {
-    Uninitialized,
     Initialized(Receiver<Initialized>),
     UncheckedProposal(Receiver<UncheckedProposal>),
     MaybeInputsOwned(Receiver<MaybeInputsOwned>),

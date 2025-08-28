@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use super::{ReceiveSession, SessionContext};
 use crate::output_substitution::OutputSubstitution;
 use crate::persist::SessionPersister;
-use crate::receive::v2::{extract_err_req, process_initial_event, SessionError};
+use crate::receive::v2::{extract_err_req, SessionError};
 use crate::receive::{common, JsonReply, Original, PsbtContext};
 use crate::{ImplementationError, IntoUrl, PjUri, Request};
 
@@ -61,8 +61,7 @@ where
         .map_err(|e| InternalReplayError::PersistenceFailure(ImplementationError::new(e)))?;
 
     let mut receiver =
-        process_initial_event(logs.next().ok_or(InternalReplayError::NoEvents)?.into())
-            .expect("Session should be initialized");
+        ReceiveSession::new(logs.next().ok_or(InternalReplayError::NoEvents)?.into())?;
     let mut history = SessionHistory::default();
 
     for event in logs {

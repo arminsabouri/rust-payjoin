@@ -1,44 +1,70 @@
+use std::borrow::Cow;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use http_body_util::BodyExt;
+use hyper::{Method, Request};
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::TokioExecutor;
 use nostr::event::{Event, EventBuilder, Kind, Tag};
 use nostr::filter::{Filter, SingleLetterTag};
 use nostr::key::Keys;
-use nostr::util::hex;
-use nostr_sdk::Client;
+use nostr::message::{ClientMessage, SubscriptionId};
+use nostr::util::{hex, JsonUtil};
 
 use super::Error;
 
 struct NostrClient {}
 
 impl NostrClient {
-    async fn connect() -> Result<Client, NostrBackendError> {
-        let client = Client::new(Keys::generate());
-        // TODO: hard coded for now, should be configurable
-        let relay_url = format!("ws://127.0.0.1:8080");
-        client.add_relay(relay_url).await.map_err(NostrBackendError::ClientError)?;
-        client.connect().await;
-        Ok(client)
-    }
-
     async fn send_event(event: Event) -> Result<(), NostrBackendError> {
-        let client = Self::connect().await?;
-        client.send_event(&event).await.map_err(NostrBackendError::ClientError)?;
-        client.disconnect().await;
+        let http = HttpConnector::new();
+        let client: Client<HttpConnector, String> =
+            Client::builder(TokioExecutor::new()).build(http);
+        let client_message = ClientMessage::Event(Cow::Borrowed(&event)).as_json();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("http://127.0.0.1:8080/rest")
+            .body(client_message)
+            .unwrap();
+
+        let resp = client.request(req).await.unwrap();
+        println!("RESPONSE STATUS: {}", resp.status());
         Ok(())
     }
 
     async fn fetch_event(filter: Filter) -> Result<Option<Event>, NostrBackendError> {
-        let client = Self::connect().await?;
-        let events = client
-            .fetch_events(filter, Duration::from_secs(5))
-            .await
-            .map_err(NostrBackendError::ClientError)?;
+        let http = HttpConnector::new();
+        let client: Client<HttpConnector, String> =
+            Client::builder(TokioExecutor::new()).build(http);
+        let subscription_id = SubscriptionId::generate();
+        let client_message = ClientMessage::Req {
+            subscription_id: Cow::Borrowed(&subscription_id),
+            filter: Cow::Borrowed(&filter),
+        }
+        .as_json();
 
-        let event = events.first().cloned();
-        client.disconnect().await;
-        Ok(event)
+        // Construct GET request with body (non-standard but Hyper allows it)
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("http://127.0.0.1:8080/rest")
+            .header("Content-Type", "application/json")
+            .body(client_message)
+            .unwrap();
+
+        let resp = client.request(req).await.unwrap();
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        // Parse newline-delimited JSON events
+        let s = String::from_utf8(body_bytes.to_vec()).unwrap();
+
+        let mut events = s
+            .split('\n')
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| Event::from_json(line).ok());
+
+        Ok(events.next())
     }
 }
 
@@ -144,7 +170,7 @@ impl super::Db for Db {
 pub enum NostrBackendError {
     EventError(nostr::event::Error),
     HexError(nostr::util::hex::Error),
-    ClientError(nostr_sdk::client::Error),
+    ClientError(hyper::Error),
 }
 
 impl crate::db::SendableError for NostrBackendError {}

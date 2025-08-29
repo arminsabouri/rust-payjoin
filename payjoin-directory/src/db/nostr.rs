@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::io::Write;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,11 +9,15 @@ use hyper::{Method, Request};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
-use nostr::event::{Event, EventBuilder, Kind, Tag};
+use nostr::event::{Event, EventBuilder, Kind, Tag, UnsignedEvent};
 use nostr::filter::{Filter, SingleLetterTag};
+use nostr::hashes::{sha256, Hash};
 use nostr::key::Keys;
 use nostr::message::{ClientMessage, SubscriptionId};
+use nostr::nips::nip59::extract_rumor;
+use nostr::types::Timestamp;
 use nostr::util::{hex, JsonUtil};
+use payjoin::directory::ShortId;
 
 use super::Error;
 
@@ -70,11 +75,24 @@ impl NostrClient {
 
 #[derive(Clone)]
 pub struct Db {
+    // TODO: the exact same key cannot be used for all giftwraps,
     key: nostr::key::Keys,
     timeout: Duration,
 }
 
 impl Db {
+    fn derive_key_pair(&self, short_id: &ShortId) -> nostr::SecretKey{
+        // TODO No domain separation for now
+        // TODO: use bip32 hardened derivations / keyed-hash'd derivation
+        let mut hasher = sha256::Hash::engine();
+        hasher.write(short_id.as_slice()).unwrap();
+        hasher.write(self.key.secret_key().as_secret_bytes()).unwrap();
+        let sks = sha256::Hash::from_engine(hasher).as_byte_array().to_vec();
+        let sk = nostr::SecretKey::from_slice(&sks).unwrap();
+
+        sk
+    }
+
     pub async fn new() -> Self { Self { key: Keys::generate(), timeout: Duration::from_secs(5) } }
 
     async fn push_v2_nostr_payload(
@@ -84,13 +102,23 @@ impl Db {
     ) -> Result<(), NostrBackendError> {
         let hex_data = hex::encode(data);
         let tag = Tag::parse(vec!["h".to_string(), mailbox_id.to_string()]).unwrap();
-        let event = EventBuilder::new(Kind::TextNote, hex_data)
-            .tag(tag)
-            .build(self.key.public_key())
-            .sign(&self.key.clone())
-            .await
-            .map_err(NostrBackendError::EventError)?;
-        NostrClient::send_event(event).await?;
+        let inner_note = UnsignedEvent::new(
+            self.key.public_key(),
+            Timestamp::now(),
+            Kind::TextNote,
+            vec![],
+            hex_data,
+        );
+
+        let dervied_sk= self.derive_key_pair(mailbox_id);
+        let signer = nostr::key::Keys::new(dervied_sk);
+        let gift_wrap =
+            EventBuilder::gift_wrap(&signer, &signer.public_key(), inner_note, vec![tag])
+                .await
+                // TODO: handle error
+                .unwrap();
+
+        NostrClient::send_event(gift_wrap).await?;
 
         Ok(())
     }
@@ -101,7 +129,7 @@ impl Db {
     ) -> Result<Vec<u8>, Error<NostrBackendError>> {
         // TODO: only assuming one event per h tag for now
         let filter = Filter::new()
-            .kind(Kind::TextNote)
+            .kind(Kind::GiftWrap)
             .custom_tag(SingleLetterTag::from_str("h").unwrap(), mailbox_id.to_string());
 
         let fut = async {
@@ -120,8 +148,14 @@ impl Db {
         }?
         .expect("sender should not be dropped");
 
-        println!("EVENT: {:?}", event);
-        let data = hex::decode(event.content.as_str()).map_err(NostrBackendError::HexError)?;
+        println!("GIFT WRAP EVENT: {:?}", event);
+        // Unwrap the gift
+        let dervied_sk= self.derive_key_pair(mailbox_id);
+        let signer = nostr::key::Keys::new(dervied_sk);
+        let inner_note = extract_rumor(&signer, &event).await.unwrap().rumor;
+
+        println!("EVENT: {:?}", inner_note);
+        let data = hex::decode(inner_note.content.as_str()).map_err(NostrBackendError::HexError)?;
 
         Ok(data)
     }

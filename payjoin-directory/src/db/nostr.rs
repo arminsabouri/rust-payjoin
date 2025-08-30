@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::io::Write;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,12 +10,12 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use nostr::event::{Event, EventBuilder, Kind, Tag, UnsignedEvent};
 use nostr::filter::{Filter, SingleLetterTag};
-use nostr::hashes::{sha256, Hash};
+use nostr::hashes::Hash;
 use nostr::key::Keys;
 use nostr::message::{ClientMessage, SubscriptionId};
 use nostr::nips::nip59::extract_rumor;
 use nostr::types::Timestamp;
-use nostr::util::{hex, JsonUtil};
+use nostr::util::{hex, hkdf, JsonUtil};
 use payjoin::directory::ShortId;
 
 use super::Error;
@@ -81,14 +80,13 @@ pub struct Db {
 }
 
 impl Db {
-    fn derive_key_pair(&self, short_id: &ShortId) -> nostr::SecretKey{
-        // TODO No domain separation for now
-        // TODO: use bip32 hardened derivations / keyed-hash'd derivation
-        let mut hasher = sha256::Hash::engine();
-        hasher.write(short_id.as_slice()).unwrap();
-        hasher.write(self.key.secret_key().as_secret_bytes()).unwrap();
-        let sks = sha256::Hash::from_engine(hasher).as_byte_array().to_vec();
-        let sk = nostr::SecretKey::from_slice(&sks).unwrap();
+    // TODO: this uses a ephemeral key for each giftwrap. We want to use a static persistent key incase the server is restarted.
+    fn derive_key_pair(&self, short_id: &ShortId) -> nostr::SecretKey {
+        let sk = self.key.secret_key().as_secret_bytes();
+        let prk = hkdf::extract(sk, short_id.as_slice());
+        let hkdf =
+            hkdf::expand(prk.to_byte_array().as_slice(), b"nostr-compat-bridge", 32 as usize);
+        let sk = nostr::SecretKey::from_slice(&hkdf).unwrap();
 
         sk
     }
@@ -110,7 +108,7 @@ impl Db {
             hex_data,
         );
 
-        let dervied_sk= self.derive_key_pair(mailbox_id);
+        let dervied_sk = self.derive_key_pair(mailbox_id);
         let signer = nostr::key::Keys::new(dervied_sk);
         let gift_wrap =
             EventBuilder::gift_wrap(&signer, &signer.public_key(), inner_note, vec![tag])
@@ -150,7 +148,7 @@ impl Db {
 
         println!("GIFT WRAP EVENT: {:?}", event);
         // Unwrap the gift
-        let dervied_sk= self.derive_key_pair(mailbox_id);
+        let dervied_sk = self.derive_key_pair(mailbox_id);
         let signer = nostr::key::Keys::new(dervied_sk);
         let inner_note = extract_rumor(&signer, &event).await.unwrap().rumor;
 

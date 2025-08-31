@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,7 +8,7 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use nostr::event::{Event, EventBuilder, Kind, Tag, UnsignedEvent};
-use nostr::filter::{Filter, SingleLetterTag};
+use nostr::filter::Filter;
 use nostr::hashes::Hash;
 use nostr::key::Keys;
 use nostr::message::{ClientMessage, SubscriptionId};
@@ -99,7 +98,6 @@ impl Db {
         data: Vec<u8>,
     ) -> Result<(), NostrBackendError> {
         let hex_data = hex::encode(data);
-        let tag = Tag::parse(vec!["h".to_string(), mailbox_id.to_string()]).unwrap();
         let inner_note = UnsignedEvent::new(
             self.key.public_key(),
             Timestamp::now(),
@@ -109,12 +107,12 @@ impl Db {
         );
 
         let dervied_sk = self.derive_key_pair(mailbox_id);
+        println!("DERIVED SK: {:?}", dervied_sk);
         let signer = nostr::key::Keys::new(dervied_sk);
-        let gift_wrap =
-            EventBuilder::gift_wrap(&signer, &signer.public_key(), inner_note, vec![tag])
-                .await
-                // TODO: handle error
-                .unwrap();
+        let gift_wrap = EventBuilder::gift_wrap(&signer, &signer.public_key(), inner_note, vec![])
+            .await
+            // TODO: handle error
+            .unwrap();
 
         NostrClient::send_event(gift_wrap).await?;
 
@@ -126,9 +124,9 @@ impl Db {
         mailbox_id: &payjoin::directory::ShortId,
     ) -> Result<Vec<u8>, Error<NostrBackendError>> {
         // TODO: only assuming one event per h tag for now
-        let filter = Filter::new()
-            .kind(Kind::GiftWrap)
-            .custom_tag(SingleLetterTag::from_str("h").unwrap(), mailbox_id.to_string());
+        let dervied_sk = self.derive_key_pair(mailbox_id);
+        let signer = nostr::key::Keys::new(dervied_sk);
+        let filter = Filter::new().kind(Kind::GiftWrap).pubkey(signer.public_key());
 
         let fut = async {
             loop {
@@ -147,9 +145,6 @@ impl Db {
         .expect("sender should not be dropped");
 
         println!("GIFT WRAP EVENT: {:?}", event);
-        // Unwrap the gift
-        let dervied_sk = self.derive_key_pair(mailbox_id);
-        let signer = nostr::key::Keys::new(dervied_sk);
         let inner_note = extract_rumor(&signer, &event).await.unwrap().rumor;
 
         println!("EVENT: {:?}", inner_note);

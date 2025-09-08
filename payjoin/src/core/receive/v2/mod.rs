@@ -341,9 +341,6 @@ impl Receiver<Initialized> {
         &mut self,
         ohttp_relay: impl IntoUrl,
     ) -> Result<(Request, ohttp::ClientResponse), Error> {
-        if SystemTime::now() > self.context.expiry {
-            return Err(InternalSessionError::Expired(self.context.expiry).into());
-        }
         let (body, ohttp_ctx) =
             self.fallback_req_body().map_err(InternalSessionError::OhttpEncapsulation)?;
         let req = Request::new_v2(&self.context.full_relay_url(ohttp_relay)?, &body);
@@ -362,6 +359,17 @@ impl Receiver<Initialized> {
         Receiver<Initialized>,
         Error,
     > {
+        if SystemTime::now() > self.context.expiry {
+            return MaybeFatalTransitionWithNoResults::fatal(
+                SessionEvent::SessionInvalid(
+                    SessionError(InternalSessionError::Expired(self.context.expiry)).to_string(),
+                    None,
+                ),
+                ProtocolError::V2(SessionError(InternalSessionError::Expired(self.context.expiry)))
+                    .into(),
+            );
+        }
+
         let current_state = self.clone();
         let proposal = match self.inner_process_res(body, context) {
             Ok(proposal) => proposal,

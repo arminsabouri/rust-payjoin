@@ -278,11 +278,23 @@ mod integration {
                     .with_expiry(Duration::from_secs(0))
                     .build()
                     .save(&recv_noop_persister)?;
-                match expired_receiver.create_poll_request(&ohttp_relay) {
-                    // Internal error types are private, so check against a string
-                    Err(err) => assert!(err.to_string().contains("expired")),
-                    _ => panic!("Expired receive session should error"),
-                };
+
+                let (req, ctx) = expired_receiver.create_poll_request(&ohttp_relay)?;
+                let agent = services.http_agent();
+                let response = agent
+                    .post(req.url)
+                    .header("Content-Type", req.content_type)
+                    .body(req.body)
+                    .send()
+                    .await?;
+                assert!(response.status().is_success(), "error response: {}", response.status());
+                let error = expired_receiver
+                    .process_response(response.bytes().await?.to_vec().as_slice(), ctx)
+                    .save(&recv_noop_persister)
+                    .err()
+                    .expect("should error");
+                let api_error = error.api_error().expect("should be api error");
+                assert!(api_error.to_string().contains("expired"));
 
                 // **********************
                 // Inside the Sender:

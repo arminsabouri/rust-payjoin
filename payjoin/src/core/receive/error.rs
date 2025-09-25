@@ -109,6 +109,24 @@ impl JsonReply {
         serde_json::Value::Object(map)
     }
 
+    #[cfg(feature = "v2")]
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
+        use std::str::FromStr;
+        let value: serde_json::Value = serde_json::from_slice(bytes)?;
+        Ok(Self {
+            error_code: ErrorCode::from_str(value["errorCode"].as_str().unwrap_or("unavailable"))
+                .unwrap_or(ErrorCode::Unavailable),
+            message: value["message"].as_str().unwrap_or("Receiver error").to_string(),
+            extra: value["extra"].as_object().unwrap_or(&serde_json::Map::new()).to_owned(),
+        })
+    }
+
+    #[cfg(feature = "v2")]
+    pub(crate) fn error_code(&self) -> ErrorCode { self.error_code }
+
+    #[cfg(feature = "v2")]
+    pub(crate) fn message(&self) -> &str { &self.message }
+
     /// Get the HTTP status code for the error
     pub fn status_code(&self) -> u16 {
         match self.error_code {

@@ -45,6 +45,7 @@ use crate::ohttp::{ohttp_encapsulate, process_get_res, process_post_res};
 use crate::persist::{
     MaybeFatalTransition, MaybeSuccessTransitionWithNoResults, NextStateTransition,
 };
+use crate::receive::JsonReply;
 use crate::uri::v2::PjParam;
 use crate::uri::ShortId;
 use crate::{HpkeKeyPair, HpkePublicKey, IntoUrl, OhttpKeys, PjUri, Request};
@@ -489,6 +490,21 @@ impl Sender<PollingForProposal> {
                     );
                 },
         };
+        match JsonReply::from_bytes(&body) {
+            Ok(json) => {
+                let error_message = json.message().to_string();
+                return MaybeSuccessTransitionWithNoResults::fatal(
+                    SessionEvent::SessionInvalid(error_message.clone()),
+                    ResponseError::Unrecognized {
+                        error_code: json.error_code().to_string(),
+                        message: error_message,
+                    },
+                );
+            }
+            Err(_) => {
+                // Nothing to do, lets try to parse the PSBT
+            }
+        }
         let psbt = match decrypt_message_b(
             &body,
             self.pj_param.receiver_pubkey().clone(),

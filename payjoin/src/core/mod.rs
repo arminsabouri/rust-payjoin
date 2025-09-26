@@ -22,6 +22,7 @@ pub mod uri;
 pub use uri::{PjParam, PjParseError, PjUri, Uri, UriExt};
 pub use url::{ParseError, Url};
 pub(crate) mod error_codes;
+pub mod reply_error;
 
 pub(crate) mod output_substitution;
 #[cfg(feature = "v1")]

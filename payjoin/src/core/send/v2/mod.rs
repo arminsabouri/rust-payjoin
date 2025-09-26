@@ -45,7 +45,7 @@ use crate::ohttp::{ohttp_encapsulate, process_get_res, process_post_res};
 use crate::persist::{
     MaybeFatalTransition, MaybeSuccessTransitionWithNoResults, NextStateTransition,
 };
-use crate::receive::JsonReply;
+use crate::reply_error::JsonReply;
 use crate::uri::v2::PjParam;
 use crate::uri::ShortId;
 use crate::{HpkeKeyPair, HpkePublicKey, IntoUrl, OhttpKeys, PjUri, Request};

@@ -244,7 +244,7 @@ impl App {
                 .handle_payjoin_post(req)
                 .await
                 .map_err(|e| {
-                    let json = payjoin::receive::JsonReply::from(&e);
+                    let json = payjoin::reply_error::JsonReply::from(&e);
                     tracing::error!("Error handling request: {e}");
                     Response::builder()
                         .status(json.status_code())

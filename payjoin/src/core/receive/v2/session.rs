@@ -5,7 +5,8 @@ use crate::error::{InternalReplayError, ReplayError};
 use crate::output_substitution::OutputSubstitution;
 use crate::persist::SessionPersister;
 use crate::receive::v2::{extract_err_req, SessionError};
-use crate::receive::{InputPair, JsonReply, OriginalPayload, PsbtContext};
+use crate::receive::{InputPair, OriginalPayload, PsbtContext};
+use crate::reply_error::JsonReply;
 use crate::{ImplementationError, IntoUrl, PjUri, Request};
 
 /// Replay a receiver event log to get the receiver in its current state [ReceiveSession]

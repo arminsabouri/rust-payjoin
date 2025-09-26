@@ -38,9 +38,7 @@ pub use session::{replay_event_log, SessionEvent, SessionHistory};
 use url::Url;
 
 use super::error::{Error, InputContributionError};
-use super::{
-    common, InternalPayloadError, JsonReply, OutputSubstitutionError, ProtocolError, SelectionError,
-};
+use super::{common, InternalPayloadError, OutputSubstitutionError, ProtocolError, SelectionError};
 use crate::error::{InternalReplayError, ReplayError};
 use crate::hpke::{decrypt_message_a, encrypt_message_b, HpkeKeyPair, HpkePublicKey};
 use crate::ohttp::{
@@ -53,6 +51,7 @@ use crate::persist::{
 };
 use crate::receive::v2::session::SessionOutcome;
 use crate::receive::{parse_payload, InputPair, OriginalPayload, PsbtContext};
+use crate::reply_error::JsonReply;
 use crate::time::Time;
 use crate::uri::ShortId;
 use crate::{ImplementationError, IntoUrl, IntoUrlError, Request, Version};

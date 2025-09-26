@@ -111,14 +111,14 @@ pub struct ProtocolError(#[from] receive::ProtocolError);
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Object)]
-pub struct JsonReply(receive::JsonReply);
+pub struct JsonReply(payjoin::reply_error::JsonReply);
 
-impl From<JsonReply> for receive::JsonReply {
+impl From<JsonReply> for payjoin::reply_error::JsonReply {
     fn from(value: JsonReply) -> Self { value.0 }
 }
 
-impl From<receive::JsonReply> for JsonReply {
-    fn from(value: receive::JsonReply) -> Self { Self(value) }
+impl From<payjoin::reply_error::JsonReply> for JsonReply {
+    fn from(value: payjoin::reply_error::JsonReply) -> Self { Self(value) }
 }
 
 impl From<ProtocolError> for JsonReply {

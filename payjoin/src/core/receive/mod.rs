@@ -18,7 +18,7 @@ use bitcoin::{
 };
 pub(crate) use error::InternalPayloadError;
 pub use error::{
-    Error, InputContributionError, JsonReply, OutputSubstitutionError, PayloadError, ProtocolError,
+    Error, InputContributionError, OutputSubstitutionError, PayloadError, ProtocolError,
     SelectionError,
 };
 use optional_parameters::Params;

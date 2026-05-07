@@ -191,10 +191,13 @@ mod integration {
     // not all needs v1
     #[cfg(all(feature = "io", feature = "v2", feature = "v1", feature = "_manual-tls"))]
     mod v2 {
+        use std::random;
         use std::sync::Arc;
         use std::time::Duration;
 
-        use bitcoin::{Address, Transaction};
+        use bitcoin::hashes::{sha256, Hash, HashEngine};
+        use bitcoin::{secp256k1, Address, Transaction};
+        use hpke::rand_core::OsRng;
         use http::StatusCode;
         use payjoin::persist::OptionalTransitionOutcome;
         use payjoin::receive::v2::{
@@ -219,6 +222,45 @@ mod integration {
         enum SenderFinalAction {
             SignAndBroadcastPayjoinProposal,
             BroadcastFallbackTransaction,
+        }
+
+        #[tokio::test]
+        async fn test_create_linked_mailbox() -> Result<(), BoxSendSyncError> {
+            init_tracing();
+            let mut services = TestServices::initialize().await?;
+            // Goal to have 3 different peers write to a linked sequences of mailboxes and read them and ensure they messages can be read
+            // Order cannot be garanteed
+
+            //short_id = H(shared_secret, i) for i = 0 .. n
+
+            tokio::select!(
+                err = services.take_ohttp_relay_handle() => panic!("Ohttp relay exited early: {:?}", err),
+                err = services.take_directory_handle() => panic!("Directory server exited early: {:?}", err),
+                res = write_to_mailbox(&services) => res
+            );
+
+            // TODO: method to generate a short id based on shared secret and index
+            fn generate_short_id(shared_secret: &[u8], index: u64) -> payjoin::directory::ShortId {
+                let mut engine = sha256::Hash::engine();
+                engine.input(shared_secret);
+                engine.input(index.to_le_bytes().as_slice());
+                sha256::Hash::from_engine(engine).into()
+            }
+
+            // TODO Method to write to mailbox  given a short id
+            // TODO Method to read from mailbox given a short id
+
+            async fn write_to_mailbox(services: &TestServices) -> Result<(), BoxSendSyncError> {
+                let shared_secret = secp256k1::SecretKey::new(&mut OsRng).secret_bytes();
+
+                // TODO: Alice writes
+                // TODO: Bob writes
+                // TODO: Carol writes
+
+                // Each read. final message should include all of their messages
+
+                Ok(())
+            }
         }
 
         #[tokio::test]

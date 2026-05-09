@@ -191,10 +191,13 @@ mod integration {
     // not all needs v1
     #[cfg(all(feature = "io", feature = "v2", feature = "v1", feature = "_manual-tls"))]
     mod v2 {
+        // use std::random;
         use std::sync::Arc;
         use std::time::Duration;
 
-        use bitcoin::{Address, Transaction};
+        use bitcoin::hashes::{sha256, Hash, HashEngine};
+        use bitcoin::{secp256k1, Address, Transaction};
+        use hpke::rand_core::OsRng;
         use http::StatusCode;
         use payjoin::persist::OptionalTransitionOutcome;
         use payjoin::receive::v2::{
@@ -219,6 +222,168 @@ mod integration {
         enum SenderFinalAction {
             SignAndBroadcastPayjoinProposal,
             BroadcastFallbackTransaction,
+        }
+
+        // Generate a short id based on shared secret and index
+        fn generate_short_id(shared_secret: &[u8], index: u64) -> payjoin::directory::ShortId {
+            let mut engine = sha256::Hash::engine();
+            engine.input(shared_secret);
+            engine.input(index.to_le_bytes().as_slice());
+            sha256::Hash::from_engine(engine).into()
+        }
+
+        // Padding sized to match payjoin/src/core/ohttp.rs:
+        // ENCAPSULATED_MESSAGE_BYTES - (N_ENC=65 + N_T=16 + OHTTP_REQ_HEADER_BYTES=7)
+        const PADDED_BHTTP_REQ_BYTES: usize =
+            payjoin::directory::ENCAPSULATED_MESSAGE_BYTES - (65 + 16 + 7);
+
+        fn encapsulate_request(
+            ohttp_keys: &payjoin::OhttpKeys,
+            method: &str,
+            target_url: &str,
+            body: Option<&[u8]>,
+        ) -> Result<(Vec<u8>, ohttp::ClientResponse), BoxSendSyncError> {
+            let mut config = ohttp_keys.0.clone();
+            let ctx = ohttp::ClientRequest::from_config(&mut config)?;
+            let url = payjoin::Url::parse(target_url)?;
+            let authority = match url.port() {
+                Some(p) => format!("{}:{}", url.host_str(), p),
+                None => url.host_str(),
+            };
+            let mut bhttp_msg = bhttp::Message::request(
+                method.as_bytes().to_vec(),
+                url.scheme().as_bytes().to_vec(),
+                authority.into_bytes(),
+                url.path().as_bytes().to_vec(),
+            );
+            if let Some(b) = body {
+                bhttp_msg.write_content(b);
+            }
+            let mut bhttp_buf = vec![0u8; PADDED_BHTTP_REQ_BYTES];
+            bhttp_msg.write_bhttp(bhttp::Mode::KnownLength, &mut bhttp_buf.as_mut_slice())?;
+            let (encapsulated, ohttp_ctx) = ctx.encapsulate(&bhttp_buf)?;
+            Ok((encapsulated, ohttp_ctx))
+        }
+
+        fn decapsulate_response(
+            ohttp_ctx: ohttp::ClientResponse,
+            encapsulated: &[u8],
+        ) -> Result<(http::StatusCode, Vec<u8>), BoxSendSyncError> {
+            let bhttp_bytes = ohttp_ctx.decapsulate(encapsulated)?;
+            let mut cursor = std::io::Cursor::new(bhttp_bytes);
+            let msg = bhttp::Message::read_bhttp(&mut cursor)?;
+            let code = msg.control().status().ok_or("missing status")?.code();
+            let status = http::StatusCode::from_u16(code)?;
+            Ok((status, msg.content().to_vec()))
+        }
+
+        // The relay extracts the gateway URI from its request path; embed the
+        // directory URL there (matches `SessionContext::full_relay_url`).
+        fn relay_url_for_directory(services: &TestServices) -> String {
+            format!("{}/{}", services.ohttp_relay_url(), services.directory_url())
+        }
+
+        async fn write_mailbox(
+            services: &TestServices,
+            ohttp_keys: &payjoin::OhttpKeys,
+            short_id: payjoin::directory::ShortId,
+            message: &[u8],
+        ) -> Result<(), BoxSendSyncError> {
+            let target = format!("{}/{}", services.directory_url(), short_id);
+            let (req, ohttp_ctx) = encapsulate_request(ohttp_keys, "POST", &target, Some(message))?;
+            let response = services
+                .http_agent()
+                .post(relay_url_for_directory(services))
+                .header("Content-Type", "message/ohttp-req")
+                .body(req)
+                .send()
+                .await?;
+            assert!(response.status().is_success(), "relay status: {}", response.status());
+            let body = response.bytes().await?;
+            let (status, _) = decapsulate_response(ohttp_ctx, &body)?;
+            assert_eq!(status, http::StatusCode::OK, "post_mailbox status");
+            Ok(())
+        }
+
+        async fn read_mailbox(
+            services: &TestServices,
+            ohttp_keys: &payjoin::OhttpKeys,
+            short_id: payjoin::directory::ShortId,
+        ) -> Result<Option<Vec<u8>>, BoxSendSyncError> {
+            let target = format!("{}/{}", services.directory_url(), short_id);
+            let (req, ohttp_ctx) = encapsulate_request(ohttp_keys, "GET", &target, None)?;
+            let response = services
+                .http_agent()
+                .post(relay_url_for_directory(services))
+                .header("Content-Type", "message/ohttp-req")
+                .body(req)
+                .send()
+                .await?;
+            assert!(response.status().is_success(), "relay status: {}", response.status());
+            let body = response.bytes().await?;
+            let (status, content) = decapsulate_response(ohttp_ctx, &body)?;
+            match status {
+                http::StatusCode::OK => Ok(Some(content)),
+                http::StatusCode::ACCEPTED => Ok(None),
+                other => Err(format!("unexpected get_mailbox status: {}", other).into()),
+            }
+        }
+
+        async fn do_linked_mailbox_test(services: &TestServices) -> Result<(), BoxSendSyncError> {
+            services.wait_for_services_ready().await?;
+            let ohttp_keys = services.fetch_ohttp_keys().await?;
+
+            let shared_secret = secp256k1::SecretKey::new(&mut OsRng).secret_bytes();
+            let short_id_0 = generate_short_id(&shared_secret, 0);
+            let short_id_1 = generate_short_id(&shared_secret, 1);
+            let short_id_2 = generate_short_id(&shared_secret, 2);
+            assert_ne!(short_id_0, short_id_1);
+            assert_ne!(short_id_1, short_id_2);
+            assert_ne!(short_id_0, short_id_2);
+
+            let alice_msg: &[u8] = b"Hello from Alice";
+            let bob_msg: &[u8] = b"Hello from Bob";
+            let carol_msg: &[u8] = b"Hello from Carol";
+
+            write_mailbox(services, &ohttp_keys, short_id_0, alice_msg).await?;
+            write_mailbox(services, &ohttp_keys, short_id_1, bob_msg).await?;
+            write_mailbox(services, &ohttp_keys, short_id_2, carol_msg).await?;
+
+            let alice_read = read_mailbox(services, &ohttp_keys, short_id_0)
+                .await?
+                .ok_or("Alice's mailbox should have a payload")?;
+            let bob_read = read_mailbox(services, &ohttp_keys, short_id_1)
+                .await?
+                .ok_or("Bob's mailbox should have a payload")?;
+            let carol_read = read_mailbox(services, &ohttp_keys, short_id_2)
+                .await?
+                .ok_or("Carol's mailbox should have a payload")?;
+
+            assert_eq!(alice_read, alice_msg);
+            assert_eq!(bob_read, bob_msg);
+            assert_eq!(carol_read, carol_msg);
+
+            // An unrelated short_id (different shared secret) should have no payload posted.
+            let other_secret = secp256k1::SecretKey::new(&mut OsRng).secret_bytes();
+            let other_short_id = generate_short_id(&other_secret, 0);
+            let empty = read_mailbox(services, &ohttp_keys, other_short_id).await?;
+            assert!(empty.is_none(), "unrelated mailbox should be empty");
+
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_create_linked_mailbox() -> Result<(), BoxSendSyncError> {
+            init_tracing();
+            let mut services = TestServices::initialize().await?;
+            // 3 peers write to a linked sequence of mailboxes whose short_ids are
+            // derived as short_id = H(shared_secret, i) for i = 0..n.
+            let result = tokio::select!(
+                err = services.take_ohttp_relay_handle() => panic!("Ohttp relay exited early: {:?}", err),
+                err = services.take_directory_handle() => panic!("Directory server exited early: {:?}", err),
+                res = do_linked_mailbox_test(&services) => res
+            );
+            result
         }
 
         #[tokio::test]

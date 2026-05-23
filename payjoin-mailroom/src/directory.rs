@@ -280,7 +280,9 @@ impl<D: Db> Service<D> {
             return Err(HandlerError::PayloadTooLarge);
         }
         match self.db.post_v2_payload(&id, req.into()).await {
-            Ok(_) => Ok(none_response),
+            Ok(Some(())) => Ok(none_response),
+            // A different payload already occupies this short_id.
+            Ok(None) => Ok(Response::builder().status(StatusCode::CONFLICT).body(empty())?),
             Err(e) => Err(HandlerError::InternalServerError(e.into())),
         }
     }

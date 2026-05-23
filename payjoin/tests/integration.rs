@@ -288,7 +288,7 @@ mod integration {
             ohttp_keys: &payjoin::OhttpKeys,
             short_id: payjoin::directory::ShortId,
             message: &[u8],
-        ) -> Result<(), BoxSendSyncError> {
+        ) -> Result<http::StatusCode, BoxSendSyncError> {
             let target = format!("{}/{}", services.directory_url(), short_id);
             let (req, ohttp_ctx) = encapsulate_request(ohttp_keys, "POST", &target, Some(message))?;
             let response = services
@@ -301,8 +301,7 @@ mod integration {
             assert!(response.status().is_success(), "relay status: {}", response.status());
             let body = response.bytes().await?;
             let (status, _) = decapsulate_response(ohttp_ctx, &body)?;
-            assert_eq!(status, http::StatusCode::OK, "post_mailbox status");
-            Ok(())
+            Ok(status)
         }
 
         async fn read_mailbox(
@@ -329,45 +328,162 @@ mod integration {
             }
         }
 
+        /// Append-only broadcast channel shared by multiple participants.
+        ///
+        /// Each participant is initialized with the same shared identity.
+        trait CollaborativeMessageSet {
+            type Message;
+            type Error;
+
+            type Messages<'a>: futures::Stream<Item = Result<Self::Message, Self::Error>>
+                + Send
+                + 'a
+            where
+                Self: 'a;
+
+            /// Append one complete message.
+            async fn write(&self, message: Self::Message) -> Result<(), Self::Error>;
+
+            /// Read all messages from the beginning in server-determined order.
+            fn read(&self) -> Self::Messages<'_>;
+        }
+
+        /// `CollaborativeMessageSet` over a chain of directory mailboxes.
+        ///
+        /// `short_id(i) = H(shared_secret, i)`. `write` walks forward on 409
+        /// so concurrent writers converge on distinct slots without
+        /// coordinating an index out-of-band. `read` polls each slot in
+        /// order and stops when the directory's local wait timeout elapses
+        /// without a payload.
+        struct DirectoryLinkedMailbox<'a> {
+            services: &'a TestServices,
+            ohttp_keys: &'a payjoin::OhttpKeys,
+            shared_secret: [u8; 32],
+            // Local-only hint for this peer; it starts at 0 and never
+            // decreases. Different peers do not share this hint, so each
+            // peer races forward independently and relies on the directory's
+            // 409 to resolve concurrent collisions.
+            next_write_index: std::sync::atomic::AtomicU64,
+        }
+
+        impl<'a> DirectoryLinkedMailbox<'a> {
+            fn new(
+                services: &'a TestServices,
+                ohttp_keys: &'a payjoin::OhttpKeys,
+                shared_secret: [u8; 32],
+            ) -> Self {
+                Self {
+                    services,
+                    ohttp_keys,
+                    shared_secret,
+                    next_write_index: std::sync::atomic::AtomicU64::new(0),
+                }
+            }
+        }
+
+        impl<'a> CollaborativeMessageSet for DirectoryLinkedMailbox<'a> {
+            type Message = Vec<u8>;
+            type Error = BoxSendSyncError;
+            type Messages<'b>
+                = std::pin::Pin<
+                Box<dyn futures::Stream<Item = Result<Vec<u8>, BoxSendSyncError>> + Send + 'b>,
+            >
+            where
+                Self: 'b;
+
+            async fn write(&self, message: Vec<u8>) -> Result<(), Self::Error> {
+                use std::sync::atomic::Ordering;
+                let mut i = self.next_write_index.load(Ordering::Relaxed);
+                loop {
+                    let short_id = generate_short_id(&self.shared_secret, i);
+                    let status =
+                        write_mailbox(self.services, self.ohttp_keys, short_id, &message).await?;
+                    match status {
+                        http::StatusCode::OK => {
+                            // Advance the local hint past the slot we just claimed.
+                            self.next_write_index.fetch_max(i + 1, Ordering::Relaxed);
+                            return Ok(());
+                        }
+                        http::StatusCode::CONFLICT => {
+                            i += 1;
+                        }
+                        other =>
+                            return Err(format!("unexpected post_mailbox status: {}", other).into()),
+                    }
+                }
+            }
+
+            fn read(&self) -> Self::Messages<'_> {
+                let secret = self.shared_secret;
+                let services = self.services;
+                let keys = self.ohttp_keys;
+                Box::pin(async_stream::stream! {
+                    let mut i = 0u64;
+                    loop {
+                        let short_id = generate_short_id(&secret, i);
+                        match read_mailbox(services, keys, short_id).await {
+                            Ok(Some(payload)) => {
+                                yield Ok(payload);
+                                i += 1;
+                            }
+                            // Local timeout: no payload at this slot. Could be true end-of-log.
+                            Ok(None) => break,
+                            Err(e) => {
+                                yield Err(e);
+                                break;
+                            }
+                        }
+                    }
+                })
+            }
+        }
+
         async fn do_linked_mailbox_test(services: &TestServices) -> Result<(), BoxSendSyncError> {
+            use futures::StreamExt;
+
             services.wait_for_services_ready().await?;
             let ohttp_keys = services.fetch_ohttp_keys().await?;
-
             let shared_secret = secp256k1::SecretKey::new(&mut OsRng).secret_bytes();
-            let short_id_0 = generate_short_id(&shared_secret, 0);
-            let short_id_1 = generate_short_id(&shared_secret, 1);
-            let short_id_2 = generate_short_id(&shared_secret, 2);
-            assert_ne!(short_id_0, short_id_1);
-            assert_ne!(short_id_1, short_id_2);
-            assert_ne!(short_id_0, short_id_2);
 
-            let alice_msg: &[u8] = b"Hello from Alice";
-            let bob_msg: &[u8] = b"Hello from Bob";
-            let carol_msg: &[u8] = b"Hello from Carol";
+            // Each peer is independently initialized with only the shared secret.
+            let alice = DirectoryLinkedMailbox::new(services, &ohttp_keys, shared_secret);
+            let bob = DirectoryLinkedMailbox::new(services, &ohttp_keys, shared_secret);
+            let carol = DirectoryLinkedMailbox::new(services, &ohttp_keys, shared_secret);
 
-            write_mailbox(services, &ohttp_keys, short_id_0, alice_msg).await?;
-            write_mailbox(services, &ohttp_keys, short_id_1, bob_msg).await?;
-            write_mailbox(services, &ohttp_keys, short_id_2, carol_msg).await?;
+            let alice_msg = b"Hello from Alice".to_vec();
+            let bob_msg = b"Hello from Bob".to_vec();
+            let carol_msg = b"Hello from Carol".to_vec();
 
-            let alice_read = read_mailbox(services, &ohttp_keys, short_id_0)
-                .await?
-                .ok_or("Alice's mailbox should have a payload")?;
-            let bob_read = read_mailbox(services, &ohttp_keys, short_id_1)
-                .await?
-                .ok_or("Bob's mailbox should have a payload")?;
-            let carol_read = read_mailbox(services, &ohttp_keys, short_id_2)
-                .await?
-                .ok_or("Carol's mailbox should have a payload")?;
+            let (ra, rb, rc) = tokio::join!(
+                alice.write(alice_msg.clone()),
+                bob.write(bob_msg.clone()),
+                carol.write(carol_msg.clone()),
+            );
+            ra?;
+            rb?;
+            rc?;
 
-            assert_eq!(alice_read, alice_msg);
-            assert_eq!(bob_read, bob_msg);
-            assert_eq!(carol_read, carol_msg);
+            // Any peer (with the same secret) can iterate the full message
+            // set. Server-side ordering is opaque, so compare as a set.
+            let stream = alice.read();
+            tokio::pin!(stream);
+            let mut observed = Vec::new();
+            while let Some(item) = stream.next().await {
+                observed.push(item?);
+            }
+            assert_eq!(observed.len(), 3, "reader should see all three appended messages");
 
-            // An unrelated short_id (different shared secret) should have no payload posted.
+            use std::collections::HashSet;
+            let expected: HashSet<Vec<u8>> = [alice_msg, bob_msg, carol_msg].into_iter().collect();
+            let observed_set: HashSet<Vec<u8>> = observed.into_iter().collect();
+            assert_eq!(observed_set, expected);
+
+            // A peer initialized with a different secret sees an empty message set.
             let other_secret = secp256k1::SecretKey::new(&mut OsRng).secret_bytes();
-            let other_short_id = generate_short_id(&other_secret, 0);
-            let empty = read_mailbox(services, &ohttp_keys, other_short_id).await?;
-            assert!(empty.is_none(), "unrelated mailbox should be empty");
+            let stranger = DirectoryLinkedMailbox::new(services, &ohttp_keys, other_secret);
+            let stranger_stream = stranger.read();
+            tokio::pin!(stranger_stream);
+            assert!(stranger_stream.next().await.is_none(), "unrelated message set must be empty");
 
             Ok(())
         }
@@ -376,8 +492,8 @@ mod integration {
         async fn test_create_linked_mailbox() -> Result<(), BoxSendSyncError> {
             init_tracing();
             let mut services = TestServices::initialize().await?;
-            // 3 peers write to a linked sequence of mailboxes whose short_ids are
-            // derived as short_id = H(shared_secret, i) for i = 0..n.
+            // Three peers each hold an independent CollaborativeMessageSet
+            // handle initialized only with the shared secret.
             let result = tokio::select!(
                 err = services.take_ohttp_relay_handle() => panic!("Ohttp relay exited early: {:?}", err),
                 err = services.take_directory_handle() => panic!("Directory server exited early: {:?}", err),

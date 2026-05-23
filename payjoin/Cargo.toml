@@ -62,7 +62,9 @@ web-time = "1.1.0"
 ignored = ["bitcoin-units"]
 
 [dev-dependencies]
+async-stream = "0.3.6"
 bhttp = "0.6.1"
+futures = "0.3.31"
 ohttp = { package = "bitcoin-ohttp", version = "0.6.0" }
 once_cell = "1.21.3"
 payjoin-test-utils = { version = "0.0.1" }

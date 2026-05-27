@@ -191,14 +191,13 @@ mod integration {
     // not all needs v1
     #[cfg(all(feature = "io", feature = "v2", feature = "v1", feature = "_manual-tls"))]
     mod v2 {
-        // use std::random;
         use std::sync::Arc;
         use std::time::Duration;
 
-        use bitcoin::hashes::{sha256, Hash, HashEngine};
         use bitcoin::{secp256k1, Address, Transaction};
         use hpke::rand_core::OsRng;
         use http::StatusCode;
+        use payjoin::linked_mailbox::{CollaborativeMessageSet, DirectoryLinkedMailbox};
         use payjoin::persist::OptionalTransitionOutcome;
         use payjoin::receive::v2::{
             replay_event_log as replay_receiver_event_log, Monitor, PayjoinProposal,
@@ -224,219 +223,20 @@ mod integration {
             BroadcastFallbackTransaction,
         }
 
-        // Generate a short id based on shared secret and index
-        fn generate_short_id(shared_secret: &[u8], index: u64) -> payjoin::directory::ShortId {
-            let mut engine = sha256::Hash::engine();
-            engine.input(b"v0-PayjoinDirectoryEntry");
-            engine.input(shared_secret);
-            engine.input(index.to_le_bytes().as_slice());
-            sha256::Hash::from_engine(engine).into()
-        }
-
-        // Padding sized to match payjoin/src/core/ohttp.rs:
-        // ENCAPSULATED_MESSAGE_BYTES - (N_ENC=65 + N_T=16 + OHTTP_REQ_HEADER_BYTES=7)
-        const PADDED_BHTTP_REQ_BYTES: usize =
-            payjoin::directory::ENCAPSULATED_MESSAGE_BYTES - (65 + 16 + 7);
-
-        fn encapsulate_request(
-            ohttp_keys: &payjoin::OhttpKeys,
-            method: &str,
-            target_url: &str,
-            body: Option<&[u8]>,
-        ) -> Result<(Vec<u8>, ohttp::ClientResponse), BoxSendSyncError> {
-            let mut config = ohttp_keys.0.clone();
-            let ctx = ohttp::ClientRequest::from_config(&mut config)?;
-            let url = payjoin::Url::parse(target_url)?;
-            let authority = match url.port() {
-                Some(p) => format!("{}:{}", url.host_str(), p),
-                None => url.host_str(),
-            };
-            let mut bhttp_msg = bhttp::Message::request(
-                method.as_bytes().to_vec(),
-                url.scheme().as_bytes().to_vec(),
-                authority.into_bytes(),
-                url.path().as_bytes().to_vec(),
-            );
-            if let Some(b) = body {
-                bhttp_msg.write_content(b);
-            }
-            let mut bhttp_buf = vec![0u8; PADDED_BHTTP_REQ_BYTES];
-            bhttp_msg.write_bhttp(bhttp::Mode::KnownLength, &mut bhttp_buf.as_mut_slice())?;
-            let (encapsulated, ohttp_ctx) = ctx.encapsulate(&bhttp_buf)?;
-            Ok((encapsulated, ohttp_ctx))
-        }
-
-        fn decapsulate_response(
-            ohttp_ctx: ohttp::ClientResponse,
-            encapsulated: &[u8],
-        ) -> Result<(http::StatusCode, Vec<u8>), BoxSendSyncError> {
-            let bhttp_bytes = ohttp_ctx.decapsulate(encapsulated)?;
-            let mut cursor = std::io::Cursor::new(bhttp_bytes);
-            let msg = bhttp::Message::read_bhttp(&mut cursor)?;
-            let code = msg.control().status().ok_or("missing status")?.code();
-            let status = http::StatusCode::from_u16(code)?;
-            Ok((status, msg.content().to_vec()))
-        }
-
-        // The relay extracts the gateway URI from its request path; embed the
-        // directory URL there (matches `SessionContext::full_relay_url`).
-        fn relay_url_for_directory(services: &TestServices) -> String {
-            format!("{}/{}", services.ohttp_relay_url(), services.directory_url())
-        }
-
-        async fn write_mailbox(
+        fn make_mailbox(
             services: &TestServices,
-            ohttp_keys: &payjoin::OhttpKeys,
-            short_id: payjoin::directory::ShortId,
-            message: &[u8],
-        ) -> Result<http::StatusCode, BoxSendSyncError> {
-            let target = format!("{}/{}", services.directory_url(), short_id);
-            let (req, ohttp_ctx) = encapsulate_request(ohttp_keys, "POST", &target, Some(message))?;
-            let response = services
-                .http_agent()
-                .post(relay_url_for_directory(services))
-                .header("Content-Type", "message/ohttp-req")
-                .body(req)
-                .send()
-                .await?;
-            assert!(response.status().is_success(), "relay status: {}", response.status());
-            let body = response.bytes().await?;
-            let (status, _) = decapsulate_response(ohttp_ctx, &body)?;
-            Ok(status)
-        }
-
-        async fn read_mailbox(
-            services: &TestServices,
-            ohttp_keys: &payjoin::OhttpKeys,
-            short_id: payjoin::directory::ShortId,
-        ) -> Result<Option<Vec<u8>>, BoxSendSyncError> {
-            let target = format!("{}/{}", services.directory_url(), short_id);
-            let (req, ohttp_ctx) = encapsulate_request(ohttp_keys, "GET", &target, None)?;
-            let response = services
-                .http_agent()
-                .post(relay_url_for_directory(services))
-                .header("Content-Type", "message/ohttp-req")
-                .body(req)
-                .send()
-                .await?;
-            assert!(response.status().is_success(), "relay status: {}", response.status());
-            let body = response.bytes().await?;
-            let (status, content) = decapsulate_response(ohttp_ctx, &body)?;
-            match status {
-                http::StatusCode::OK => Ok(Some(content)),
-                http::StatusCode::ACCEPTED => Ok(None),
-                other => Err(format!("unexpected get_mailbox status: {}", other).into()),
-            }
-        }
-
-        /// Append-only broadcast channel shared by multiple participants.
-        ///
-        /// Each participant is initialized with the same shared identity.
-        trait CollaborativeMessageSet {
-            type Message;
-            type Error;
-
-            type Messages<'a>: futures::Stream<Item = Result<Self::Message, Self::Error>>
-                + Send
-                + 'a
-            where
-                Self: 'a;
-
-            /// Append one complete message.
-            async fn write(&self, message: Self::Message) -> Result<(), Self::Error>;
-
-            /// Read all messages from the beginning in server-determined order.
-            fn read(&self) -> Self::Messages<'_>;
-        }
-
-        /// `CollaborativeMessageSet` over a chain of directory mailboxes.
-        ///
-        /// `short_id(i) = H(shared_secret, i)`. `write` walks forward on 409
-        /// so concurrent writers converge on distinct slots without
-        /// coordinating an index out-of-band. `read` polls each slot in
-        /// order and stops when the directory's local wait timeout elapses
-        /// without a payload.
-        struct DirectoryLinkedMailbox<'a> {
-            services: &'a TestServices,
-            ohttp_keys: &'a payjoin::OhttpKeys,
+            ohttp_keys: &OhttpKeys,
             shared_secret: [u8; 32],
-            // Local-only hint for this peer; it starts at 0 and never
-            // decreases. Different peers do not share this hint, so each
-            // peer races forward independently and relies on the directory's
-            // 409 to resolve concurrent collisions.
-            next_write_index: std::sync::atomic::AtomicU64,
-        }
-
-        impl<'a> DirectoryLinkedMailbox<'a> {
-            fn new(
-                services: &'a TestServices,
-                ohttp_keys: &'a payjoin::OhttpKeys,
-                shared_secret: [u8; 32],
-            ) -> Self {
-                Self {
-                    services,
-                    ohttp_keys,
-                    shared_secret,
-                    next_write_index: std::sync::atomic::AtomicU64::new(0),
-                }
-            }
-        }
-
-        impl<'a> CollaborativeMessageSet for DirectoryLinkedMailbox<'a> {
-            type Message = Vec<u8>;
-            type Error = BoxSendSyncError;
-            type Messages<'b>
-                = std::pin::Pin<
-                Box<dyn futures::Stream<Item = Result<Vec<u8>, BoxSendSyncError>> + Send + 'b>,
-            >
-            where
-                Self: 'b;
-
-            async fn write(&self, message: Vec<u8>) -> Result<(), Self::Error> {
-                use std::sync::atomic::Ordering;
-                let mut i = self.next_write_index.load(Ordering::Relaxed);
-                loop {
-                    let short_id = generate_short_id(&self.shared_secret, i);
-                    let status =
-                        write_mailbox(self.services, self.ohttp_keys, short_id, &message).await?;
-                    match status {
-                        http::StatusCode::OK => {
-                            // Advance the local hint past the slot we just claimed.
-                            self.next_write_index.fetch_max(i + 1, Ordering::Relaxed);
-                            return Ok(());
-                        }
-                        http::StatusCode::CONFLICT => {
-                            i += 1;
-                        }
-                        other =>
-                            return Err(format!("unexpected post_mailbox status: {}", other).into()),
-                    }
-                }
-            }
-
-            fn read(&self) -> Self::Messages<'_> {
-                let secret = self.shared_secret;
-                let services = self.services;
-                let keys = self.ohttp_keys;
-                Box::pin(async_stream::stream! {
-                    let mut i = 0u64;
-                    loop {
-                        let short_id = generate_short_id(&secret, i);
-                        match read_mailbox(services, keys, short_id).await {
-                            Ok(Some(payload)) => {
-                                yield Ok(payload);
-                                i += 1;
-                            }
-                            // Local timeout: no payload at this slot. Could be true end-of-log.
-                            Ok(None) => break,
-                            Err(e) => {
-                                yield Err(e);
-                                break;
-                            }
-                        }
-                    }
-                })
-            }
+        ) -> DirectoryLinkedMailbox {
+            let gateway_url =
+                format!("{}/{}", services.ohttp_relay_url(), services.directory_url());
+            DirectoryLinkedMailbox::new(
+                (*services.http_agent()).clone(),
+                gateway_url,
+                services.directory_url(),
+                ohttp_keys.clone(),
+                shared_secret,
+            )
         }
 
         async fn do_linked_mailbox_test(services: &TestServices) -> Result<(), BoxSendSyncError> {
@@ -447,9 +247,9 @@ mod integration {
             let shared_secret = secp256k1::SecretKey::new(&mut OsRng).secret_bytes();
 
             // Each peer is independently initialized with only the shared secret.
-            let alice = DirectoryLinkedMailbox::new(services, &ohttp_keys, shared_secret);
-            let bob = DirectoryLinkedMailbox::new(services, &ohttp_keys, shared_secret);
-            let carol = DirectoryLinkedMailbox::new(services, &ohttp_keys, shared_secret);
+            let alice = make_mailbox(services, &ohttp_keys, shared_secret);
+            let bob = make_mailbox(services, &ohttp_keys, shared_secret);
+            let carol = make_mailbox(services, &ohttp_keys, shared_secret);
 
             let alice_msg = b"Hello from Alice".to_vec();
             let bob_msg = b"Hello from Bob".to_vec();
@@ -481,7 +281,7 @@ mod integration {
 
             // A peer initialized with a different secret sees an empty message set.
             let other_secret = secp256k1::SecretKey::new(&mut OsRng).secret_bytes();
-            let stranger = DirectoryLinkedMailbox::new(services, &ohttp_keys, other_secret);
+            let stranger = make_mailbox(services, &ohttp_keys, other_secret);
             let stranger_stream = stranger.read();
             tokio::pin!(stranger_stream);
             assert!(stranger_stream.next().await.is_none(), "unrelated message set must be empty");

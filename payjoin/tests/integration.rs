@@ -227,6 +227,7 @@ mod integration {
         // Generate a short id based on shared secret and index
         fn generate_short_id(shared_secret: &[u8], index: u64) -> payjoin::directory::ShortId {
             let mut engine = sha256::Hash::engine();
+            engine.input(b"v0-PayjoinDirectoryEntry");
             engine.input(shared_secret);
             engine.input(index.to_le_bytes().as_slice());
             sha256::Hash::from_engine(engine).into()

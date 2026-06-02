@@ -1396,7 +1396,7 @@ impl Receiver<Monitor> {
 
 /// Derive a mailbox endpoint on a directory given a [`ShortId`].
 /// It consists of a directory URL and the session ShortID in the path.
-fn mailbox_endpoint(directory: &Url, id: &ShortId) -> Url {
+pub(crate) fn mailbox_endpoint(directory: &Url, id: &ShortId) -> Url {
     let mut url = directory.clone();
     {
         let mut path_segments =

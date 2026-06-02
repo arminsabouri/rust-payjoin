@@ -65,7 +65,7 @@ impl InputScriptType {
 }
 
 /// Parameters fixed by the session creator before the multiparty session opens.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionParameters {
     /// Global `nVersion` for the collaborative transaction.
     tx_version: Version,

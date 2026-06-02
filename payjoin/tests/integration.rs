@@ -188,40 +188,15 @@ mod integration {
         }
     }
 
-    // not all needs v1
-    #[cfg(all(feature = "io", feature = "v2", feature = "v1", feature = "_manual-tls"))]
-    mod v2 {
-        use std::sync::Arc;
-        use std::time::Duration;
-
-        use bitcoin::{secp256k1, Address, Transaction};
+    #[cfg(feature = "multiparty")]
+    mod multiparty {
+        use bitcoin::secp256k1;
         use hpke::rand_core::OsRng;
-        use http::StatusCode;
-        use payjoin::linked_mailbox::{CollaborativeMessageSet, DirectoryLinkedMailbox};
-        use payjoin::persist::OptionalTransitionOutcome;
-        use payjoin::receive::v2::{
-            replay_event_log as replay_receiver_event_log, Monitor, PayjoinProposal,
-            ReceiveSession, Receiver, ReceiverBuilder, SessionStatus, UncheckedOriginalPayload,
+        use payjoin::multiparty::linked_mailbox::{
+            CollaborativeMessageSet, DirectoryLinkedMailbox,
         };
-        use payjoin::send::v2::{replay_event_log as replay_sender_event_log, SenderBuilder};
-        use payjoin::send::ResponseError;
-        use payjoin::{OhttpKeys, PjUri, UriExt};
-        use payjoin_test_utils::{
-            BoxSendSyncError, InMemoryPersister, SessionPersister, TestServices,
-        };
-        use reqwest::{Client, Response};
-
-        use super::*;
-
-        /// Possible actions the sender can take after receiving the Payjoin proposal from the
-        /// receiver.
-        ///
-        /// NOTE: This list is not finalized, as how the receiver can monitor non-segwit
-        /// sender addresses are still pending implementation: https://github.com/payjoin/rust-payjoin/issues/1214
-        enum SenderFinalAction {
-            SignAndBroadcastPayjoinProposal,
-            BroadcastFallbackTransaction,
-        }
+        use payjoin::OhttpKeys;
+        use payjoin_test_utils::{init_tracing, BoxSendSyncError, TestServices};
 
         fn make_mailbox(
             services: &TestServices,
@@ -301,6 +276,40 @@ mod integration {
                 res = do_linked_mailbox_test(&services) => res
             );
             result
+        }
+    }
+
+    // not all needs v1
+    #[cfg(all(feature = "io", feature = "v2", feature = "v1", feature = "_manual-tls"))]
+    mod v2 {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use bitcoin::{Address, Transaction};
+        use http::StatusCode;
+        use payjoin::persist::OptionalTransitionOutcome;
+        use payjoin::receive::v2::{
+            replay_event_log as replay_receiver_event_log, Monitor, PayjoinProposal,
+            ReceiveSession, Receiver, ReceiverBuilder, SessionStatus, UncheckedOriginalPayload,
+        };
+        use payjoin::send::v2::{replay_event_log as replay_sender_event_log, SenderBuilder};
+        use payjoin::send::ResponseError;
+        use payjoin::{OhttpKeys, PjUri, UriExt};
+        use payjoin_test_utils::{
+            BoxSendSyncError, InMemoryPersister, SessionPersister, TestServices,
+        };
+        use reqwest::{Client, Response};
+
+        use super::*;
+
+        /// Possible actions the sender can take after receiving the Payjoin proposal from the
+        /// receiver.
+        ///
+        /// NOTE: This list is not finalized, as how the receiver can monitor non-segwit
+        /// sender addresses are still pending implementation: https://github.com/payjoin/rust-payjoin/issues/1214
+        enum SenderFinalAction {
+            SignAndBroadcastPayjoinProposal,
+            BroadcastFallbackTransaction,
         }
 
         #[tokio::test]

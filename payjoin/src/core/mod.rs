@@ -42,9 +42,9 @@ pub use crate::ohttp::OhttpKeys;
 #[cfg(feature = "io")]
 #[cfg_attr(docsrs, doc(cfg(feature = "io")))]
 pub mod io;
-#[cfg(feature = "io")]
-#[cfg_attr(docsrs, doc(cfg(feature = "io")))]
-pub mod linked_mailbox;
+#[cfg(feature = "multiparty")]
+#[cfg_attr(docsrs, doc(cfg(feature = "multiparty")))]
+pub mod multiparty;
 
 /// 4M block size limit with base64 encoding overhead => maximum reasonable size of content-length
 /// 4_000_000 * 4 / 3 fits in u32

@@ -29,20 +29,6 @@ impl ResponderContext {
 
     pub fn uri(&self) -> &str { &self.uri }
 
-    fn full_relay_url(&self, ohttp_relay: impl IntoUrl) -> Result<Url, ResponderError> {
-        let relay_base = ohttp_relay.into_url()?;
-
-        let directory_base = self
-            .pj_param
-            .endpoint_url()
-            .join("/")
-            .map_err(|e| ResponderError::ParseUrl(e.into()))?;
-
-        relay_base
-            .join(&format!("/{directory_base}"))
-            .map_err(|e| ResponderError::ParseUrl(e.into()))
-    }
-
     fn ensure_not_expired(&self) -> Result<(), ResponderError> {
         let PjParam::V2(v2) = &self.pj_param else {
             return Err(ResponderError::NotV2);
@@ -129,7 +115,8 @@ impl Responder<Initialized> {
         ohttp_relay: impl IntoUrl,
     ) -> Result<(Request, ohttp::ClientResponse), ResponderError> {
         let (body, ohttp_ctx) = self.post_reply_body()?;
-        let relay_url = self.context.full_relay_url(ohttp_relay)?;
+        let relay_url =
+            crate::ohttp::full_relay_url(ohttp_relay, &self.context.pj_param.endpoint_url())?;
         let req = Request::new_v2(&relay_url, &body);
         Ok((req, ohttp_ctx))
     }

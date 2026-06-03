@@ -34,17 +34,6 @@ impl InitiatorContext {
     fn initiator_mailbox_id(&self) -> ShortId {
         sha256::Hash::hash(&self.initiator_key.public_key().to_compressed_bytes()).into()
     }
-
-    fn full_relay_url(&self, ohttp_relay: impl IntoUrl) -> Result<Url, InitiatorError> {
-        let relay_base = ohttp_relay.into_url()?;
-
-        let directory_base =
-            self.directory.join("/").map_err(|e| InitiatorError::ParseUrl(e.into()))?;
-
-        relay_base
-            .join(&format!("/{directory_base}"))
-            .map_err(|e| InitiatorError::ParseUrl(e.into()))
-    }
 }
 
 /// Multiparty initiator state machine.
@@ -121,7 +110,7 @@ impl Initiator<Initialized> {
         ohttp_relay: impl IntoUrl,
     ) -> Result<(Request, ohttp::ClientResponse), InitiatorError> {
         let (body, ohttp_ctx) = self.poll_req_body()?;
-        let relay_url = self.context.full_relay_url(ohttp_relay)?;
+        let relay_url = crate::ohttp::full_relay_url(ohttp_relay, &self.context.directory)?;
         let req = Request::new_v2(&relay_url, &body);
         Ok((req, ohttp_ctx))
     }

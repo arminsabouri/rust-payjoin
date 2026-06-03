@@ -6,12 +6,26 @@ use bitcoin::key::constants::UNCOMPRESSED_PUBLIC_KEY_SIZE;
 use hpke::rand_core::{OsRng, RngCore};
 
 use crate::directory::ENCAPSULATED_MESSAGE_BYTES;
+use crate::{IntoUrl, Url};
 
 const N_ENC: usize = UNCOMPRESSED_PUBLIC_KEY_SIZE;
 const N_T: usize = crate::hpke::POLY1305_TAG_SIZE;
 const OHTTP_REQ_HEADER_BYTES: usize = 7;
 pub const PADDED_BHTTP_REQ_BYTES: usize =
     ENCAPSULATED_MESSAGE_BYTES - (N_ENC + N_T + OHTTP_REQ_HEADER_BYTES);
+
+/// Build the OHTTP relay URL that forwards to the Payjoin Directory.
+///
+/// Only the relay's scheme and authority are used directly; the directory URL is appended as a
+/// path segment so the relay can proxy without learning query parameters.
+pub(crate) fn full_relay_url(
+    ohttp_relay: impl IntoUrl,
+    directory: &Url,
+) -> Result<Url, crate::into_url::Error> {
+    let relay_base = ohttp_relay.into_url()?;
+    let directory_base = directory.join("/")?;
+    relay_base.join(&format!("/{directory_base}")).map_err(Into::into)
+}
 
 pub(crate) fn ohttp_encapsulate(
     ohttp_keys: &ohttp::KeyConfig,

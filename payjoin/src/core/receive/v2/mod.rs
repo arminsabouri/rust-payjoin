@@ -83,19 +83,6 @@ pub struct SessionContext {
 }
 
 impl SessionContext {
-    fn full_relay_url(&self, ohttp_relay: impl IntoUrl) -> Result<Url, InternalSessionError> {
-        let relay_base = ohttp_relay.into_url().map_err(InternalSessionError::ParseUrl)?;
-
-        // Only reveal scheme and authority to the relay
-        let directory_base =
-            self.directory.join("/").map_err(|e| InternalSessionError::ParseUrl(e.into()))?;
-
-        // Append that information as a path to the relay URL
-        relay_base
-            .join(&format!("/{directory_base}"))
-            .map_err(|e| InternalSessionError::ParseUrl(e.into()))
-    }
-
     /// The mailbox ID where the receiver expects the sender's Original PSBT.
     pub(crate) fn proposal_mailbox_id(&self) -> ShortId {
         short_id_from_pubkey(self.receiver_key.public_key())
@@ -436,7 +423,11 @@ impl Receiver<Initialized> {
         }
         let (body, ohttp_ctx) =
             self.fallback_req_body().map_err(InternalSessionError::OhttpEncapsulation)?;
-        let req = Request::new_v2(&self.session_context.full_relay_url(ohttp_relay)?, &body);
+        let req = Request::new_v2(
+            &crate::ohttp::full_relay_url(ohttp_relay, &self.session_context.directory)
+                .map_err(InternalSessionError::ParseUrl)?,
+            &body,
+        );
         Ok((req, ohttp_ctx))
     }
 
@@ -1189,7 +1180,11 @@ impl Receiver<PayjoinProposal> {
             Some(&body),
         )?;
 
-        let req = Request::new_v2(&self.session_context.full_relay_url(ohttp_relay)?, &body);
+        let req = Request::new_v2(
+            &crate::ohttp::full_relay_url(ohttp_relay, &self.session_context.directory)
+                .map_err(InternalSessionError::ParseUrl)?,
+            &body,
+        );
         Ok((req, ctx))
     }
 
@@ -1271,7 +1266,11 @@ impl Receiver<HasReplyableError> {
         let (body, ohttp_ctx) =
             ohttp_encapsulate(&session_context.ohttp_keys.0, "POST", mailbox.as_str(), Some(&body))
                 .map_err(InternalSessionError::OhttpEncapsulation)?;
-        let req = Request::new_v2(&session_context.full_relay_url(ohttp_relay)?, &body);
+        let req = Request::new_v2(
+            &crate::ohttp::full_relay_url(ohttp_relay, &session_context.directory)
+                .map_err(InternalSessionError::ParseUrl)?,
+            &body,
+        );
         Ok((req, ohttp_ctx))
     }
 

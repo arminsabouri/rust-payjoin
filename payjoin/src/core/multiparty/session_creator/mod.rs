@@ -43,23 +43,6 @@ impl SessionCreatorContext {
         sha256::Hash::hash(&peer.to_compressed_bytes()).into()
     }
 
-    fn full_relay_url(
-        &self,
-        ohttp_relay: impl IntoUrl,
-    ) -> Result<Url, InternalSessionCreatorSessionError> {
-        let relay_base =
-            ohttp_relay.into_url().map_err(InternalSessionCreatorSessionError::ParseUrl)?;
-
-        let directory_base = self
-            .directory
-            .join("/")
-            .map_err(|e| InternalSessionCreatorSessionError::ParseUrl(e.into()))?;
-
-        relay_base
-            .join(&format!("/{directory_base}"))
-            .map_err(|e| InternalSessionCreatorSessionError::ParseUrl(e.into()))
-    }
-
     fn next_undelivered(&self) -> Option<&PendingParticipant> {
         self.participants.iter().find(|p| !p.parameters_delivered)
     }
@@ -246,8 +229,7 @@ impl SessionCreator<CollectedSessions> {
 
         let (body, ohttp_ctx) =
             self.distribution_post_body(&recipient).map_err(SessionCreatorError::from_session)?;
-        let relay_url =
-            self.context.full_relay_url(ohttp_relay).map_err(SessionCreatorError::from_session)?;
+        let relay_url = crate::ohttp::full_relay_url(ohttp_relay, &self.context.directory)?;
         let req = Request::new_v2(&relay_url, &body);
         Ok(Some((SessionParametersDistributionMessage { recipient }, req, ohttp_ctx)))
     }

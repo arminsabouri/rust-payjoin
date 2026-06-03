@@ -1,5 +1,4 @@
 mod error;
-mod session;
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
@@ -7,14 +6,14 @@ use std::time::Duration;
 use bitcoin::hashes::{sha256, Hash};
 pub use error::{InitiatorError, InitiatorSessionError};
 use serde::{Deserialize, Serialize};
-pub use session::{
-    replay_event_log, InitiatorEvent, InitiatorHistory, InitiatorOutcome, InitiatorSession,
-    InitiatorStatus,
-};
 #[cfg(target_arch = "wasm32")]
 use web_time::Duration;
 
 use crate::hpke::{decrypt_message_a, HpkeKeyPair, HpkePublicKey};
+pub use crate::multiparty::session::replay_event_log;
+use crate::multiparty::session::{
+    MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
+};
 use crate::multiparty::uri::{build_multiparty_pj_uri, MultipartyPjUri};
 use crate::ohttp::{ohttp_encapsulate, process_get_res};
 use crate::persist::{MaybeFatalTransitionWithNoResults, NextStateTransition};
@@ -28,7 +27,7 @@ pub struct InitiatorContext {
     initiator_key: HpkeKeyPair,
     directory: Url,
     ohttp_keys: OhttpKeys,
-    reply_key: Option<HpkePublicKey>,
+    pub(crate) reply_key: Option<HpkePublicKey>,
 }
 
 impl InitiatorContext {
@@ -71,9 +70,9 @@ impl InitiatorBuilder {
         }))
     }
 
-    pub fn build(self) -> NextStateTransition<InitiatorEvent, Initiator<Initialized>> {
+    pub fn build(self) -> NextStateTransition<MultipartySessionEvent, Initiator<Initialized>> {
         NextStateTransition::success(
-            InitiatorEvent::Created(self.0.clone()),
+            MultipartySessionEvent::InitiatorCreated(self.0.clone()),
             Initiator { state: Initialized {}, context: self.0 },
         )
     }
@@ -136,7 +135,7 @@ impl Initiator<Initialized> {
         body: &[u8],
         context: ohttp::ClientResponse,
     ) -> MaybeFatalTransitionWithNoResults<
-        InitiatorEvent,
+        MultipartySessionEvent,
         Initiator<HasReplyKey>,
         Initiator<Initialized>,
         InitiatorSessionError,
@@ -153,7 +152,7 @@ impl Initiator<Initialized> {
                 }
                 _ =>
                     return MaybeFatalTransitionWithNoResults::fatal(
-                        InitiatorEvent::Closed(InitiatorOutcome::Failure),
+                        MultipartySessionEvent::Closed(MultipartySessionOutcome::Failure),
                         e,
                     ),
             },
@@ -161,7 +160,7 @@ impl Initiator<Initialized> {
 
         if let Some(reply_key) = reply_key {
             MaybeFatalTransitionWithNoResults::success(
-                InitiatorEvent::RetrievedReplyKey(reply_key.clone()),
+                MultipartySessionEvent::InitiatorRetrievedReplyKey(reply_key.clone()),
                 Initiator {
                     state: HasReplyKey {},
                     context: InitiatorContext {
@@ -192,8 +191,8 @@ impl Initiator<Initialized> {
         Ok(Some(reply_key))
     }
 
-    pub(crate) fn apply_retrieved_reply_key(self, reply_key: HpkePublicKey) -> InitiatorSession {
-        InitiatorSession::HasReplyKey(Initiator {
+    pub(crate) fn apply_retrieved_reply_key(self, reply_key: HpkePublicKey) -> MultipartySession {
+        MultipartySession::InitiatorHasReplyKey(Initiator {
             state: HasReplyKey {},
             context: InitiatorContext { reply_key: Some(reply_key), ..self.context },
         })

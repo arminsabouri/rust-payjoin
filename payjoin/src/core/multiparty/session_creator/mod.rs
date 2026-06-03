@@ -1,5 +1,4 @@
 mod error;
-mod session;
 
 use std::fmt;
 
@@ -7,12 +6,12 @@ use bitcoin::hashes::{sha256, Hash};
 use error::InternalSessionCreatorSessionError;
 pub use error::SessionCreatorSessionError;
 use serde::{Deserialize, Serialize};
-pub use session::{
-    replay_event_log, SessionCreatorEvent, SessionCreatorHistory, SessionCreatorOutcome,
-    SessionCreatorSession, SessionCreatorStatus,
-};
 
 use crate::hpke::{encrypt_message_a, HpkeKeyPair, HpkePublicKey};
+pub use crate::multiparty::session::replay_event_log;
+use crate::multiparty::session::{
+    MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
+};
 use crate::multiparty::session_parameters::SessionParameters;
 use crate::ohttp::{ohttp_encapsulate, process_post_res, OhttpEncapsulationError};
 use crate::persist::{MaybeFatalTransition, NextStateTransition};
@@ -35,7 +34,7 @@ pub struct SessionCreatorContext {
     creator_key: HpkeKeyPair,
     directory: Url,
     ohttp_keys: OhttpKeys,
-    session_parameters: SessionParameters,
+    pub(crate) session_parameters: SessionParameters,
     participants: Vec<PendingParticipant>,
 }
 
@@ -168,7 +167,7 @@ impl SessionCreatorBuilder {
     pub fn build(
         self,
     ) -> Result<
-        NextStateTransition<SessionCreatorEvent, SessionCreator<CollectedSessions>>,
+        NextStateTransition<MultipartySessionEvent, SessionCreator<CollectedSessions>>,
         SessionCreatorError,
     > {
         if self.participant_keys.is_empty() {
@@ -190,7 +189,7 @@ impl SessionCreatorBuilder {
         };
 
         Ok(NextStateTransition::success(
-            SessionCreatorEvent::Created(context.clone()),
+            MultipartySessionEvent::SessionCreatorCreated(context.clone()),
             SessionCreator { state: CollectedSessions {}, context },
         ))
     }
@@ -213,13 +212,13 @@ pub enum ParametersDelivery {
     Distributed(SessionCreator<ParametersDistributed>),
 }
 
-impl From<ParametersDelivery> for SessionCreatorSession {
+impl From<ParametersDelivery> for MultipartySession {
     fn from(delivery: ParametersDelivery) -> Self {
         match delivery {
             ParametersDelivery::Collecting(state) =>
-                SessionCreatorSession::CollectedSessions(state),
+                MultipartySession::SessionCreatorCollectedSessions(state),
             ParametersDelivery::Distributed(state) =>
-                SessionCreatorSession::ParametersDistributed(state),
+                MultipartySession::SessionCreatorParametersDistributed(state),
         }
     }
 }
@@ -259,7 +258,7 @@ impl SessionCreator<CollectedSessions> {
         recipient: HpkePublicKey,
         body: &[u8],
         ohttp_context: ohttp::ClientResponse,
-    ) -> MaybeFatalTransition<SessionCreatorEvent, ParametersDelivery, SessionCreatorSessionError>
+    ) -> MaybeFatalTransition<MultipartySessionEvent, ParametersDelivery, SessionCreatorSessionError>
     {
         match process_post_res(body, ohttp_context) {
             Ok(()) => {}
@@ -271,18 +270,18 @@ impl SessionCreator<CollectedSessions> {
                 }
                 // TODO: should we should treat all of these as transient and re-try?
                 return MaybeFatalTransition::fatal(
-                    SessionCreatorEvent::Closed(SessionCreatorOutcome::Failure),
+                    MultipartySessionEvent::Closed(MultipartySessionOutcome::Failure),
                     InternalSessionCreatorSessionError::DirectoryResponse(e).into(),
                 );
             }
         }
 
-        let event = SessionCreatorEvent::ParametersDeliveredTo(recipient.clone());
+        let event = MultipartySessionEvent::SessionCreatorParametersDeliveredTo(recipient.clone());
         let delivery = match self.parameters_delivered_to(recipient) {
             Ok(delivery) => delivery,
             Err(e) => {
                 return MaybeFatalTransition::fatal(
-                    SessionCreatorEvent::Closed(SessionCreatorOutcome::Failure),
+                    MultipartySessionEvent::Closed(MultipartySessionOutcome::Failure),
                     e.into(),
                 );
             }
@@ -327,10 +326,7 @@ impl SessionCreator<CollectedSessions> {
             .map_err(InternalSessionCreatorSessionError::OhttpEncapsulation)
     }
 
-    pub(crate) fn apply_parameters_delivered(
-        self,
-        recipient: HpkePublicKey,
-    ) -> SessionCreatorSession {
+    pub(crate) fn apply_parameters_delivered(self, recipient: HpkePublicKey) -> MultipartySession {
         self.parameters_delivered_to(recipient)
             .expect("replay only applies valid ParametersDeliveredTo events")
             .into()

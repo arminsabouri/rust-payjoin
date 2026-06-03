@@ -1,14 +1,13 @@
 mod error;
-mod session;
 
 pub use error::{ResponderError, ResponderSessionError};
 use serde::{Deserialize, Serialize};
-pub use session::{
-    replay_event_log, ResponderEvent, ResponderHistory, ResponderOutcome, ResponderSession,
-    ResponderStatus,
-};
 
 use crate::hpke::{encrypt_message_a, HpkeKeyPair, HpkePublicKey};
+pub use crate::multiparty::session::replay_event_log;
+use crate::multiparty::session::{
+    MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
+};
 use crate::multiparty::uri::MultipartyPjUri;
 use crate::ohttp::{ohttp_encapsulate, process_post_res};
 use crate::persist::{MaybeFatalTransition, NextStateTransition};
@@ -22,7 +21,7 @@ pub struct ResponderContext {
     pj_param: PjParam,
     /// Original BIP-321 URI the responder accepted.
     uri: String,
-    sent_reply_key: Option<HpkePublicKey>,
+    pub(crate) sent_reply_key: Option<HpkePublicKey>,
 }
 
 impl ResponderContext {
@@ -68,7 +67,8 @@ impl ResponderBuilder {
     /// Start a responder session from a multiparty BIP-321 Payjoin URI.
     pub fn from_uri(
         uri: MultipartyPjUri,
-    ) -> Result<NextStateTransition<ResponderEvent, Responder<Initialized>>, ResponderError> {
+    ) -> Result<NextStateTransition<MultipartySessionEvent, Responder<Initialized>>, ResponderError>
+    {
         let pj_param = uri.pj_param().clone();
         let PjParam::V2(v2) = &pj_param else {
             return Err(ResponderError::NotV2);
@@ -85,7 +85,7 @@ impl ResponderBuilder {
         };
 
         Ok(NextStateTransition::success(
-            ResponderEvent::Created(context.clone()),
+            MultipartySessionEvent::ResponderCreated(context.clone()),
             Responder { state: Initialized {}, context },
         ))
     }
@@ -139,7 +139,8 @@ impl Responder<Initialized> {
         self,
         body: &[u8],
         context: ohttp::ClientResponse,
-    ) -> MaybeFatalTransition<ResponderEvent, Responder<SentReplyKey>, ResponderSessionError> {
+    ) -> MaybeFatalTransition<MultipartySessionEvent, Responder<SentReplyKey>, ResponderSessionError>
+    {
         let current_state = self.clone();
         if let Err(directory_error) = process_post_res(body, context) {
             let err = ResponderError::DirectoryResponse(directory_error);
@@ -149,14 +150,14 @@ impl Responder<Initialized> {
                 }
             }
             return MaybeFatalTransition::fatal(
-                ResponderEvent::Closed(ResponderOutcome::Failure),
+                MultipartySessionEvent::Closed(MultipartySessionOutcome::Failure),
                 err,
             );
         }
 
         let reply_key = current_state.context.responder_key.public_key().clone();
         MaybeFatalTransition::success(
-            ResponderEvent::SentReplyKey(reply_key.clone()),
+            MultipartySessionEvent::ResponderSentReplyKey(reply_key.clone()),
             Responder {
                 state: SentReplyKey {},
                 context: ResponderContext {
@@ -167,8 +168,8 @@ impl Responder<Initialized> {
         )
     }
 
-    pub(crate) fn apply_sent_reply_key(self, reply_key: HpkePublicKey) -> ResponderSession {
-        ResponderSession::SentReplyKey(Responder {
+    pub(crate) fn apply_sent_reply_key(self, reply_key: HpkePublicKey) -> MultipartySession {
+        MultipartySession::ResponderSentReplyKey(Responder {
             state: SentReplyKey {},
             context: ResponderContext { sent_reply_key: Some(reply_key), ..self.context },
         })

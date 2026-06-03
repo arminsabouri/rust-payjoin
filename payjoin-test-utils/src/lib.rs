@@ -273,6 +273,12 @@ pub async fn wait_for_service_ready(
     Err("Timeout waiting for service to be ready")
 }
 
+mod ohttp_directory;
+
+pub use ohttp_directory::{
+    simulate_directory_response, test_ohttp_key_config, EncapsulatedDirectoryMessage, OHTTP_RELAY,
+};
+
 pub static EXAMPLE_URL: &str = "https://example.com";
 
 pub const KEY_ID: KeyId = 1;

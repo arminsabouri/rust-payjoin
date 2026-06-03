@@ -164,20 +164,14 @@ impl std::error::Error for MultipartyUriError {
 mod tests {
     use std::str::FromStr;
 
-    use payjoin_test_utils::{EXAMPLE_URL, KEM, KEY_ID, SYMMETRIC};
+    use payjoin_test_utils::EXAMPLE_URL;
 
     use super::*;
     use crate::hpke::HpkeKeyPair;
+    use crate::multiparty::test_helpers::test_ohttp_keys;
     use crate::time::Time;
     use crate::uri::v2::PjParam as V2PjParam;
-    use crate::{OhttpKeys, Url};
-
-    fn test_ohttp_keys() -> OhttpKeys {
-        OhttpKeys(
-            ohttp::KeyConfig::new(KEY_ID, KEM, Vec::from(SYMMETRIC))
-                .expect("valid OHTTP key config"),
-        )
-    }
+    use crate::Url;
 
     fn sample_v2_pj_param() -> PjParam {
         let directory = Url::from_str(EXAMPLE_URL).expect("valid directory URL");

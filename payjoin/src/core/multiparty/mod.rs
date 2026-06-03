@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod test_helpers;
+
 pub mod initiator;
 #[cfg_attr(docsrs, doc(cfg(feature = "multiparty")))]
 pub mod linked_mailbox;

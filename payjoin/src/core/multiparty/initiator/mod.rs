@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use web_time::Duration;
 
 use crate::hpke::{decrypt_message_a, HpkeKeyPair, HpkePublicKey};
+use crate::multiparty::participant::{AwaitingSessionParameters, Participant, ParticipantContext};
 pub use crate::multiparty::session::replay_event_log;
 use crate::multiparty::session::{
     MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
@@ -27,12 +28,36 @@ pub struct InitiatorContext {
     initiator_key: HpkeKeyPair,
     directory: Url,
     ohttp_keys: OhttpKeys,
-    pub(crate) reply_key: Option<HpkePublicKey>,
+    /// Responder reply key from message A, once the initiator has polled the directory.
+    pub(crate) responder_public_key: Option<HpkePublicKey>,
 }
 
 impl InitiatorContext {
     fn initiator_mailbox_id(&self) -> ShortId {
         sha256::Hash::hash(&self.initiator_key.public_key().to_compressed_bytes()).into()
+    }
+
+    fn session_parameters_mailbox_id(&self) -> Option<ShortId> {
+        if let Some(responder_public_key) = &self.responder_public_key {
+            Some(sha256::Hash::hash(&responder_public_key.to_compressed_bytes()).into())
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn participant_context(
+        &self,
+        responder_public_key: HpkePublicKey,
+    ) -> ParticipantContext {
+        ParticipantContext::new(
+            self.initiator_key.clone(),
+            self.directory.clone(),
+            self.ohttp_keys.clone(),
+            responder_public_key,
+            self.session_parameters_mailbox_id().expect(
+                "session parameters mailbox id must be present TODO: this should not panic",
+            ),
+        )
     }
 }
 
@@ -55,7 +80,7 @@ impl InitiatorBuilder {
             initiator_key,
             directory: directory.into_url()?,
             ohttp_keys,
-            reply_key: None,
+            responder_public_key: None,
         }))
     }
 
@@ -125,14 +150,14 @@ impl Initiator<Initialized> {
         context: ohttp::ClientResponse,
     ) -> MaybeFatalTransitionWithNoResults<
         MultipartySessionEvent,
-        Initiator<HasReplyKey>,
+        Participant<AwaitingSessionParameters>,
         Initiator<Initialized>,
         InitiatorSessionError,
     > {
         // TODO: this should transition to a common state where responder and initator are waiting
         let current_state = self.clone();
-        let reply_key = match self.inner_process_poll_res(body, context) {
-            Ok(reply_key) => reply_key,
+        let responder_public_key = match self.inner_process_poll_res(body, context) {
+            Ok(responder_public_key) => responder_public_key,
             Err(e) => match &e {
                 InitiatorError::DirectoryResponse(directory_error)
                     if !directory_error.is_fatal() =>
@@ -147,15 +172,12 @@ impl Initiator<Initialized> {
             },
         };
 
-        if let Some(reply_key) = reply_key {
+        if let Some(responder_public_key) = responder_public_key {
             MaybeFatalTransitionWithNoResults::success(
-                MultipartySessionEvent::InitiatorRetrievedReplyKey(reply_key.clone()),
-                Initiator {
-                    state: HasReplyKey {},
-                    context: InitiatorContext {
-                        reply_key: Some(reply_key),
-                        ..current_state.context
-                    },
+                MultipartySessionEvent::InitiatorRetrievedReplyKey(responder_public_key.clone()),
+                Participant {
+                    state: AwaitingSessionParameters {},
+                    context: current_state.context.participant_context(responder_public_key),
                 },
             )
         } else {
@@ -180,10 +202,13 @@ impl Initiator<Initialized> {
         Ok(Some(reply_key))
     }
 
-    pub(crate) fn apply_retrieved_reply_key(self, reply_key: HpkePublicKey) -> MultipartySession {
-        MultipartySession::InitiatorHasReplyKey(Initiator {
-            state: HasReplyKey {},
-            context: InitiatorContext { reply_key: Some(reply_key), ..self.context },
+    pub(crate) fn apply_retrieved_reply_key(
+        self,
+        responder_public_key: HpkePublicKey,
+    ) -> MultipartySession {
+        MultipartySession::ParticipantAwaitingSessionParameters(Participant {
+            state: AwaitingSessionParameters {},
+            context: self.context.participant_context(responder_public_key),
         })
     }
 }

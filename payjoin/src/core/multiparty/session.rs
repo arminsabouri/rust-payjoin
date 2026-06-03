@@ -4,14 +4,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{InternalReplayError, ReplayError};
 use crate::multiparty::initiator::{
-    HasReplyKey, Initialized as InitiatorInitialized, Initiator, InitiatorContext,
+    Initialized as InitiatorInitialized, Initiator, InitiatorContext,
+};
+use crate::multiparty::participant::{
+    AwaitingSessionParameters, HasSessionParameters, Participant,
 };
 use crate::multiparty::responder::{
-    Initialized as ResponderInitialized, Responder, ResponderContext, SentReplyKey,
+    Initialized as ResponderInitialized, Responder, ResponderContext,
 };
 use crate::multiparty::session_creator::{
     CollectedSessions, ParametersDistributed, SessionCreator, SessionCreatorContext,
 };
+use crate::multiparty::SessionParameters;
 use crate::persist::SessionPersister;
 use crate::{HpkePublicKey, ImplementationError};
 
@@ -23,6 +27,7 @@ pub enum MultipartySessionEvent {
     InitiatorRetrievedReplyKey(HpkePublicKey),
     ResponderCreated(ResponderContext),
     ResponderSentReplyKey(HpkePublicKey),
+    ParticipantRetrievedSessionParameters(SessionParameters),
     SessionCreatorCreated(SessionCreatorContext),
     SessionCreatorParametersDeliveredTo(HpkePublicKey),
     Closed(MultipartySessionOutcome),
@@ -43,9 +48,9 @@ impl MultipartySessionEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MultipartySession {
     InitiatorInitialized(Initiator<InitiatorInitialized>),
-    InitiatorHasReplyKey(Initiator<HasReplyKey>),
     ResponderInitialized(Responder<ResponderInitialized>),
-    ResponderSentReplyKey(Responder<SentReplyKey>),
+    ParticipantAwaitingSessionParameters(Participant<AwaitingSessionParameters>),
+    ParticipantHasSessionParameters(Participant<HasSessionParameters>),
     SessionCreatorCollectedSessions(SessionCreator<CollectedSessions>),
     SessionCreatorParametersDistributed(SessionCreator<ParametersDistributed>),
     Closed(MultipartySessionOutcome),
@@ -53,11 +58,7 @@ pub enum MultipartySession {
 
 impl MultipartySession {
     pub fn is_pending_parameters(&self) -> bool {
-        matches!(
-            self,
-            MultipartySession::InitiatorHasReplyKey(_)
-                | MultipartySession::ResponderSentReplyKey(_)
-        )
+        matches!(self, MultipartySession::ParticipantAwaitingSessionParameters(_))
     }
 }
 
@@ -76,6 +77,11 @@ impl MultipartySession {
                 MultipartySession::ResponderInitialized(state),
                 MultipartySessionEvent::ResponderSentReplyKey(reply_key),
             ) => Ok(state.apply_sent_reply_key(reply_key)),
+
+            (
+                MultipartySession::ParticipantAwaitingSessionParameters(state),
+                MultipartySessionEvent::ParticipantRetrievedSessionParameters(session_parameters),
+            ) => Ok(state.apply_retrieved_session_parameters(session_parameters)),
 
             (
                 MultipartySession::SessionCreatorCollectedSessions(state),
@@ -174,9 +180,9 @@ where
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionStatus {
     InitiatorActive,
-    InitiatorHasReplyKey,
     ResponderActive,
-    ResponderSentReplyKey,
+    ParticipantAwaitingSessionParameters,
+    ParticipantHasSessionParameters,
     SessionCreatorCollectingParameters,
     SessionCreatorParametersDistributed,
     Closed(MultipartySessionOutcome),

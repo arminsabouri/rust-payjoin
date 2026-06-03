@@ -4,6 +4,7 @@ mod test_helpers;
 pub mod initiator;
 #[cfg_attr(docsrs, doc(cfg(feature = "multiparty")))]
 pub mod linked_mailbox;
+pub mod participant;
 pub mod responder;
 pub mod session;
 pub mod session_creator;
@@ -12,12 +13,16 @@ pub mod session_parameters;
 #[cfg_attr(docsrs, doc(cfg(feature = "multiparty")))]
 pub mod uri;
 pub use initiator::{
-    HasReplyKey, Initialized, Initiator, InitiatorBuilder, InitiatorContext, InitiatorError,
-    InitiatorSessionError,
+    Initialized as InitiatorInitialized, Initiator, InitiatorBuilder, InitiatorContext,
+    InitiatorError, InitiatorSessionError,
+};
+pub use participant::{
+    AwaitingSessionParameters, HasSessionParameters, Participant, ParticipantContext,
+    ParticipantError, ParticipantSessionError,
 };
 pub use responder::{
     Initialized as ResponderInitialized, Responder, ResponderBuilder, ResponderContext,
-    ResponderError, ResponderSessionError, SentReplyKey,
+    ResponderError, ResponderSessionError,
 };
 pub use session::{
     replay_event_log, MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,

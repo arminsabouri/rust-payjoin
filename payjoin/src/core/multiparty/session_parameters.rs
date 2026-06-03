@@ -197,6 +197,26 @@ impl SessionParameters {
             session_secret,
         })
     }
+
+    /// Deserialize session parameters from a message-A plaintext body (zero-padded to
+    /// [`crate::hpke::PADDED_PLAINTEXT_A_LENGTH`]).
+    pub fn from_message_a_body(bytes: &[u8]) -> Result<Self, SessionParametersError> {
+        match Self::from_bytes(bytes) {
+            Ok(params) => Ok(params),
+            Err(SessionParametersError::TrailingBytes(trailing)) => {
+                let encoded_len = bytes
+                    .len()
+                    .checked_sub(trailing)
+                    .ok_or(SessionParametersError::TrailingBytes(trailing))?;
+                if bytes[encoded_len..].iter().all(|byte| *byte == 0) {
+                    Self::from_bytes(&bytes[..encoded_len])
+                } else {
+                    Err(SessionParametersError::TrailingBytes(trailing))
+                }
+            }
+            Err(err) => Err(err),
+        }
+    }
 }
 
 fn ensure_unique_input_types(types: &[InputScriptType]) -> Result<(), SessionParametersError> {

@@ -1,9 +1,11 @@
 mod error;
 
+use bitcoin::hashes::{sha256, Hash};
 pub use error::{ResponderError, ResponderSessionError};
 use serde::{Deserialize, Serialize};
 
 use crate::hpke::{encrypt_message_a, HpkeKeyPair, HpkePublicKey};
+use crate::multiparty::participant::{AwaitingSessionParameters, Participant, ParticipantContext};
 pub use crate::multiparty::session::replay_event_log;
 use crate::multiparty::session::{
     MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
@@ -12,7 +14,7 @@ use crate::multiparty::uri::MultipartyPjUri;
 use crate::ohttp::{ohttp_encapsulate, process_post_res};
 use crate::persist::{MaybeFatalTransition, NextStateTransition};
 use crate::uri::PjParam;
-use crate::{IntoUrl, Request, Url};
+use crate::{IntoUrl, Request};
 
 /// Persistent context for a multiparty responder session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,7 +23,8 @@ pub struct ResponderContext {
     pj_param: PjParam,
     /// Original BIP-321 URI the responder accepted.
     uri: String,
-    pub(crate) sent_reply_key: Option<HpkePublicKey>,
+    /// Initiator HPKE public key from the multiparty Payjoin URI (`pj` receiver pubkey).
+    pub(crate) initiator_public_key: HpkePublicKey,
 }
 
 impl ResponderContext {
@@ -38,6 +41,23 @@ impl ResponderContext {
         }
         Ok(())
     }
+
+    pub(crate) fn participant_context(&self) -> Result<ParticipantContext, ResponderError> {
+        self.ensure_not_expired()?;
+        let PjParam::V2(v2) = &self.pj_param else {
+            return Err(ResponderError::NotV2);
+        };
+        Ok(ParticipantContext::new(
+            self.responder_key.clone(),
+            v2.endpoint().clone(),
+            v2.ohttp_keys().clone(),
+            self.initiator_public_key.clone(),
+            // TODO: de-deup
+            sha256::Hash::hash(&self.initiator_public_key.to_compressed_bytes()).into(),
+        ))
+    }
+
+    pub(crate) fn responder_public_key(&self) -> &HpkePublicKey { self.responder_key.public_key() }
 }
 
 /// Multiparty responder state machine.
@@ -63,11 +83,12 @@ impl ResponderBuilder {
             return Err(ResponderError::Expired);
         }
 
+        let initiator_public_key = v2.receiver_pubkey().clone();
         let context = ResponderContext {
             responder_key: HpkeKeyPair::gen_keypair(),
             pj_param,
             uri: uri.as_str().to_string(),
-            sent_reply_key: None,
+            initiator_public_key,
         };
 
         Ok(NextStateTransition::success(
@@ -126,8 +147,11 @@ impl Responder<Initialized> {
         self,
         body: &[u8],
         context: ohttp::ClientResponse,
-    ) -> MaybeFatalTransition<MultipartySessionEvent, Responder<SentReplyKey>, ResponderSessionError>
-    {
+    ) -> MaybeFatalTransition<
+        MultipartySessionEvent,
+        Participant<AwaitingSessionParameters>,
+        ResponderSessionError,
+    > {
         let current_state = self.clone();
         if let Err(directory_error) = process_post_res(body, context) {
             let err = ResponderError::DirectoryResponse(directory_error);
@@ -142,23 +166,28 @@ impl Responder<Initialized> {
             );
         }
 
-        let reply_key = current_state.context.responder_key.public_key().clone();
+        let sent_reply_key = current_state.context.responder_public_key().clone();
+        let participant_context = match current_state.context.participant_context() {
+            Ok(ctx) => ctx,
+            Err(err) =>
+                return MaybeFatalTransition::fatal(
+                    MultipartySessionEvent::Closed(MultipartySessionOutcome::Failure),
+                    err,
+                ),
+        };
         MaybeFatalTransition::success(
-            MultipartySessionEvent::ResponderSentReplyKey(reply_key.clone()),
-            Responder {
-                state: SentReplyKey {},
-                context: ResponderContext {
-                    sent_reply_key: Some(reply_key),
-                    ..current_state.context
-                },
-            },
+            MultipartySessionEvent::ResponderSentReplyKey(sent_reply_key),
+            Participant { state: AwaitingSessionParameters {}, context: participant_context },
         )
     }
 
-    pub(crate) fn apply_sent_reply_key(self, reply_key: HpkePublicKey) -> MultipartySession {
-        MultipartySession::ResponderSentReplyKey(Responder {
-            state: SentReplyKey {},
-            context: ResponderContext { sent_reply_key: Some(reply_key), ..self.context },
+    pub(crate) fn apply_sent_reply_key(self, _sent_reply_key: HpkePublicKey) -> MultipartySession {
+        MultipartySession::ParticipantAwaitingSessionParameters(Participant {
+            state: AwaitingSessionParameters {},
+            context: self
+                .context
+                .participant_context()
+                .expect("replay only applies after responder posted reply key"),
         })
     }
 }

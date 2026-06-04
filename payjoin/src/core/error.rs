@@ -63,6 +63,12 @@ impl<SessionState: Debug, SessionEvent: Debug> std::error::Error
 }
 
 #[cfg(feature = "v2")]
+impl<SessionState, SessionEvent> ReplayError<SessionState, SessionEvent> {
+    /// Whether the event log had no entries.
+    pub fn is_no_events(&self) -> bool { matches!(self.0, InternalReplayError::NoEvents) }
+}
+
+#[cfg(feature = "v2")]
 impl<SessionState: Debug, SessionEvent: Debug> From<InternalReplayError<SessionState, SessionEvent>>
     for ReplayError<SessionState, SessionEvent>
 {

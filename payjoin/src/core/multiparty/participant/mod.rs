@@ -19,12 +19,11 @@ use crate::{IntoUrl, OhttpKeys, Request, Url};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParticipantContext {
     mailbox_key: HpkeKeyPair,
-    directory: Url,
-    ohttp_keys: OhttpKeys,
+    pub(crate) directory: Url,
+    pub ohttp_keys: OhttpKeys,
     pub(crate) session_parameters: Option<SessionParameters>,
     /// The other party's HPKE public key (initiator for responders, responder for initiators).
     pub(crate) reply_key: HpkePublicKey,
-    session_parameters_mailbox_short_id: ShortId,
 }
 
 impl ParticipantContext {
@@ -33,15 +32,13 @@ impl ParticipantContext {
         directory: Url,
         ohttp_keys: OhttpKeys,
         reply_key: HpkePublicKey,
-        session_parameters_mailbox_short_id: ShortId,
     ) -> Self {
         Self {
             mailbox_key,
-            directory,
+            directory: directory.payjoin_directory_origin(),
             ohttp_keys,
             session_parameters: None,
             reply_key,
-            session_parameters_mailbox_short_id,
         }
     }
 }
@@ -54,14 +51,22 @@ pub struct Participant<State> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AwaitingSessionParameters {}
+pub struct AwaitingSessionParameters {
+    /// HPKE public key for the Payjoin Directory mailbox that receives session parameters.
+    pub(crate) parameters_mailbox_public_key: HpkePublicKey,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HasSessionParameters {}
 
 impl Participant<AwaitingSessionParameters> {
-    fn mailbox_id(&self) -> ShortId {
-        sha256::Hash::hash(&self.context.mailbox_key.public_key().to_compressed_bytes()).into()
+    /// Mailbox where the session creator POSTs parameters and this participant polls.
+    pub(crate) fn parameters_mailbox_public_key(&self) -> &HpkePublicKey {
+        &self.state.parameters_mailbox_public_key
+    }
+
+    fn parameters_mailbox_short_id(&self) -> ShortId {
+        sha256::Hash::hash(&self.state.parameters_mailbox_public_key.to_compressed_bytes()).into()
     }
 
     fn session_parameters_poll_body(
@@ -70,7 +75,8 @@ impl Participant<AwaitingSessionParameters> {
         ([u8; crate::directory::ENCAPSULATED_MESSAGE_BYTES], ohttp::ClientResponse),
         ParticipantError,
     > {
-        let poll_target = mailbox_endpoint(&self.context.directory, &self.mailbox_id());
+        let poll_target =
+            mailbox_endpoint(&self.context.directory, &self.parameters_mailbox_short_id());
         ohttp_encapsulate(&self.context.ohttp_keys, "GET", poll_target.as_str(), None)
             .map_err(ParticipantError::OhttpEncapsulation)
     }
@@ -169,4 +175,11 @@ impl Participant<AwaitingSessionParameters> {
     }
 }
 
-impl Participant<HasSessionParameters> {}
+impl Participant<HasSessionParameters> {
+    pub fn session_parameters(&self) -> &SessionParameters {
+        self.context
+            .session_parameters
+            .as_ref()
+            .expect("HasSessionParameters state must have session_parameters in context")
+    }
+}

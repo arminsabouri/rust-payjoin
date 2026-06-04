@@ -29,8 +29,9 @@ pub use responder::{
     ResponderError, ResponderSessionError,
 };
 pub use session::{
-    replay_event_log, MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
-    SessionHistory, SessionStatus,
+    collect_open_sessions_awaiting_parameters, replay_event_log, CollectAwaitingParametersError,
+    MultipartySession, MultipartySessionEvent, MultipartySessionOutcome, SessionHistory,
+    SessionStatus,
 };
 pub use session_creator::{
     CollectedSessions, ParametersDelivery, ParametersDistributed, PendingParticipant,

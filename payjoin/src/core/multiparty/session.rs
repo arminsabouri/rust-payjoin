@@ -1,5 +1,7 @@
 //! Multiparty session events, state, replay, and history.
 
+use core::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::{InternalReplayError, ReplayError};
@@ -9,6 +11,7 @@ use crate::multiparty::initiator::{
 use crate::multiparty::participant::{
     AwaitingSessionParameters, HasSessionParameters, Participant,
 };
+use crate::multiparty::persist::MultipartySessionRegistry;
 use crate::multiparty::responder::{
     Initialized as ResponderInitialized, Responder, ResponderContext,
 };
@@ -174,6 +177,75 @@ where
 
     let history = construct_history(session_events)?;
     Ok((session, history))
+}
+
+/// Errors from [`collect_open_sessions_awaiting_parameters`].
+pub enum CollectAwaitingParametersError<R: MultipartySessionRegistry> {
+    Registry(R::Error),
+    Replay(ReplayError<MultipartySession, MultipartySessionEvent>),
+}
+
+impl<R: MultipartySessionRegistry> fmt::Debug for CollectAwaitingParametersError<R>
+where
+    R::Error: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Registry(err) => f.debug_tuple("Registry").field(err).finish(),
+            Self::Replay(err) => f.debug_tuple("Replay").field(err).finish(),
+        }
+    }
+}
+
+impl<R: MultipartySessionRegistry> fmt::Display for CollectAwaitingParametersError<R>
+where
+    R::Error: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Registry(err) => write!(f, "registry error: {err}"),
+            Self::Replay(err) => write!(f, "replay error: {err}"),
+        }
+    }
+}
+
+impl<R: MultipartySessionRegistry> std::error::Error for CollectAwaitingParametersError<R>
+where
+    R::Error: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Registry(err) => Some(err),
+            Self::Replay(err) => Some(err),
+        }
+    }
+}
+
+/// Replay every open session in `registry` and return those awaiting session parameters.
+///
+/// Empty logs and sessions still in initiator/responder bootstrap are skipped. Replay failures
+/// other than an empty log are returned immediately.
+pub fn collect_open_sessions_awaiting_parameters<R>(
+    registry: &R,
+) -> Result<Vec<Participant<AwaitingSessionParameters>>, CollectAwaitingParametersError<R>>
+where
+    R: MultipartySessionRegistry,
+{
+    let mut awaiting = Vec::new();
+
+    for persister in registry.list_open().map_err(CollectAwaitingParametersError::Registry)? {
+        let (session, _) = match replay_events(persister) {
+            Ok(result) => result,
+            Err(err) if err.is_no_events() => continue,
+            Err(err) => return Err(CollectAwaitingParametersError::Replay(err)),
+        };
+
+        if let MultipartySession::ParticipantAwaitingSessionParameters(participant) = session {
+            awaiting.push(participant);
+        }
+    }
+
+    Ok(awaiting)
 }
 
 /// Inferred status of a multiparty session from its event log.

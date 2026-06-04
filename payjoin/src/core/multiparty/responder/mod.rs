@@ -1,6 +1,5 @@
 mod error;
 
-use bitcoin::hashes::{sha256, Hash};
 pub use error::{ResponderError, ResponderSessionError};
 use serde::{Deserialize, Serialize};
 
@@ -49,11 +48,9 @@ impl ResponderContext {
         };
         Ok(ParticipantContext::new(
             self.responder_key.clone(),
-            v2.endpoint().clone(),
+            v2.directory().clone(),
             v2.ohttp_keys().clone(),
             self.initiator_public_key.clone(),
-            // TODO: de-deup
-            sha256::Hash::hash(&self.initiator_public_key.to_compressed_bytes()).into(),
         ))
     }
 
@@ -176,14 +173,19 @@ impl Responder<Initialized> {
                 ),
         };
         MaybeFatalTransition::success(
-            MultipartySessionEvent::ResponderSentReplyKey(sent_reply_key),
-            Participant { state: AwaitingSessionParameters {}, context: participant_context },
+            MultipartySessionEvent::ResponderSentReplyKey(sent_reply_key.clone()),
+            Participant {
+                state: AwaitingSessionParameters { parameters_mailbox_public_key: sent_reply_key },
+                context: participant_context,
+            },
         )
     }
 
     pub(crate) fn apply_sent_reply_key(self, _sent_reply_key: HpkePublicKey) -> MultipartySession {
         MultipartySession::ParticipantAwaitingSessionParameters(Participant {
-            state: AwaitingSessionParameters {},
+            state: AwaitingSessionParameters {
+                parameters_mailbox_public_key: self.context.responder_public_key().clone(),
+            },
             context: self
                 .context
                 .participant_context()

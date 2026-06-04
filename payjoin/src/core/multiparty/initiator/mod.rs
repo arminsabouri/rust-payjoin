@@ -37,14 +37,6 @@ impl InitiatorContext {
         sha256::Hash::hash(&self.initiator_key.public_key().to_compressed_bytes()).into()
     }
 
-    fn session_parameters_mailbox_id(&self) -> Option<ShortId> {
-        if let Some(responder_public_key) = &self.responder_public_key {
-            Some(sha256::Hash::hash(&responder_public_key.to_compressed_bytes()).into())
-        } else {
-            None
-        }
-    }
-
     pub(crate) fn participant_context(
         &self,
         responder_public_key: HpkePublicKey,
@@ -54,9 +46,6 @@ impl InitiatorContext {
             self.directory.clone(),
             self.ohttp_keys.clone(),
             responder_public_key,
-            self.session_parameters_mailbox_id().expect(
-                "session parameters mailbox id must be present TODO: this should not panic",
-            ),
         )
     }
 }
@@ -176,7 +165,9 @@ impl Initiator<Initialized> {
             MaybeFatalTransitionWithNoResults::success(
                 MultipartySessionEvent::InitiatorRetrievedReplyKey(responder_public_key.clone()),
                 Participant {
-                    state: AwaitingSessionParameters {},
+                    state: AwaitingSessionParameters {
+                        parameters_mailbox_public_key: responder_public_key.clone(),
+                    },
                     context: current_state.context.participant_context(responder_public_key),
                 },
             )
@@ -207,7 +198,9 @@ impl Initiator<Initialized> {
         responder_public_key: HpkePublicKey,
     ) -> MultipartySession {
         MultipartySession::ParticipantAwaitingSessionParameters(Participant {
-            state: AwaitingSessionParameters {},
+            state: AwaitingSessionParameters {
+                parameters_mailbox_public_key: responder_public_key.clone(),
+            },
             context: self.context.participant_context(responder_public_key),
         })
     }

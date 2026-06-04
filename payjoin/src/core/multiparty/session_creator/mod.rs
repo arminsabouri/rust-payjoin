@@ -8,6 +8,7 @@ pub use error::SessionCreatorSessionError;
 use serde::{Deserialize, Serialize};
 
 use crate::hpke::{encrypt_message_a, HpkeKeyPair, HpkePublicKey};
+use crate::multiparty::participant::{AwaitingSessionParameters, Participant};
 pub use crate::multiparty::session::replay_event_log;
 use crate::multiparty::session::{
     MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
@@ -89,6 +90,10 @@ pub enum SessionCreatorError {
     ParseUrl(crate::into_url::Error),
     OhttpEncapsulation(OhttpEncapsulationError),
     NoPendingParticipants,
+    /// Collected participants use different Payjoin Directory URLs.
+    InconsistentDirectory,
+    /// Two or more participants share the same mailbox public key.
+    DuplicateParticipant,
 }
 
 impl fmt::Display for SessionCreatorError {
@@ -98,6 +103,9 @@ impl fmt::Display for SessionCreatorError {
             Self::OhttpEncapsulation(err) => write!(f, "ohttp encapsulation error: {err}"),
             Self::NoPendingParticipants =>
                 write!(f, "no participants to distribute session parameters to"),
+            Self::InconsistentDirectory =>
+                write!(f, "participants do not share the same directory URL"),
+            Self::DuplicateParticipant => write!(f, "duplicate participant mailbox public key"),
         }
     }
 }
@@ -107,7 +115,9 @@ impl std::error::Error for SessionCreatorError {
         match self {
             Self::ParseUrl(err) => Some(err),
             Self::OhttpEncapsulation(err) => Some(err),
-            Self::NoPendingParticipants => None,
+            Self::NoPendingParticipants
+            | Self::InconsistentDirectory
+            | Self::DuplicateParticipant => None,
         }
     }
 }
@@ -130,8 +140,9 @@ pub struct SessionCreatorBuilder {
 impl SessionCreatorBuilder {
     /// Start a session-creator that will distribute [`SessionParameters`] to each participant.
     ///
-    /// `participant_keys` are responder reply keys from message A; each key identifies the
-    /// participant's mailbox on the Payjoin Directory.
+    /// `participant_keys` are each participant's session-parameters mailbox HPKE public keys (see
+    /// [`Participant::parameters_mailbox_public_key`]); each key identifies that mailbox on the
+    /// Payjoin Directory.
     pub fn new(
         session_parameters: SessionParameters,
         participant_keys: impl IntoIterator<Item = HpkePublicKey>,
@@ -144,6 +155,40 @@ impl SessionCreatorBuilder {
             participant_keys,
             directory: directory.into_url()?,
             ohttp_keys,
+        })
+    }
+
+    /// Build from participants awaiting session parameters.
+    ///
+    /// Delivers to each participant's [`Participant::parameters_mailbox_public_key`] (directory
+    /// short id `H(parameters mailbox)`), set when the role transitions into
+    /// [`AwaitingSessionParameters`].
+    pub fn from_awaiting_participants<'a>(
+        session_parameters: SessionParameters,
+        participants: impl IntoIterator<Item = &'a Participant<AwaitingSessionParameters>>,
+    ) -> Result<Self, SessionCreatorError> {
+        let mut participants = participants.into_iter();
+        let first = participants.next().ok_or(SessionCreatorError::NoPendingParticipants)?;
+        // TOOD: can we just encode the directory and ohttp keys in the session parameters?
+        let directory = first.context.directory.clone();
+        let mut participant_keys = vec![first.parameters_mailbox_public_key().clone()];
+
+        for participant in participants {
+            if participant.context.directory != directory {
+                return Err(SessionCreatorError::InconsistentDirectory);
+            }
+            let key = participant.parameters_mailbox_public_key().clone();
+            if participant_keys.contains(&key) {
+                return Err(SessionCreatorError::DuplicateParticipant);
+            }
+            participant_keys.push(key);
+        }
+
+        Ok(Self {
+            session_parameters,
+            participant_keys,
+            directory,
+            ohttp_keys: first.context.ohttp_keys.clone(),
         })
     }
 

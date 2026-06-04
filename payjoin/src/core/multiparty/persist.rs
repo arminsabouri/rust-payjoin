@@ -1,8 +1,11 @@
-//! Multiparty session registry: many disjoint event logs, keyed by an opaque handle.
+//! Multiparty session registry for a coordinator wallet (initiator / session creator).
 //!
-//! Each multiparty role (initiator, responder, session creator, …) persists to its own
-//! [`crate::persist::SessionPersister`]. A [`MultipartySessionRegistry`] tracks which logs
-//! are still open and resolves a handle to the corresponding persister.
+//! Each protocol session has its own [`crate::persist::SessionPersister`] event log (one log per
+//! initiator bootstrap, per responder bootstrap, per creator distribution, …). Only the
+//! coordinator needs a [`MultipartySessionRegistry`]: it registers handles for every log it
+//! orchestrates (including responders' logs in tests and integrated apps) and uses
+//! [`crate::multiparty::collect_open_sessions_awaiting_parameters`] to find participants ready
+//! for session parameters.
 
 use core::fmt;
 use std::error;

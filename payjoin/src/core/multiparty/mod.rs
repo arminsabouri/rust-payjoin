@@ -5,6 +5,7 @@ pub mod initiator;
 #[cfg_attr(docsrs, doc(cfg(feature = "multiparty")))]
 pub mod linked_mailbox;
 pub mod participant;
+pub mod persist;
 pub mod responder;
 pub mod session;
 pub mod session_creator;
@@ -19,6 +20,9 @@ pub use initiator::{
 pub use participant::{
     AwaitingSessionParameters, HasSessionParameters, Participant, ParticipantContext,
     ParticipantError, ParticipantSessionError,
+};
+pub use persist::{
+    InMemoryMultipartyRegistry, MultipartySessionRegistry, RegistryError, SessionId,
 };
 pub use responder::{
     Initialized as ResponderInitialized, Responder, ResponderBuilder, ResponderContext,

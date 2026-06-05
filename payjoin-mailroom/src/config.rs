@@ -14,6 +14,10 @@ pub struct Config {
     pub timeout: Duration,
     #[serde(deserialize_with = "deserialize_duration_secs")]
     pub mailbox_ttl: Duration,
+    /// When true, repeated v2 writes to the same mailbox append fixed-size
+    /// frames instead of being rejected (append-only mailbox). Defaults to
+    /// false, preserving single-payload BIP77 semantics.
+    pub append_mailbox: bool,
     pub v1: Option<V1Config>,
     #[cfg(feature = "telemetry")]
     pub telemetry: Option<TelemetryConfig>,
@@ -88,6 +92,7 @@ impl Default for Config {
             storage_dir: PathBuf::from("./data"),
             timeout: Duration::from_secs(30),
             mailbox_ttl: Duration::from_secs(60 * 60 * 24 * 7), // 1 week
+            append_mailbox: false,
             v1: None,
             #[cfg(feature = "telemetry")]
             telemetry: None,
@@ -119,6 +124,7 @@ impl Config {
             storage_dir,
             timeout,
             mailbox_ttl: Duration::from_secs(60 * 60 * 24 * 7), // 1 week
+            append_mailbox: false,
             v1,
             #[cfg(feature = "telemetry")]
             telemetry: None,

@@ -12,7 +12,7 @@ use hpke::rand_core::OsRng;
 use hpke::{Deserializable, OpModeR, OpModeS, Serializable};
 use serde::{Deserialize, Serialize};
 
-pub const PADDED_MESSAGE_BYTES: usize = 7168;
+pub use crate::directory::PADDED_MESSAGE_BYTES;
 pub const PADDED_PLAINTEXT_A_LENGTH: usize =
     PADDED_MESSAGE_BYTES - (ELLSWIFT_ENCODING_SIZE + PUBLIC_KEY_SIZE + POLY1305_TAG_SIZE);
 pub const PADDED_PLAINTEXT_B_LENGTH: usize =

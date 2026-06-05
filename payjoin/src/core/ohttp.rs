@@ -96,7 +96,7 @@ impl fmt::Display for DirectoryResponseError {
                 f,
                 "Unexpected response size {}, expected {} bytes",
                 size,
-                crate::directory::ENCAPSULATED_MESSAGE_BYTES
+                crate::directory::ENCAPSULATED_RESPONSE_BYTES
             ),
             UnexpectedStatusCode(status) => write!(f, "Unexpected status code: {status}"),
         }
@@ -142,7 +142,7 @@ fn process_ohttp_res(
     res: &[u8],
     ohttp_context: ohttp::ClientResponse,
 ) -> Result<http::Response<Vec<u8>>, DirectoryResponseError> {
-    let response_array: &[u8; crate::directory::ENCAPSULATED_MESSAGE_BYTES] =
+    let response_array: &[u8; crate::directory::ENCAPSULATED_RESPONSE_BYTES] =
         res.try_into().map_err(|_| DirectoryResponseError::InvalidSize(res.len()))?;
     tracing::trace!("decapsulating directory response");
     let res = ohttp_decapsulate(ohttp_context, response_array)
@@ -153,7 +153,7 @@ fn process_ohttp_res(
 /// decapsulate ohttp, bhttp response and return http response body and status code
 pub(crate) fn ohttp_decapsulate(
     res_ctx: ohttp::ClientResponse,
-    ohttp_body: &[u8; ENCAPSULATED_MESSAGE_BYTES],
+    ohttp_body: &[u8; crate::directory::ENCAPSULATED_RESPONSE_BYTES],
 ) -> Result<http::Response<Vec<u8>>, OhttpEncapsulationError> {
     let bhttp_body = res_ctx.decapsulate(ohttp_body)?;
     let mut r = std::io::Cursor::new(bhttp_body);

@@ -190,6 +190,10 @@ mod integration {
 
     #[cfg(feature = "multiparty")]
     mod multiparty {
+        use payjoin::append_mailbox::{
+            append_request, process_append_response, process_read_response, read_request,
+        };
+        use payjoin::directory::ShortId;
         use payjoin::multiparty::{
             replay_event_log, InMemoryMultipartyRegistry, InitiatorBuilder, InputScriptType,
             MultipartyPjUri, MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
@@ -197,7 +201,7 @@ mod integration {
             SessionParameters,
         };
         use payjoin::persist::OptionalTransitionOutcome;
-        use payjoin::Request;
+        use payjoin::{HpkeKeyPair, Request, Url};
         use payjoin_test_utils::{init_tracing, BoxSendSyncError, InMemoryPersister, TestServices};
         use reqwest::Client;
 
@@ -438,6 +442,96 @@ mod integration {
                 err = services.take_directory_handle() =>
                     panic!("directory exited early: {err:?}"),
                 res = do_three_participants_initiator_session_creator(&services) => res,
+            );
+            result
+        }
+
+        /// Append several frames from different senders to one mailbox, then read
+        /// it back, exercising the directory's append-only mailbox semantics
+        /// end-to-end through OHTTP.
+        async fn do_append_mailbox_accumulates_frames(
+            services: &TestServices,
+        ) -> Result<(), BoxSendSyncError> {
+            let agent = services.http_agent();
+            services.wait_for_services_ready().await?;
+            let ohttp_keys = services.fetch_ohttp_keys().await?;
+            let directory = Url::parse(&services.directory_url())?;
+            let ohttp_relay = services.ohttp_relay_url();
+
+            // The mailbox owner reads; two senders append independently sealed frames.
+            let receiver = HpkeKeyPair::gen_keypair();
+            let sender_a = HpkeKeyPair::gen_keypair();
+            let sender_b = HpkeKeyPair::gen_keypair();
+            let mailbox = ShortId([7u8; 8]);
+
+            // Each append seals one frame to the receiver. With append semantics
+            // the directory accepts every write to the same mailbox instead of
+            // rejecting the second as a conflict.
+            let appends: [(&HpkeKeyPair, &[u8]); 3] = [
+                (&sender_a, b"hello from A"),
+                (&sender_b, b"hello from B"),
+                (&sender_a, b"second from A"),
+            ];
+            for (sender, message) in appends {
+                let (req, ctx) = append_request(
+                    &ohttp_keys,
+                    &directory,
+                    &ohttp_relay,
+                    &mailbox,
+                    message,
+                    sender.public_key(),
+                    receiver.public_key(),
+                )?;
+                let body = send_ohttp_request(&agent, req).await?;
+                process_append_response(&body, ctx)?;
+            }
+
+            // A single read returns every appended frame, decrypted in append
+            // order, each carrying its sender's reply key. Plaintexts are
+            // zero-padded to a fixed length on encryption, so trim the padding
+            // before comparing to the original messages.
+            let (req, ctx) = read_request(&ohttp_keys, &directory, &ohttp_relay, &mailbox)?;
+            let body = send_ohttp_request(&agent, req).await?;
+            let messages = process_read_response(&body, ctx, &receiver)?;
+
+            let trim = |bytes: &[u8]| -> Vec<u8> {
+                let end = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+                bytes[..end].to_vec()
+            };
+            let plaintexts: Vec<Vec<u8>> = messages.iter().map(|m| trim(&m.plaintext)).collect();
+            assert_eq!(
+                plaintexts,
+                vec![b"hello from A".to_vec(), b"hello from B".to_vec(), b"second from A".to_vec(),],
+                "all appended frames returned in append order"
+            );
+            // TODO: reply keys should be set to the same shared secret * G
+            assert_eq!(messages[0].reply_key, *sender_a.public_key());
+            assert_eq!(messages[1].reply_key, *sender_b.public_key());
+            assert_eq!(messages[2].reply_key, *sender_a.public_key());
+
+            // A reader the frames were not sealed to recovers nothing from the
+            // same mailbox: frames stay confidential under append.
+            let stranger = HpkeKeyPair::gen_keypair();
+            let (req, ctx) = read_request(&ohttp_keys, &directory, &ohttp_relay, &mailbox)?;
+            let body = send_ohttp_request(&agent, req).await?;
+            assert!(
+                process_read_response(&body, ctx, &stranger)?.is_empty(),
+                "frames stay sealed to the intended receiver"
+            );
+
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn append_mailbox_accumulates_frames() -> Result<(), BoxSendSyncError> {
+            init_tracing();
+            let mut services = TestServices::initialize_with_append().await?;
+            let result = tokio::select!(
+                err = services.take_ohttp_relay_handle() =>
+                    panic!("OHTTP relay exited early: {err:?}"),
+                err = services.take_directory_handle() =>
+                    panic!("directory exited early: {err:?}"),
+                res = do_append_mailbox_accumulates_frames(&services) => res,
             );
             result
         }

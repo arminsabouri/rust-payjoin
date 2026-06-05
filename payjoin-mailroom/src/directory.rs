@@ -8,7 +8,7 @@ use axum::body::{Body, Bytes};
 use axum::http::header::{HeaderValue, ACCESS_CONTROL_ALLOW_ORIGIN, CONTENT_TYPE};
 use axum::http::{Method, Request, Response, StatusCode, Uri};
 use http_body_util::BodyExt;
-use payjoin::directory::{ShortId, ShortIdError, ENCAPSULATED_MESSAGE_BYTES};
+use payjoin::directory::{ShortId, ShortIdError, ENCAPSULATED_RESPONSE_BYTES};
 use tracing::{debug, error, trace, warn};
 
 use crate::db::{Db, Error as DbError, SendableError};
@@ -16,8 +16,11 @@ use crate::ohttp_relay::SentinelTag;
 
 const CHACHA20_POLY1305_NONCE_LEN: usize = 32; // chacha20poly1305 n_k
 const POLY1305_TAG_SIZE: usize = 16;
-pub const BHTTP_REQ_BYTES: usize =
-    ENCAPSULATED_MESSAGE_BYTES - (CHACHA20_POLY1305_NONCE_LEN + POLY1305_TAG_SIZE);
+/// Usable BHTTP payload size of an encapsulated OHTTP response, after the
+/// ChaCha20-Poly1305 nonce and tag. A read response is padded to this length
+/// before encapsulation.
+pub const BHTTP_RES_BYTES: usize =
+    ENCAPSULATED_RESPONSE_BYTES - (CHACHA20_POLY1305_NONCE_LEN + POLY1305_TAG_SIZE);
 const V1_MAX_BUFFER_SIZE: usize = 65536;
 
 const V1_REJECT_RES_JSON: &str =
@@ -243,11 +246,11 @@ impl<D: Db> Service<D> {
         bhttp_res
             .write_bhttp(bhttp::Mode::KnownLength, &mut bhttp_bytes)
             .map_err(|e| HandlerError::InternalServerError(e.into()))?;
-        bhttp_bytes.resize(BHTTP_REQ_BYTES, 0);
+        bhttp_bytes.resize(BHTTP_RES_BYTES, 0);
         let ohttp_res = res_ctx
             .encapsulate(&bhttp_bytes)
             .map_err(|e| HandlerError::InternalServerError(e.into()))?;
-        assert!(ohttp_res.len() == ENCAPSULATED_MESSAGE_BYTES, "Unexpected OHTTP response size");
+        assert!(ohttp_res.len() == ENCAPSULATED_RESPONSE_BYTES, "Unexpected OHTTP response size");
         Ok(Response::new(full(ohttp_res)))
     }
 
@@ -287,6 +290,7 @@ impl<D: Db> Service<D> {
         }
     }
 
+    /// Read the entire mailbox
     async fn get_mailbox(&self, id: &str) -> Result<Response<Body>, HandlerError> {
         trace!("get_mailbox");
         let id = ShortId::from_str(id)?;
@@ -588,6 +592,7 @@ mod tests {
     use payjoin::directory::ShortId;
 
     use super::*;
+    use crate::db::files::FRAME_SIZE;
     use crate::db::FilesDb;
     use crate::ohttp_relay::SentinelTag;
 
@@ -615,6 +620,41 @@ mod tests {
         let (parts, body) = res.into_parts();
         let bytes = body.collect().await.unwrap().to_bytes();
         (parts.status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    /// A `Service` whose v2 mailbox writes append fixed-size frames.
+    async fn append_test_service() -> Service<FilesDb> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = FilesDb::init(Duration::from_millis(100), dir.keep(), Duration::from_secs(3600))
+            .await
+            .expect("db init")
+            .with_append_mailbox();
+        let ohttp: ohttp::Server =
+            crate::key_config::gen_ohttp_server_config().expect("ohttp config").into();
+        Service::new(db, ohttp, SentinelTag::new([0u8; 32]), None)
+    }
+
+    #[tokio::test]
+    async fn append_mailbox_read_returns_all_frames() {
+        let svc = append_test_service().await;
+        let id = valid_short_id_path();
+
+        // Post three uniform, fixed-size frames to the same mailbox.
+        let frame = |b: u8| vec![b; FRAME_SIZE];
+        for b in [b'A', b'B', b'C'] {
+            let res = svc.post_mailbox(&id, Body::from(frame(b))).await.expect("post");
+            assert_eq!(res.status(), StatusCode::OK, "each append should be accepted");
+        }
+
+        // A single GET returns every appended frame, concatenated in order.
+        let res = svc.get_mailbox(&id).await.expect("get");
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.len(), 3 * FRAME_SIZE, "all three frames returned in one response");
+
+        let expected: Vec<u8> =
+            [b'A', b'B', b'C'].into_iter().flat_map(|b| vec![b; FRAME_SIZE]).collect();
+        assert_eq!(bytes.as_ref(), expected.as_slice(), "frames concatenated in append order");
     }
 
     // V1 routing

@@ -1,6 +1,25 @@
 //! Types relevant to the Payjoin Directory as defined in BIP 77.
 
+/// Fixed size, in bytes, of one Payjoin Directory mailbox message frame.
+///
+/// Every v2 message is an HPKE ciphertext padded to this length, so a mailbox
+/// holds a whole number of these frames.
+pub const PADDED_MESSAGE_BYTES: usize = 7168;
+
+/// Maximum number of message frames a single mailbox read response can carry.
+pub const MAX_FRAMES_PER_RESPONSE: usize = 16;
+
+/// Fixed size, in bytes, of an encapsulated OHTTP *request*.
+///
+/// A request carries at most one message frame, so it stays small. OHTTP pads
+/// every request to this single size so the relay can't distinguish them.
 pub const ENCAPSULATED_MESSAGE_BYTES: usize = 8192;
+
+/// Fixed size, in bytes, of an encapsulated OHTTP *response*.
+///
+/// A mailbox read may return many frames, so responses are larger than
+/// requests.
+pub const ENCAPSULATED_RESPONSE_BYTES: usize = (MAX_FRAMES_PER_RESPONSE + 1) * PADDED_MESSAGE_BYTES;
 
 /// A 64-bit identifier used to identify Payjoin Directory entries.
 ///

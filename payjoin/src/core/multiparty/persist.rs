@@ -22,6 +22,11 @@ pub trait MultipartySessionRegistry {
 
     /// Handles for session logs that are not closed.
     fn list_open(&self) -> Result<Vec<&Self::Persister>, Self::Error>;
+
+    /// Create new session
+    /// TODO: do we want to link the previous session wiht the new one?
+    /// TODO: does not need to be mut. Use interior mutability for the inmemory registry.
+    fn new_session(&mut self) -> Result<Self::Persister, Self::Error>;
 }
 
 /// Errors from [`InMemoryMultipartyRegistry`].
@@ -61,7 +66,7 @@ impl InMemoryMultipartyRegistry {
     pub fn new() -> Self { Self::default() }
 
     /// Register a new open session and return its handle.
-    pub fn create_session(&mut self) -> InMemoryPersister<MultipartySessionEvent> {
+    fn create_session(&mut self) -> InMemoryPersister<MultipartySessionEvent> {
         let persister = InMemoryPersister::default();
         self.sessions.push(persister.clone());
         persister
@@ -79,4 +84,6 @@ impl MultipartySessionRegistry for InMemoryMultipartyRegistry {
             .filter(|persister| !persister.inner.read().unwrap().is_closed)
             .collect())
     }
+
+    fn new_session(&mut self) -> Result<Self::Persister, Self::Error> { Ok(self.create_session()) }
 }

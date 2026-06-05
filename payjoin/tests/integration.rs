@@ -195,8 +195,8 @@ mod integration {
         use payjoin::multiparty::{
             collect_open_sessions_awaiting_parameters, replay_event_log,
             InMemoryMultipartyRegistry, InitiatorBuilder, InputScriptType, MultipartyPjUri,
-            MultipartySession, MultipartySessionEvent, ParametersDelivery, ResponderBuilder,
-            SessionCreatorBuilder, SessionParameters,
+            MultipartySession, MultipartySessionEvent, MultipartySessionRegistry,
+            ParametersDelivery, ResponderBuilder, SessionCreatorBuilder, SessionParameters,
         };
         use payjoin::persist::OptionalTransitionOutcome;
         use payjoin::Request;
@@ -315,8 +315,8 @@ mod integration {
 
             // Coordinator registry: one initiator wallet indexes every session log it orchestrates.
             let mut registry = InMemoryMultipartyRegistry::new();
-            let initiator_a_persister = registry.create_session();
-            let initiator_b_persister = registry.create_session();
+            let initiator_a_persister = registry.new_session().expect("new session");
+            let initiator_b_persister = registry.new_session().expect("new session");
 
             let responder_a_persister = InMemoryPersister::default();
             let responder_b_persister = InMemoryPersister::default();
@@ -359,7 +359,7 @@ mod integration {
             // assert_eq!(handles, HashSet::from([initiator_id_a, initiator_id_b]));
 
             // TODO: may be unnecessary to create a new session. Can we graduate the existing session to a creator?
-            let creator_persister = registry.create_session();
+            let creator_persister = registry.new_session().expect("new session");
             let mut creator = SessionCreatorBuilder::from_awaiting_participants(
                 expected_params.clone(),
                 &awaiting,

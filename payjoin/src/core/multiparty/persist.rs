@@ -10,8 +10,10 @@
 use core::fmt;
 use std::error;
 
-use crate::multiparty::session::MultipartySessionEvent;
-use crate::persist::{InMemoryPersister, SessionPersister};
+use crate::multiparty::participant::{AwaitingSessionParameters, Participant};
+use crate::multiparty::session::{MultipartySessionEvent, MultipartySessionOutcome};
+use crate::multiparty::SessionParameters;
+use crate::persist::{InMemoryPersister, MaybeFatalTransitionWithNoResults, SessionPersister};
 
 /// Index of many multiparty session persisters.
 pub trait MultipartySessionRegistry {
@@ -27,6 +29,136 @@ pub trait MultipartySessionRegistry {
     /// TODO: do we want to link the previous session wiht the new one?
     /// TODO: does not need to be mut. Use interior mutability for the inmemory registry.
     fn new_session(&mut self) -> Result<Self::Persister, Self::Error>;
+
+    /// Close `from` with [`MultipartySessionOutcome::Graduated`], then register a new log
+    /// whose first event is [`MultipartySessionEvent::SessionParametersAdopted`].
+    fn save_graduation(
+        &mut self,
+        from: &Self::Persister,
+        graduation: SessionParametersGraduation,
+    ) -> Result<
+        Self::Persister,
+        GraduationError<Self::Error, <Self::Persister as SessionPersister>::InternalStorageError>,
+    > {
+        from.save_event(graduation.close_event()).map_err(GraduationError::Storage)?;
+        from.close().map_err(GraduationError::Storage)?;
+        let new = self.new_session().map_err(GraduationError::Registry)?;
+        new.save_event(graduation.adopted_event()).map_err(GraduationError::Storage)?;
+        Ok(new)
+    }
+}
+
+/// Successful end of a pre-parameters log: close with [`MultipartySessionOutcome::Graduated`]
+/// and continue in a new log whose first event carries the adopted session parameters.
+/// TODO: this is masquerading as a transition. Fine for now, when we consider upstreaming changes
+/// we should change this to match the paradigm in the rest of the library.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionParametersGraduation {
+    session_parameters: SessionParameters,
+}
+
+impl SessionParametersGraduation {
+    pub(crate) fn new(session_parameters: SessionParameters) -> Self { Self { session_parameters } }
+
+    /// Session parameters adopted into the post-graduation log.
+    pub fn session_parameters(&self) -> &SessionParameters { &self.session_parameters }
+
+    pub(crate) fn close_event(&self) -> MultipartySessionEvent {
+        MultipartySessionEvent::Closed(MultipartySessionOutcome::Graduated(
+            self.session_parameters.clone(),
+        ))
+    }
+
+    pub(crate) fn adopted_event(&self) -> MultipartySessionEvent {
+        MultipartySessionEvent::SessionParametersAdopted(self.session_parameters.clone())
+    }
+
+    /// Close `persister` with [`MultipartySessionOutcome::Graduated`].
+    pub fn close_persister<P>(&self, persister: &P) -> Result<(), P::InternalStorageError>
+    where
+        P: SessionPersister<SessionEvent = MultipartySessionEvent>,
+    {
+        persister.save_event(self.close_event())?;
+        persister.close()?;
+        Ok(())
+    }
+}
+
+/// Outcome of polling for session parameters before persistence.
+#[derive(Debug)]
+pub enum SessionParametersPollTransition {
+    /// Directory has nothing yet; resume from the returned participant.
+    Stasis(Participant<AwaitingSessionParameters>),
+    /// Parameters retrieved; persist via [`MultipartySessionRegistry::save_graduation`].
+    Graduation(SessionParametersGraduation),
+}
+
+/// Fatal or transient failure while polling for session parameters.
+pub enum SessionParametersPollFailure {
+    Transient(crate::multiparty::participant::ParticipantSessionError),
+    Fatal(
+        MaybeFatalTransitionWithNoResults<
+            MultipartySessionEvent,
+            (),
+            Participant<AwaitingSessionParameters>,
+            crate::multiparty::participant::ParticipantSessionError,
+        >,
+    ),
+}
+
+impl fmt::Debug for SessionParametersPollFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transient(err) => f.debug_tuple("Transient").field(err).finish(),
+            Self::Fatal(_) => f.write_str("Fatal"),
+        }
+    }
+}
+
+/// Errors from [`MultipartySessionRegistry::save_graduation`].
+#[derive(Debug)]
+pub enum GraduationError<R, S> {
+    Registry(R),
+    Storage(S),
+}
+
+impl<R: fmt::Display, S: fmt::Display> fmt::Display for GraduationError<R, S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Registry(err) => write!(f, "registry error: {err}"),
+            Self::Storage(err) => write!(f, "storage error: {err}"),
+        }
+    }
+}
+
+impl<R, S> error::Error for GraduationError<R, S>
+where
+    R: error::Error + 'static,
+    S: error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            Self::Registry(err) => Some(err),
+            Self::Storage(err) => Some(err),
+        }
+    }
+}
+
+impl SessionParametersGraduation {
+    /// Close `from` and write the adopted-parameters first event to `new`.
+    pub fn save_with_new_persister<P>(
+        self,
+        from: &P,
+        new: &P,
+    ) -> Result<(), P::InternalStorageError>
+    where
+        P: SessionPersister<SessionEvent = MultipartySessionEvent>,
+    {
+        from.save_event(self.close_event())?;
+        from.close()?;
+        new.save_event(self.adopted_event())?;
+        Ok(())
+    }
 }
 
 /// Errors from [`InMemoryMultipartyRegistry`].

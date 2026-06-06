@@ -5,9 +5,10 @@ pub use error::{ParticipantError, ParticipantSessionError};
 use serde::{Deserialize, Serialize};
 
 use crate::hpke::{decrypt_message_a, HpkeKeyPair, HpkePublicKey};
-use crate::multiparty::session::{
-    MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
+use crate::multiparty::persist::{
+    SessionParametersGraduation, SessionParametersPollFailure, SessionParametersPollTransition,
 };
+use crate::multiparty::session::{MultipartySessionEvent, MultipartySessionOutcome};
 use crate::multiparty::session_parameters::SessionParameters;
 use crate::ohttp::{ohttp_encapsulate, process_get_res};
 use crate::persist::MaybeFatalTransitionWithNoResults;
@@ -100,12 +101,7 @@ impl Participant<AwaitingSessionParameters> {
         self,
         body: &[u8],
         context: ohttp::ClientResponse,
-    ) -> MaybeFatalTransitionWithNoResults<
-        MultipartySessionEvent,
-        Participant<HasSessionParameters>,
-        Participant<AwaitingSessionParameters>,
-        ParticipantSessionError,
-    > {
+    ) -> Result<SessionParametersPollTransition, SessionParametersPollFailure> {
         let current_state = self.clone();
         let session_parameters = match self.inner_process_session_parameters_poll_res(body, context)
         {
@@ -114,31 +110,24 @@ impl Participant<AwaitingSessionParameters> {
                 ParticipantError::DirectoryResponse(directory_error)
                     if !directory_error.is_fatal() =>
                 {
-                    return MaybeFatalTransitionWithNoResults::transient(e);
+                    return Err(SessionParametersPollFailure::Transient(e));
                 }
                 _ =>
-                    return MaybeFatalTransitionWithNoResults::fatal(
-                        MultipartySessionEvent::Closed(MultipartySessionOutcome::Failure),
-                        e,
-                    ),
+                    return Err(SessionParametersPollFailure::Fatal(
+                        MaybeFatalTransitionWithNoResults::fatal(
+                            MultipartySessionEvent::Closed(MultipartySessionOutcome::Failure),
+                            e,
+                        ),
+                    )),
             },
         };
 
         if let Some(session_parameters) = session_parameters {
-            MaybeFatalTransitionWithNoResults::success(
-                MultipartySessionEvent::ParticipantRetrievedSessionParameters(
-                    session_parameters.clone(),
-                ),
-                Participant {
-                    state: HasSessionParameters {},
-                    context: ParticipantContext {
-                        session_parameters: Some(session_parameters),
-                        ..current_state.context
-                    },
-                },
-            )
+            Ok(SessionParametersPollTransition::Graduation(SessionParametersGraduation::new(
+                session_parameters,
+            )))
         } else {
-            MaybeFatalTransitionWithNoResults::no_results(current_state)
+            Ok(SessionParametersPollTransition::Stasis(current_state))
         }
     }
 
@@ -159,19 +148,6 @@ impl Participant<AwaitingSessionParameters> {
         let session_parameters = SessionParameters::from_message_a_body(&params_bytes)
             .map_err(ParticipantError::SessionParameters)?;
         Ok(Some(session_parameters))
-    }
-
-    pub(crate) fn apply_retrieved_session_parameters(
-        self,
-        session_parameters: SessionParameters,
-    ) -> MultipartySession {
-        MultipartySession::ParticipantHasSessionParameters(Participant {
-            state: HasSessionParameters {},
-            context: ParticipantContext {
-                session_parameters: Some(session_parameters),
-                ..self.context
-            },
-        })
     }
 }
 

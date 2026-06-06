@@ -9,13 +9,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::hpke::{encrypt_message_a, HpkeKeyPair, HpkePublicKey};
 use crate::multiparty::participant::{AwaitingSessionParameters, Participant};
+use crate::multiparty::persist::{MultipartySessionRegistry, SessionParametersGraduation};
 pub use crate::multiparty::session::replay_event_log;
 use crate::multiparty::session::{
+    collect_open_sessions_awaiting_parameters_with_persisters, CollectAwaitingParametersError,
     MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
 };
 use crate::multiparty::session_parameters::SessionParameters;
 use crate::ohttp::{ohttp_encapsulate, process_post_res, OhttpEncapsulationError};
-use crate::persist::{MaybeFatalTransition, NextStateTransition};
+use crate::persist::{MaybeFatalTransition, NextStateTransition, SessionPersister};
 use crate::receive::v2::mailbox_endpoint;
 use crate::uri::ShortId;
 use crate::{IntoUrl, OhttpKeys, Request, Url};
@@ -130,6 +132,60 @@ impl From<OhttpEncapsulationError> for SessionCreatorError {
     fn from(value: OhttpEncapsulationError) -> Self { Self::OhttpEncapsulation(value) }
 }
 
+/// Errors from [`SessionCreatorBuilder::from_open_awaiting`] and
+/// [`SessionCreatorBuilder::build_and_promote`].
+pub enum SessionCreatorPromoteError<R: MultipartySessionRegistry> {
+    Collect(CollectAwaitingParametersError<R>),
+    Build(SessionCreatorError),
+    Registry(R::Error),
+    Storage(<R::Persister as SessionPersister>::InternalStorageError),
+}
+
+impl<R: MultipartySessionRegistry> fmt::Debug for SessionCreatorPromoteError<R>
+where
+    R::Error: fmt::Debug,
+    <R::Persister as SessionPersister>::InternalStorageError: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Collect(err) => f.debug_tuple("Collect").field(err).finish(),
+            Self::Build(err) => f.debug_tuple("Build").field(err).finish(),
+            Self::Registry(err) => f.debug_tuple("Registry").field(err).finish(),
+            Self::Storage(err) => f.debug_tuple("Storage").field(err).finish(),
+        }
+    }
+}
+
+impl<R: MultipartySessionRegistry> fmt::Display for SessionCreatorPromoteError<R>
+where
+    R::Error: fmt::Display,
+    <R::Persister as SessionPersister>::InternalStorageError: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Collect(err) => write!(f, "collect awaiting sessions: {err}"),
+            Self::Build(err) => write!(f, "session creator build: {err}"),
+            Self::Registry(err) => write!(f, "registry error: {err}"),
+            Self::Storage(err) => write!(f, "storage error: {err}"),
+        }
+    }
+}
+
+impl<R: MultipartySessionRegistry + 'static> std::error::Error for SessionCreatorPromoteError<R>
+where
+    R::Error: std::error::Error + 'static,
+    <R::Persister as SessionPersister>::InternalStorageError: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Collect(err) => Some(err),
+            Self::Build(err) => Some(err),
+            Self::Registry(err) => Some(err),
+            Self::Storage(err) => Some(err),
+        }
+    }
+}
+
 pub struct SessionCreatorBuilder {
     session_parameters: SessionParameters,
     participant_keys: Vec<HpkePublicKey>,
@@ -190,6 +246,47 @@ impl SessionCreatorBuilder {
             directory,
             ohttp_keys: first.context.ohttp_keys.clone(),
         })
+    }
+
+    /// Build from every open session in `registry` that awaits session parameters.
+    pub fn from_open_awaiting<R>(
+        registry: &R,
+        session_parameters: SessionParameters,
+    ) -> Result<Self, SessionCreatorPromoteError<R>>
+    where
+        R: MultipartySessionRegistry,
+    {
+        let awaiting = collect_open_sessions_awaiting_parameters_with_persisters(registry)
+            .map_err(SessionCreatorPromoteError::Collect)?;
+        let participants = awaiting.iter().map(|(_, participant)| participant);
+        Self::from_awaiting_participants(session_parameters, participants)
+            .map_err(SessionCreatorPromoteError::Build)
+    }
+
+    /// Close every open awaiting log in `registry`, register a session-creator log, and persist
+    /// the built creator state.
+    pub fn build_and_promote<R>(
+        self,
+        registry: &mut R,
+    ) -> Result<(R::Persister, SessionCreator<CollectedSessions>), SessionCreatorPromoteError<R>>
+    where
+        R: MultipartySessionRegistry,
+    {
+        let session_parameters = self.session_parameters.clone();
+        let awaiting = collect_open_sessions_awaiting_parameters_with_persisters(registry)
+            .map_err(SessionCreatorPromoteError::Collect)?;
+        let transition = self.build().map_err(SessionCreatorPromoteError::Build)?;
+
+        let graduation = SessionParametersGraduation::new(session_parameters);
+        for (persister, _) in &awaiting {
+            graduation.close_persister(*persister).map_err(SessionCreatorPromoteError::Storage)?;
+        }
+
+        let creator_persister =
+            registry.new_session().map_err(SessionCreatorPromoteError::Registry)?;
+        let creator =
+            transition.save(&creator_persister).map_err(SessionCreatorPromoteError::Storage)?;
+        Ok((creator_persister, creator))
     }
 
     pub fn build(

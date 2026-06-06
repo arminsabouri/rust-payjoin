@@ -193,10 +193,10 @@ mod integration {
         use std::time::Duration;
 
         use payjoin::multiparty::{
-            collect_open_sessions_awaiting_parameters, replay_event_log,
-            InMemoryMultipartyRegistry, InitiatorBuilder, InputScriptType, MultipartyPjUri,
-            MultipartySession, MultipartySessionEvent, MultipartySessionRegistry,
-            ParametersDelivery, ResponderBuilder, SessionCreatorBuilder, SessionParameters,
+            replay_event_log, InMemoryMultipartyRegistry, InitiatorBuilder, InputScriptType,
+            MultipartyPjUri, MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
+            MultipartySessionRegistry, ParametersDelivery, ResponderBuilder, SessionCreatorBuilder,
+            SessionParameters, SessionParametersPollFailure, SessionParametersPollTransition,
         };
         use payjoin::persist::OptionalTransitionOutcome;
         use payjoin::Request;
@@ -272,12 +272,12 @@ mod integration {
             panic!("initiator poll did not retrieve a reply key");
         }
 
-        async fn poll_participant_until_has_session_params(
+        async fn poll_participant_until_graduated(
             agent: &Client,
             persister: &InMemoryPersister<MultipartySessionEvent>,
             ohttp_relay: &str,
             expected: &SessionParameters,
-        ) -> Result<(), BoxSendSyncError> {
+        ) -> Result<InMemoryPersister<MultipartySessionEvent>, BoxSendSyncError> {
             let (participant, _) = replay_event_log(persister)?;
             let mut participant = match participant {
                 MultipartySession::ParticipantAwaitingSessionParameters(state) => state,
@@ -288,14 +288,18 @@ mod integration {
             for _ in 0..50 {
                 let (req, ctx) = participant.create_session_parameters_poll_request(ohttp_relay)?;
                 let body = send_ohttp_request(agent, req).await?;
-                let transition = participant.process_session_parameters_poll_response(&body, ctx);
-                match transition.save(persister) {
-                    Ok(OptionalTransitionOutcome::Progress(next)) => {
-                        assert_eq!(next.session_parameters(), expected);
-                        return Ok(());
+                match participant.clone().process_session_parameters_poll_response(&body, ctx) {
+                    Ok(SessionParametersPollTransition::Graduation(graduation)) => {
+                        assert_eq!(graduation.session_parameters(), expected);
+                        let adopted_persister = InMemoryPersister::default();
+                        graduation.save_with_new_persister(persister, &adopted_persister)?;
+                        return Ok(adopted_persister);
                     }
-                    Ok(OptionalTransitionOutcome::Stasis(next)) => participant = next,
-                    Err(err) => return Err(err.into()),
+                    Ok(SessionParametersPollTransition::Stasis(next)) => participant = next,
+                    Err(SessionParametersPollFailure::Transient(_)) => {}
+                    Err(SessionParametersPollFailure::Fatal(fatal)) => {
+                        fatal.save(persister)?;
+                    }
                 }
                 sleep(Duration::from_millis(50)).await;
             }
@@ -351,21 +355,9 @@ mod integration {
             poll_initiator_until_has_reply_key(&agent, &initiator_b_persister, &ohttp_relay)
                 .await?;
 
-            // Two session awaiting should be a and b initiators
-            let awaiting =
-                collect_open_sessions_awaiting_parameters(&registry).expect("collect awaiting");
-            assert_eq!(awaiting.len(), 2);
-            // let handles: HashSet<_> = awaiting.iter().map(|session| session.mailbox_public_key()).collect();
-            // assert_eq!(handles, HashSet::from([initiator_id_a, initiator_id_b]));
-
-            // TODO: may be unnecessary to create a new session. Can we graduate the existing session to a creator?
-            let creator_persister = registry.new_session().expect("new session");
-            let mut creator = SessionCreatorBuilder::from_awaiting_participants(
-                expected_params.clone(),
-                &awaiting,
-            )?
-            .build()?
-            .save(&creator_persister)?;
+            let (creator_persister, mut creator) =
+                SessionCreatorBuilder::from_open_awaiting(&registry, expected_params.clone())?
+                    .build_and_promote(&mut registry)?;
 
             // Distribute session parameters to responders
             loop {
@@ -385,25 +377,39 @@ mod integration {
             }
 
             for persister in [responder_a_persister, responder_b_persister] {
-                poll_participant_until_has_session_params(
+                let participant_persister = poll_participant_until_graduated(
                     &agent,
                     &persister,
                     &ohttp_relay,
                     &expected_params,
                 )
                 .await?;
+                // TODO: Assert they have the right session parameters
+                let (session_state, _) = replay_event_log(&participant_persister)?;
+                assert!(matches!(session_state, MultipartySession::SessionParametersReceieved(_)));
+
                 let (session_state, _) = replay_event_log(&persister)?;
                 assert!(matches!(
                     session_state,
-                    MultipartySession::ParticipantHasSessionParameters(_)
+                    MultipartySession::Closed(MultipartySessionOutcome::Graduated(_))
                 ));
-                // TODO: Assert they have the right session parameters
             }
 
             let (session_state, _) = replay_event_log(&creator_persister)?;
             assert!(matches!(
                 session_state,
                 MultipartySession::SessionCreatorParametersDistributed(_)
+            ));
+
+            let (session_state, _) = replay_event_log(&initiator_a_persister)?;
+            assert!(matches!(
+                session_state,
+                MultipartySession::Closed(MultipartySessionOutcome::Graduated(_))
+            ));
+            let (session_state, _) = replay_event_log(&initiator_b_persister)?;
+            assert!(matches!(
+                session_state,
+                MultipartySession::Closed(MultipartySessionOutcome::Graduated(_))
             ));
 
             Ok(())

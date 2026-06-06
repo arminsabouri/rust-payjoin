@@ -22,21 +22,24 @@ pub use participant::{
     ParticipantError, ParticipantSessionError,
 };
 pub use persist::{
-    InMemoryMultipartyRegistry, MultipartySessionRegistry, RegistryError, SessionId,
+    GraduationError, InMemoryMultipartyRegistry, MultipartySessionRegistry, RegistryError,
+    SessionId, SessionParametersGraduation, SessionParametersPollFailure,
+    SessionParametersPollTransition,
 };
 pub use responder::{
     Initialized as ResponderInitialized, Responder, ResponderBuilder, ResponderContext,
     ResponderError, ResponderSessionError,
 };
 pub use session::{
-    collect_open_sessions_awaiting_parameters, replay_event_log, CollectAwaitingParametersError,
-    MultipartySession, MultipartySessionEvent, MultipartySessionOutcome, SessionHistory,
-    SessionStatus,
+    collect_open_sessions_awaiting_parameters,
+    collect_open_sessions_awaiting_parameters_with_persisters, replay_event_log,
+    CollectAwaitingParametersError, MultipartySession, MultipartySessionEvent,
+    MultipartySessionOutcome, SessionHistory, SessionStatus,
 };
 pub use session_creator::{
     CollectedSessions, ParametersDelivery, ParametersDistributed, PendingParticipant,
     SessionCreator, SessionCreatorBuilder, SessionCreatorContext, SessionCreatorError,
-    SessionCreatorSessionError, SessionParametersDistributionMessage,
+    SessionCreatorPromoteError, SessionCreatorSessionError, SessionParametersDistributionMessage,
 };
 pub use session_parameters::{
     InputScriptType, SessionParameters, SessionParametersError, SESSION_SECRET_LEN,

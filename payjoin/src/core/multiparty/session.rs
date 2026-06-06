@@ -30,16 +30,20 @@ pub enum MultipartySessionEvent {
     InitiatorRetrievedReplyKey(HpkePublicKey),
     ResponderCreated(ResponderContext),
     ResponderSentReplyKey(HpkePublicKey),
-    ParticipantRetrievedSessionParameters(SessionParameters),
+    /// First event of a post-graduation log carrying adopted session parameters.
+    SessionParametersAdopted(SessionParameters),
     SessionCreatorCreated(SessionCreatorContext),
     SessionCreatorParametersDeliveredTo(HpkePublicKey),
     Closed(MultipartySessionOutcome),
 }
 
-/// Outcome when a multiparty session closes unsuccessfully.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+/// Outcome when a multiparty session closes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MultipartySessionOutcome {
+    /// Session failed before completing the protocol.
     Failure,
+    /// Pre-parameters phase complete; session parameters continue in a new log.
+    Graduated(SessionParameters),
 }
 
 impl MultipartySessionEvent {
@@ -56,6 +60,7 @@ pub enum MultipartySession {
     ParticipantHasSessionParameters(Participant<HasSessionParameters>),
     SessionCreatorCollectedSessions(SessionCreator<CollectedSessions>),
     SessionCreatorParametersDistributed(SessionCreator<ParametersDistributed>),
+    SessionParametersReceieved(SessionParameters),
     Closed(MultipartySessionOutcome),
 }
 
@@ -80,11 +85,6 @@ impl MultipartySession {
                 MultipartySession::ResponderInitialized(state),
                 MultipartySessionEvent::ResponderSentReplyKey(reply_key),
             ) => Ok(state.apply_sent_reply_key(reply_key)),
-
-            (
-                MultipartySession::ParticipantAwaitingSessionParameters(state),
-                MultipartySessionEvent::ParticipantRetrievedSessionParameters(session_parameters),
-            ) => Ok(state.apply_retrieved_session_parameters(session_parameters)),
 
             (
                 MultipartySession::SessionCreatorCollectedSessions(state),
@@ -136,6 +136,8 @@ where
                 state: CollectedSessions {},
                 context,
             }),
+        MultipartySessionEvent::SessionParametersAdopted(session_parameters) =>
+            MultipartySession::SessionParametersReceieved(session_parameters),
         MultipartySessionEvent::Closed(outcome) => MultipartySession::Closed(outcome),
         _ => return Err(InternalReplayError::InvalidEvent(Box::new(first_event), None).into()),
     };
@@ -225,9 +227,12 @@ where
 ///
 /// Empty logs and sessions still in initiator/responder bootstrap are skipped. Replay failures
 /// other than an empty log are returned immediately.
-pub fn collect_open_sessions_awaiting_parameters<R>(
+pub fn collect_open_sessions_awaiting_parameters_with_persisters<R>(
     registry: &R,
-) -> Result<Vec<Participant<AwaitingSessionParameters>>, CollectAwaitingParametersError<R>>
+) -> Result<
+    Vec<(&R::Persister, Participant<AwaitingSessionParameters>)>,
+    CollectAwaitingParametersError<R>,
+>
 where
     R: MultipartySessionRegistry,
 {
@@ -241,11 +246,22 @@ where
         };
 
         if let MultipartySession::ParticipantAwaitingSessionParameters(participant) = session {
-            awaiting.push(participant);
+            awaiting.push((persister, participant));
         }
     }
 
     Ok(awaiting)
+}
+
+/// Like [`collect_open_sessions_awaiting_parameters_with_persisters`], without persister handles.
+pub fn collect_open_sessions_awaiting_parameters<R>(
+    registry: &R,
+) -> Result<Vec<Participant<AwaitingSessionParameters>>, CollectAwaitingParametersError<R>>
+where
+    R: MultipartySessionRegistry,
+{
+    collect_open_sessions_awaiting_parameters_with_persisters(registry)
+        .map(|entries| entries.into_iter().map(|(_, participant)| participant).collect())
 }
 
 /// Inferred status of a multiparty session from its event log.
@@ -257,6 +273,7 @@ pub enum SessionStatus {
     ParticipantHasSessionParameters,
     SessionCreatorCollectingParameters,
     SessionCreatorParametersDistributed,
+    SessionParametersAdopted,
     Closed(MultipartySessionOutcome),
 }
 

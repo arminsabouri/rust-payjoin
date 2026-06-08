@@ -24,7 +24,7 @@ pub use participant::{
 pub use persist::{
     GraduationError, InMemoryMultipartyRegistry, MultipartySessionRegistry, RegistryError,
     SessionId, SessionParametersGraduation, SessionParametersPollFailure,
-    SessionParametersPollTransition,
+    SessionParametersPollSaveOutcome, SessionParametersPollTransition,
 };
 pub use responder::{
     Initialized as ResponderInitialized, Responder, ResponderBuilder, ResponderContext,

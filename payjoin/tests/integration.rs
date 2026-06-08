@@ -196,7 +196,7 @@ mod integration {
             replay_event_log, InMemoryMultipartyRegistry, InitiatorBuilder, InputScriptType,
             MultipartyPjUri, MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
             MultipartySessionRegistry, ParametersDelivery, ResponderBuilder, SessionCreatorBuilder,
-            SessionParameters, SessionParametersPollFailure, SessionParametersPollTransition,
+            SessionParameters, SessionParametersPollFailure, SessionParametersPollSaveOutcome,
         };
         use payjoin::persist::OptionalTransitionOutcome;
         use payjoin::Request;
@@ -274,6 +274,7 @@ mod integration {
 
         async fn poll_participant_until_graduated(
             agent: &Client,
+            registry: &mut InMemoryMultipartyRegistry,
             persister: &InMemoryPersister<MultipartySessionEvent>,
             ohttp_relay: &str,
             expected: &SessionParameters,
@@ -289,13 +290,19 @@ mod integration {
                 let (req, ctx) = participant.create_session_parameters_poll_request(ohttp_relay)?;
                 let body = send_ohttp_request(agent, req).await?;
                 match participant.clone().process_session_parameters_poll_response(&body, ctx) {
-                    Ok(SessionParametersPollTransition::Graduation(graduation)) => {
-                        assert_eq!(graduation.session_parameters(), expected);
-                        let adopted_persister = InMemoryPersister::default();
-                        graduation.save_with_new_persister(persister, &adopted_persister)?;
-                        return Ok(adopted_persister);
-                    }
-                    Ok(SessionParametersPollTransition::Stasis(next)) => participant = next,
+                    Ok(transition) => match transition.save(registry, persister)? {
+                        SessionParametersPollSaveOutcome::Graduated(adopted_persister) => {
+                            let (session_state, _) = replay_event_log(&adopted_persister)?;
+                            let MultipartySession::SessionParametersReceieved(received) =
+                                session_state
+                            else {
+                                panic!("graduated log must replay to adopted session parameters");
+                            };
+                            assert_eq!(&received, expected);
+                            return Ok(adopted_persister);
+                        }
+                        SessionParametersPollSaveOutcome::Stasis(next) => participant = next,
+                    },
                     Err(SessionParametersPollFailure::Transient(_)) => {}
                     Err(SessionParametersPollFailure::Fatal(fatal)) => {
                         fatal.save(persister)?;
@@ -322,8 +329,10 @@ mod integration {
             let initiator_a_persister = registry.new_session().expect("new session");
             let initiator_b_persister = registry.new_session().expect("new session");
 
-            let responder_a_persister = InMemoryPersister::default();
-            let responder_b_persister = InMemoryPersister::default();
+            let mut responder_a_registry = InMemoryMultipartyRegistry::new();
+            let mut responder_b_registry = InMemoryMultipartyRegistry::new();
+            let responder_a_persister = responder_a_registry.new_session()?;
+            let responder_b_persister = responder_b_registry.new_session()?;
 
             let initiator_a = InitiatorBuilder::new(directory_url.as_str(), ohttp_keys.clone())?
                 .build()
@@ -376,19 +385,31 @@ mod integration {
                 }
             }
 
-            for persister in [responder_a_persister, responder_b_persister] {
-                let participant_persister = poll_participant_until_graduated(
-                    &agent,
-                    &persister,
-                    &ohttp_relay,
-                    &expected_params,
-                )
-                .await?;
-                // TODO: Assert they have the right session parameters
-                let (session_state, _) = replay_event_log(&participant_persister)?;
+            let participant_a_persister = poll_participant_until_graduated(
+                &agent,
+                &mut responder_a_registry,
+                &responder_a_persister,
+                &ohttp_relay,
+                &expected_params,
+            )
+            .await?;
+            let participant_b_persister = poll_participant_until_graduated(
+                &agent,
+                &mut responder_b_registry,
+                &responder_b_persister,
+                &ohttp_relay,
+                &expected_params,
+            )
+            .await?;
+
+            for (pre_graduation, post_graduation) in [
+                (responder_a_persister, participant_a_persister),
+                (responder_b_persister, participant_b_persister),
+            ] {
+                let (session_state, _) = replay_event_log(&post_graduation)?;
                 assert!(matches!(session_state, MultipartySession::SessionParametersReceieved(_)));
 
-                let (session_state, _) = replay_event_log(&persister)?;
+                let (session_state, _) = replay_event_log(&pre_graduation)?;
                 assert!(matches!(
                     session_state,
                     MultipartySession::Closed(MultipartySessionOutcome::Graduated(_))

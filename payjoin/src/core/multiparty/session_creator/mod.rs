@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::hpke::{encrypt_message_a, HpkeKeyPair, HpkePublicKey};
 use crate::multiparty::participant::{AwaitingSessionParameters, Participant};
-use crate::multiparty::persist::{MultipartySessionRegistry, SessionParametersGraduation};
+use crate::multiparty::persist::{
+    GraduationError, MultipartySessionRegistry, SessionParametersGraduation,
+};
 pub use crate::multiparty::session::replay_event_log;
 use crate::multiparty::session::{
     collect_open_sessions_awaiting_parameters_with_persisters, CollectAwaitingParametersError,
@@ -271,15 +273,23 @@ impl SessionCreatorBuilder {
     ) -> Result<(R::Persister, SessionCreator<CollectedSessions>), SessionCreatorPromoteError<R>>
     where
         R: MultipartySessionRegistry,
+        R::Persister: Clone,
     {
         let session_parameters = self.session_parameters.clone();
-        let awaiting = collect_open_sessions_awaiting_parameters_with_persisters(registry)
-            .map_err(SessionCreatorPromoteError::Collect)?;
+        let awaiting_persisters: Vec<R::Persister> =
+            collect_open_sessions_awaiting_parameters_with_persisters(registry)
+                .map_err(SessionCreatorPromoteError::Collect)?
+                .into_iter()
+                .map(|(persister, _)| persister.clone())
+                .collect();
         let transition = self.build().map_err(SessionCreatorPromoteError::Build)?;
 
         let graduation = SessionParametersGraduation::new(session_parameters);
-        for (persister, _) in &awaiting {
-            graduation.close_persister(*persister).map_err(SessionCreatorPromoteError::Storage)?;
+        for persister in &awaiting_persisters {
+            registry.close_graduated(persister, &graduation).map_err(|err| match err {
+                GraduationError::Registry(e) => SessionCreatorPromoteError::Registry(e),
+                GraduationError::Storage(e) => SessionCreatorPromoteError::Storage(e),
+            })?;
         }
 
         let creator_persister =

@@ -30,6 +30,20 @@ pub trait MultipartySessionRegistry {
     /// TODO: does not need to be mut. Use interior mutability for the inmemory registry.
     fn new_session(&mut self) -> Result<Self::Persister, Self::Error>;
 
+    /// Close `from` with [`MultipartySessionOutcome::Graduated`].
+    fn close_graduated(
+        &mut self,
+        from: &Self::Persister,
+        graduation: &SessionParametersGraduation,
+    ) -> Result<
+        (),
+        GraduationError<Self::Error, <Self::Persister as SessionPersister>::InternalStorageError>,
+    > {
+        from.save_event(graduation.close_event()).map_err(GraduationError::Storage)?;
+        from.close().map_err(GraduationError::Storage)?;
+        Ok(())
+    }
+
     /// Close `from` with [`MultipartySessionOutcome::Graduated`], then register a new log
     /// whose first event is [`MultipartySessionEvent::SessionParametersAdopted`].
     fn save_graduation(
@@ -40,8 +54,7 @@ pub trait MultipartySessionRegistry {
         Self::Persister,
         GraduationError<Self::Error, <Self::Persister as SessionPersister>::InternalStorageError>,
     > {
-        from.save_event(graduation.close_event()).map_err(GraduationError::Storage)?;
-        from.close().map_err(GraduationError::Storage)?;
+        self.close_graduated(from, &graduation)?;
         let new = self.new_session().map_err(GraduationError::Registry)?;
         new.save_event(graduation.adopted_event()).map_err(GraduationError::Storage)?;
         Ok(new)
@@ -72,16 +85,6 @@ impl SessionParametersGraduation {
     pub(crate) fn adopted_event(&self) -> MultipartySessionEvent {
         MultipartySessionEvent::SessionParametersAdopted(self.session_parameters.clone())
     }
-
-    /// Close `persister` with [`MultipartySessionOutcome::Graduated`].
-    pub fn close_persister<P>(&self, persister: &P) -> Result<(), P::InternalStorageError>
-    where
-        P: SessionPersister<SessionEvent = MultipartySessionEvent>,
-    {
-        persister.save_event(self.close_event())?;
-        persister.close()?;
-        Ok(())
-    }
 }
 
 /// Outcome of polling for session parameters before persistence.
@@ -89,8 +92,52 @@ impl SessionParametersGraduation {
 pub enum SessionParametersPollTransition {
     /// Directory has nothing yet; resume from the returned participant.
     Stasis(Participant<AwaitingSessionParameters>),
-    /// Parameters retrieved; persist via [`MultipartySessionRegistry::save_graduation`].
+    /// Parameters retrieved; persist via [`SessionParametersPollTransition::save`].
     Graduation(SessionParametersGraduation),
+}
+
+/// Outcome of persisting a session-parameters poll transition via the registry.
+pub enum SessionParametersPollSaveOutcome<P> {
+    /// Directory had nothing yet; resume polling from the returned participant.
+    Stasis(Participant<AwaitingSessionParameters>),
+    /// Parameters adopted into a new registry log; `from` is closed with
+    /// [`MultipartySessionOutcome::Graduated`].
+    Graduated(P),
+}
+
+impl<P> fmt::Debug for SessionParametersPollSaveOutcome<P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stasis(participant) => f.debug_tuple("Stasis").field(participant).finish(),
+            Self::Graduated(_) => f.write_str("Graduated"),
+        }
+    }
+}
+
+impl SessionParametersPollTransition {
+    /// Persist this poll outcome via `registry`.
+    ///
+    /// Stasis requires no registry mutation. Graduation closes `from` and registers a new log
+    /// whose first event is [`MultipartySessionEvent::SessionParametersAdopted`].
+    pub fn save<R>(
+        self,
+        registry: &mut R,
+        from: &R::Persister,
+    ) -> Result<
+        SessionParametersPollSaveOutcome<R::Persister>,
+        GraduationError<R::Error, <R::Persister as SessionPersister>::InternalStorageError>,
+    >
+    where
+        R: MultipartySessionRegistry,
+    {
+        match self {
+            Self::Stasis(participant) => Ok(SessionParametersPollSaveOutcome::Stasis(participant)),
+            Self::Graduation(graduation) => {
+                let new = registry.save_graduation(from, graduation)?;
+                Ok(SessionParametersPollSaveOutcome::Graduated(new))
+            }
+        }
+    }
 }
 
 /// Fatal or transient failure while polling for session parameters.
@@ -141,23 +188,6 @@ where
             Self::Registry(err) => Some(err),
             Self::Storage(err) => Some(err),
         }
-    }
-}
-
-impl SessionParametersGraduation {
-    /// Close `from` and write the adopted-parameters first event to `new`.
-    pub fn save_with_new_persister<P>(
-        self,
-        from: &P,
-        new: &P,
-    ) -> Result<(), P::InternalStorageError>
-    where
-        P: SessionPersister<SessionEvent = MultipartySessionEvent>,
-    {
-        from.save_event(self.close_event())?;
-        from.close()?;
-        new.save_event(self.adopted_event())?;
-        Ok(())
     }
 }
 

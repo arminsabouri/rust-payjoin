@@ -57,9 +57,6 @@ pub struct AwaitingSessionParameters {
     pub(crate) parameters_mailbox_public_key: HpkePublicKey,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HasSessionParameters {}
-
 impl Participant<AwaitingSessionParameters> {
     /// Mailbox where the session creator POSTs parameters and this participant polls.
     pub(crate) fn parameters_mailbox_public_key(&self) -> &HpkePublicKey {
@@ -123,9 +120,12 @@ impl Participant<AwaitingSessionParameters> {
         };
 
         if let Some(session_parameters) = session_parameters {
-            Ok(SessionParametersPollTransition::Graduation(SessionParametersGraduation::new(
-                session_parameters,
-            )))
+            Ok(SessionParametersPollTransition::Graduation(
+                SessionParametersGraduation::from_awaiting_participant(
+                    &current_state,
+                    session_parameters,
+                ),
+            ))
         } else {
             Ok(SessionParametersPollTransition::Stasis(current_state))
         }
@@ -151,7 +151,18 @@ impl Participant<AwaitingSessionParameters> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HasSessionParameters {}
+
 impl Participant<HasSessionParameters> {
+    pub(crate) fn from_adopted_context(context: ParticipantContext) -> Self {
+        debug_assert!(
+            context.session_parameters.is_some(),
+            "adopted participant context must include session parameters"
+        );
+        Self { state: HasSessionParameters {}, context }
+    }
+
     pub fn session_parameters(&self) -> &SessionParameters {
         self.context
             .session_parameters

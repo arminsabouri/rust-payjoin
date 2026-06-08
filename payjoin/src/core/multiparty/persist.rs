@@ -10,7 +10,7 @@
 use core::fmt;
 use std::error;
 
-use crate::multiparty::participant::{AwaitingSessionParameters, Participant};
+use crate::multiparty::participant::{AwaitingSessionParameters, Participant, ParticipantContext};
 use crate::multiparty::session::{MultipartySessionEvent, MultipartySessionOutcome};
 use crate::multiparty::SessionParameters;
 use crate::persist::{InMemoryPersister, MaybeFatalTransitionWithNoResults, SessionPersister};
@@ -68,10 +68,24 @@ pub trait MultipartySessionRegistry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionParametersGraduation {
     session_parameters: SessionParameters,
+    /// Set when graduating a participant into a post-adoption log.
+    // This is only None when graduating a session creator into a participant log.
+    // TODO: feels like this shouldn't be an option, we should always have a participant context.
+    participant_context: Option<ParticipantContext>,
 }
 
 impl SessionParametersGraduation {
-    pub(crate) fn new(session_parameters: SessionParameters) -> Self { Self { session_parameters } }
+    /// Close-only graduation (e.g. coordinator promotion); does not open an adoption log.
+    pub(crate) fn new(session_parameters: SessionParameters) -> Self {
+        Self { session_parameters, participant_context: None }
+    }
+
+    pub(crate) fn from_awaiting_participant(
+        participant: &Participant<AwaitingSessionParameters>,
+        session_parameters: SessionParameters,
+    ) -> Self {
+        Self { session_parameters, participant_context: Some(participant.context.clone()) }
+    }
 
     /// Session parameters adopted into the post-graduation log.
     pub fn session_parameters(&self) -> &SessionParameters { &self.session_parameters }
@@ -83,7 +97,12 @@ impl SessionParametersGraduation {
     }
 
     pub(crate) fn adopted_event(&self) -> MultipartySessionEvent {
-        MultipartySessionEvent::SessionParametersAdopted(self.session_parameters.clone())
+        let mut context = self
+            .participant_context
+            .clone()
+            .expect("participant adoption requires participant context");
+        context.session_parameters = Some(self.session_parameters.clone());
+        MultipartySessionEvent::SessionParametersAdopted(context)
     }
 }
 

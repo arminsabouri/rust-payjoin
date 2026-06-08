@@ -299,7 +299,7 @@ impl SessionCreatorBuilder {
         Ok((creator_persister, creator))
     }
 
-    pub fn build(
+    fn build(
         self,
     ) -> Result<
         NextStateTransition<MultipartySessionEvent, SessionCreator<CollectedSessions>>,

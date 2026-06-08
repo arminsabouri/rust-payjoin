@@ -293,12 +293,12 @@ mod integration {
                     Ok(transition) => match transition.save(registry, persister)? {
                         SessionParametersPollSaveOutcome::Graduated(adopted_persister) => {
                             let (session_state, _) = replay_event_log(&adopted_persister)?;
-                            let MultipartySession::SessionParametersReceieved(received) =
+                            let MultipartySession::ParticipantHasSessionParameters(participant) =
                                 session_state
                             else {
-                                panic!("graduated log must replay to adopted session parameters");
+                                panic!("graduated log must replay to participant with parameters");
                             };
-                            assert_eq!(&received, expected);
+                            assert_eq!(participant.session_parameters(), expected);
                             return Ok(adopted_persister);
                         }
                         SessionParametersPollSaveOutcome::Stasis(next) => participant = next,
@@ -407,7 +407,10 @@ mod integration {
                 (responder_b_persister, participant_b_persister),
             ] {
                 let (session_state, _) = replay_event_log(&post_graduation)?;
-                assert!(matches!(session_state, MultipartySession::SessionParametersReceieved(_)));
+                assert!(matches!(
+                    session_state,
+                    MultipartySession::ParticipantHasSessionParameters(_)
+                ));
 
                 let (session_state, _) = replay_event_log(&pre_graduation)?;
                 assert!(matches!(

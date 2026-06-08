@@ -9,7 +9,7 @@ use crate::multiparty::initiator::{
     Initialized as InitiatorInitialized, Initiator, InitiatorContext,
 };
 use crate::multiparty::participant::{
-    AwaitingSessionParameters, HasSessionParameters, Participant,
+    AwaitingSessionParameters, HasSessionParameters, Participant, ParticipantContext,
 };
 use crate::multiparty::persist::MultipartySessionRegistry;
 use crate::multiparty::responder::{
@@ -30,8 +30,8 @@ pub enum MultipartySessionEvent {
     InitiatorRetrievedReplyKey(HpkePublicKey),
     ResponderCreated(ResponderContext),
     ResponderSentReplyKey(HpkePublicKey),
-    /// First event of a post-graduation log carrying adopted session parameters.
-    SessionParametersAdopted(SessionParameters),
+    /// First event of a post-graduation participant log.
+    SessionParametersAdopted(ParticipantContext),
     SessionCreatorCreated(SessionCreatorContext),
     SessionCreatorParametersDeliveredTo(HpkePublicKey),
     Closed(MultipartySessionOutcome),
@@ -60,7 +60,6 @@ pub enum MultipartySession {
     ParticipantHasSessionParameters(Participant<HasSessionParameters>),
     SessionCreatorCollectedSessions(SessionCreator<CollectedSessions>),
     SessionCreatorParametersDistributed(SessionCreator<ParametersDistributed>),
-    SessionParametersReceieved(SessionParameters),
     Closed(MultipartySessionOutcome),
 }
 
@@ -136,8 +135,10 @@ where
                 state: CollectedSessions {},
                 context,
             }),
-        MultipartySessionEvent::SessionParametersAdopted(session_parameters) =>
-            MultipartySession::SessionParametersReceieved(session_parameters),
+        MultipartySessionEvent::SessionParametersAdopted(context) =>
+            MultipartySession::ParticipantHasSessionParameters(Participant::from_adopted_context(
+                context,
+            )),
         MultipartySessionEvent::Closed(outcome) => MultipartySession::Closed(outcome),
         _ => return Err(InternalReplayError::InvalidEvent(Box::new(first_event), None).into()),
     };
@@ -273,7 +274,6 @@ pub enum SessionStatus {
     ParticipantHasSessionParameters,
     SessionCreatorCollectingParameters,
     SessionCreatorParametersDistributed,
-    SessionParametersAdopted,
     Closed(MultipartySessionOutcome),
 }
 

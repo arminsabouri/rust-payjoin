@@ -190,8 +190,6 @@ mod integration {
 
     #[cfg(feature = "multiparty")]
     mod multiparty {
-        use std::time::Duration;
-
         use payjoin::multiparty::{
             replay_event_log, InMemoryMultipartyRegistry, InitiatorBuilder, InputScriptType,
             MultipartyPjUri, MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
@@ -202,7 +200,6 @@ mod integration {
         use payjoin::Request;
         use payjoin_test_utils::{init_tracing, BoxSendSyncError, InMemoryPersister, TestServices};
         use reqwest::Client;
-        use tokio::time::sleep;
 
         fn sample_session_parameters() -> SessionParameters {
             SessionParameters::new(
@@ -246,33 +243,28 @@ mod integration {
             Ok(())
         }
 
-        async fn poll_initiator_until_has_reply_key(
+        async fn initiator_poll_reply_key(
             agent: &Client,
             persister: &InMemoryPersister<MultipartySessionEvent>,
             ohttp_relay: &str,
         ) -> Result<(), BoxSendSyncError> {
             let (initiator, _) = replay_event_log(persister)?;
-            let mut initiator = match initiator {
+            let initiator = match initiator {
                 MultipartySession::InitiatorInitialized(state) => state,
                 _ => panic!("initiator must be initialized before poll"),
             };
 
-            // TODO: the poll is really not neccecary. There should always be a payload
-            for _ in 0..50 {
-                let (req, ctx) = initiator.create_poll_request(ohttp_relay)?;
-                let body = send_ohttp_request(agent, req).await?;
-                let transition = initiator.process_poll_request(&body, ctx);
-                match transition.save(persister) {
-                    Ok(OptionalTransitionOutcome::Progress(_)) => return Ok(()),
-                    Ok(OptionalTransitionOutcome::Stasis(next)) => initiator = next,
-                    Err(err) => return Err(err.into()),
-                }
-                sleep(Duration::from_millis(50)).await;
+            let (req, ctx) = initiator.create_poll_request(ohttp_relay)?;
+            let body = send_ohttp_request(agent, req).await?;
+            match initiator.process_poll_request(&body, ctx).save(persister)? {
+                OptionalTransitionOutcome::Progress(_) => Ok(()),
+                OptionalTransitionOutcome::Stasis(_) => panic!(
+                    "initiator poll should retrieve reply key immediately after responder post"
+                ),
             }
-            panic!("initiator poll did not retrieve a reply key");
         }
 
-        async fn poll_participant_until_graduated(
+        async fn participant_poll_session_parameters(
             agent: &Client,
             registry: &mut InMemoryMultipartyRegistry,
             persister: &InMemoryPersister<MultipartySessionEvent>,
@@ -285,32 +277,32 @@ mod integration {
                 _ => panic!("participant must await session parameters"),
             };
 
-            // TODO: the poll is really not neccecary. There should always be a payload
-            for _ in 0..50 {
-                let (req, ctx) = participant.create_session_parameters_poll_request(ohttp_relay)?;
-                let body = send_ohttp_request(agent, req).await?;
-                match participant.clone().process_session_parameters_poll_response(&body, ctx) {
-                    Ok(transition) => match transition.save(registry, persister)? {
-                        SessionParametersPollSaveOutcome::Graduated(adopted_persister) => {
-                            let (session_state, _) = replay_event_log(&adopted_persister)?;
-                            let MultipartySession::ParticipantHasSessionParameters(participant) =
-                                session_state
-                            else {
-                                panic!("graduated log must replay to participant with parameters");
-                            };
-                            assert_eq!(participant.session_parameters(), expected);
-                            return Ok(adopted_persister);
-                        }
-                        SessionParametersPollSaveOutcome::Stasis(next) => participant = next,
-                    },
-                    Err(SessionParametersPollFailure::Transient(_)) => {}
-                    Err(SessionParametersPollFailure::Fatal(fatal)) => {
-                        fatal.save(persister)?;
+            let (req, ctx) = participant.create_session_parameters_poll_request(ohttp_relay)?;
+            let body = send_ohttp_request(agent, req).await?;
+            match participant.process_session_parameters_poll_response(&body, ctx) {
+                Ok(transition) => match transition.save(registry, persister)? {
+                    SessionParametersPollSaveOutcome::Graduated(adopted_persister) => {
+                        let (session_state, _) = replay_event_log(&adopted_persister)?;
+                        let MultipartySession::ParticipantHasSessionParameters(participant) =
+                            session_state
+                        else {
+                            panic!("graduated log must replay to participant with parameters");
+                        };
+                        assert_eq!(participant.session_parameters(), expected);
+                        Ok(adopted_persister)
                     }
+                    SessionParametersPollSaveOutcome::Stasis(_) => panic!(
+                        "participant poll should retrieve session parameters immediately after creator distribution"
+                    ),
+                },
+                Err(SessionParametersPollFailure::Transient(err)) => {
+                    panic!("unexpected transient session-parameters poll failure: {err:?}")
                 }
-                sleep(Duration::from_millis(50)).await;
+                Err(SessionParametersPollFailure::Fatal(fatal)) => {
+                    fatal.save(persister)?;
+                    panic!("fatal session-parameters poll failure")
+                }
             }
-            panic!("participant did not retrieve session parameters");
         }
 
         async fn do_three_participants_initiator_session_creator(
@@ -359,10 +351,8 @@ mod integration {
                 .await?;
 
             // For each initiator, poll until we get the reply keys
-            poll_initiator_until_has_reply_key(&agent, &initiator_a_persister, &ohttp_relay)
-                .await?;
-            poll_initiator_until_has_reply_key(&agent, &initiator_b_persister, &ohttp_relay)
-                .await?;
+            initiator_poll_reply_key(&agent, &initiator_a_persister, &ohttp_relay).await?;
+            initiator_poll_reply_key(&agent, &initiator_b_persister, &ohttp_relay).await?;
 
             let (creator_persister, mut creator) =
                 SessionCreatorBuilder::from_open_awaiting(&registry, expected_params.clone())?
@@ -385,7 +375,7 @@ mod integration {
                 }
             }
 
-            let participant_a_persister = poll_participant_until_graduated(
+            let participant_a_persister = participant_poll_session_parameters(
                 &agent,
                 &mut responder_a_registry,
                 &responder_a_persister,
@@ -393,7 +383,7 @@ mod integration {
                 &expected_params,
             )
             .await?;
-            let participant_b_persister = poll_participant_until_graduated(
+            let participant_b_persister = participant_poll_session_parameters(
                 &agent,
                 &mut responder_b_registry,
                 &responder_b_persister,

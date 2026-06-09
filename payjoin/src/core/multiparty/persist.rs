@@ -2,12 +2,14 @@
 //!
 //! Each role keeps its own event log(s) on a [`crate::persist::SessionPersister`]. Wallets
 //! register the logs they own and pass the returned persister handles into `.save(&persister)`
-//! transitions. Graduation is persisted through the registry via
-//! [`MultipartySessionRegistry::save_graduation`] and [`MultipartySessionRegistry::close_graduated`].
+//! transitions. Closing awaiting logs and opening post-adoption logs is persisted through the
+//! registry via [`MultipartySessionRegistry::close_awaiting_for_session_creator`] and
+//! [`MultipartySessionRegistry::adopt_participant_parameters`].
 //!
-//! A coordinator wallet registers initiator bootstrap logs and the session-creator log, then uses
+//! An initiator wallet that becomes session creator registers initiator bootstrap logs and the
+//! session-creator log, then uses
 //! [`crate::multiparty::collect_open_sessions_awaiting_parameters`] to find its own sessions
-//! awaiting session parameters. Participant wallets (e.g. responders) use a separate registry
+//! awaiting session parameters. Responder and other participant wallets use a separate registry
 //! for bootstrap and post-adoption logs.
 
 use core::fmt;
@@ -22,7 +24,7 @@ use crate::persist::{InMemoryPersister, MaybeFatalTransitionWithNoResults, Sessi
 pub trait MultipartySessionRegistry {
     /// Registry-level errors (not per-log storage errors).
     type Error: error::Error + Send + Sync + 'static;
-    /// Concrete persister type returned for a handle.
+    /// Concrete persister type used by the registry.
     type Persister: SessionPersister<SessionEvent = MultipartySessionEvent>;
 
     /// Handles for session logs that are not closed.
@@ -33,64 +35,74 @@ pub trait MultipartySessionRegistry {
     /// TODO: does not need to be mut. Use interior mutability for the inmemory registry.
     fn new_session(&mut self) -> Result<Self::Persister, Self::Error>;
 
-    /// Close `from` with [`MultipartySessionOutcome::Graduated`].
-    fn close_graduated(
+    /// Close an awaiting session log when [`SessionCreatorBuilder::build_and_promote`] runs.
+    fn close_awaiting_for_session_creator(
         &mut self,
         from: &Self::Persister,
-        graduation: &SessionParametersGraduation,
+        promotion: &SessionCreatorPromotion,
     ) -> Result<
         (),
         GraduationError<Self::Error, <Self::Persister as SessionPersister>::InternalStorageError>,
     > {
-        from.save_event(graduation.close_event()).map_err(GraduationError::Storage)?;
+        from.save_event(promotion.close_event()).map_err(GraduationError::Storage)?;
         from.close().map_err(GraduationError::Storage)?;
         Ok(())
     }
 
-    /// Close `from` with [`MultipartySessionOutcome::Graduated`], then register a new log
-    /// whose first event is [`MultipartySessionEvent::SessionParametersAdopted`].
-    fn save_graduation(
+    /// Close a participant awaiting-parameters log and register a successor log whose first
+    /// event is [`MultipartySessionEvent::SessionParametersAdopted`].
+    fn adopt_participant_parameters(
         &mut self,
         from: &Self::Persister,
-        graduation: SessionParametersGraduation,
+        adoption: ParticipantParametersAdoption,
     ) -> Result<
         Self::Persister,
         GraduationError<Self::Error, <Self::Persister as SessionPersister>::InternalStorageError>,
     > {
-        self.close_graduated(from, &graduation)?;
+        from.save_event(adoption.close_event()).map_err(GraduationError::Storage)?;
+        from.close().map_err(GraduationError::Storage)?;
         let new = self.new_session().map_err(GraduationError::Registry)?;
-        new.save_event(graduation.adopted_event()).map_err(GraduationError::Storage)?;
+        new.save_event(adoption.adopted_event()).map_err(GraduationError::Storage)?;
         Ok(new)
     }
 }
 
-/// Successful end of a pre-parameters log: close with [`MultipartySessionOutcome::Graduated`]
-/// and continue in a new log whose first event carries the adopted session parameters.
-/// TODO: this is masquerading as a transition. Fine for now, when we consider upstreaming changes
-/// we should change this to match the paradigm in the rest of the library.
+/// Close an awaiting session log when session creator promotion replaces parameter polling on
+/// that log.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionParametersGraduation {
+pub struct SessionCreatorPromotion {
     session_parameters: SessionParameters,
-    /// Set when graduating a participant into a post-adoption log.
-    // This is only None when graduating a session creator into a participant log.
-    // TODO: feels like this shouldn't be an option, we should always have a participant context.
-    participant_context: Option<ParticipantContext>,
 }
 
-impl SessionParametersGraduation {
-    /// Close-only graduation (e.g. coordinator promotion); does not open an adoption log.
-    pub(crate) fn new(session_parameters: SessionParameters) -> Self {
-        Self { session_parameters, participant_context: None }
-    }
+impl SessionCreatorPromotion {
+    pub(crate) fn new(session_parameters: SessionParameters) -> Self { Self { session_parameters } }
 
+    /// Session parameters the session creator will distribute.
+    pub fn session_parameters(&self) -> &SessionParameters { &self.session_parameters }
+
+    pub(crate) fn close_event(&self) -> MultipartySessionEvent {
+        MultipartySessionEvent::Closed(MultipartySessionOutcome::Graduated(
+            self.session_parameters.clone(),
+        ))
+    }
+}
+
+/// Participant received session parameters; close the awaiting log and continue in a new log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParticipantParametersAdoption {
+    participant_context: ParticipantContext,
+    session_parameters: SessionParameters,
+}
+
+impl ParticipantParametersAdoption {
     pub(crate) fn from_awaiting_participant(
         participant: &Participant<AwaitingSessionParameters>,
         session_parameters: SessionParameters,
     ) -> Self {
-        Self { session_parameters, participant_context: Some(participant.context.clone()) }
+        Self { participant_context: participant.context.clone(), session_parameters }
     }
 
-    /// Session parameters adopted into the post-graduation log.
+    /// Session parameters adopted into the post-adoption log.
     pub fn session_parameters(&self) -> &SessionParameters { &self.session_parameters }
 
     pub(crate) fn close_event(&self) -> MultipartySessionEvent {
@@ -100,10 +112,7 @@ impl SessionParametersGraduation {
     }
 
     pub(crate) fn adopted_event(&self) -> MultipartySessionEvent {
-        let mut context = self
-            .participant_context
-            .clone()
-            .expect("participant adoption requires participant context");
+        let mut context = self.participant_context.clone();
         context.session_parameters = Some(self.session_parameters.clone());
         MultipartySessionEvent::SessionParametersAdopted(context)
     }
@@ -115,7 +124,7 @@ pub enum SessionParametersPollTransition {
     /// Directory has nothing yet; resume from the returned participant.
     Stasis(Participant<AwaitingSessionParameters>),
     /// Parameters retrieved; persist via [`SessionParametersPollTransition::save`].
-    Graduation(SessionParametersGraduation),
+    Adoption(ParticipantParametersAdoption),
 }
 
 /// Outcome of persisting a session-parameters poll transition via the registry.
@@ -139,7 +148,7 @@ impl<P> fmt::Debug for SessionParametersPollSaveOutcome<P> {
 impl SessionParametersPollTransition {
     /// Persist this poll outcome via `registry`.
     ///
-    /// Stasis requires no registry mutation. Graduation closes `from` and registers a new log
+    /// Stasis requires no registry mutation. Adoption closes `from` and registers a new log
     /// whose first event is [`MultipartySessionEvent::SessionParametersAdopted`].
     pub fn save<R>(
         self,
@@ -154,8 +163,8 @@ impl SessionParametersPollTransition {
     {
         match self {
             Self::Stasis(participant) => Ok(SessionParametersPollSaveOutcome::Stasis(participant)),
-            Self::Graduation(graduation) => {
-                let new = registry.save_graduation(from, graduation)?;
+            Self::Adoption(adoption) => {
+                let new = registry.adopt_participant_parameters(from, adoption)?;
                 Ok(SessionParametersPollSaveOutcome::Graduated(new))
             }
         }
@@ -184,7 +193,8 @@ impl fmt::Debug for SessionParametersPollFailure {
     }
 }
 
-/// Errors from [`MultipartySessionRegistry::save_graduation`].
+/// Errors from [`MultipartySessionRegistry::adopt_participant_parameters`] and
+/// [`MultipartySessionRegistry::close_awaiting_for_session_creator`].
 #[derive(Debug)]
 pub enum GraduationError<R, S> {
     Registry(R),

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::hpke::{decrypt_message_a, HpkeKeyPair, HpkePublicKey};
 use crate::multiparty::persist::{
-    SessionParametersGraduation, SessionParametersPollFailure, SessionParametersPollTransition,
+    ParticipantParametersAdoption, SessionParametersPollFailure, SessionParametersPollTransition,
 };
 use crate::multiparty::session::{MultipartySessionEvent, MultipartySessionOutcome};
 use crate::multiparty::session_parameters::SessionParameters;
@@ -120,8 +120,8 @@ impl Participant<AwaitingSessionParameters> {
         };
 
         if let Some(session_parameters) = session_parameters {
-            Ok(SessionParametersPollTransition::Graduation(
-                SessionParametersGraduation::from_awaiting_participant(
+            Ok(SessionParametersPollTransition::Adoption(
+                ParticipantParametersAdoption::from_awaiting_participant(
                     &current_state,
                     session_parameters,
                 ),

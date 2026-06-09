@@ -22,8 +22,9 @@ pub use participant::{
     ParticipantError, ParticipantSessionError,
 };
 pub use persist::{
-    GraduationError, InMemoryMultipartyRegistry, MultipartySessionRegistry, RegistryError,
-    SessionParametersGraduation, SessionParametersPollFailure, SessionParametersPollSaveOutcome,
+    GraduationError, InMemoryMultipartyRegistry, MultipartySessionRegistry,
+    ParticipantParametersAdoption, RegistryError, SessionCreatorPromotion,
+    SessionParametersPollFailure, SessionParametersPollSaveOutcome,
     SessionParametersPollTransition,
 };
 pub use responder::{

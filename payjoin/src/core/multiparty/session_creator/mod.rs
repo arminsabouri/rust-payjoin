@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::hpke::{encrypt_message_a, HpkeKeyPair, HpkePublicKey};
 use crate::multiparty::participant::{AwaitingSessionParameters, Participant};
 use crate::multiparty::persist::{
-    GraduationError, MultipartySessionRegistry, SessionParametersGraduation,
+    GraduationError, MultipartySessionRegistry, SessionCreatorPromotion,
 };
 pub use crate::multiparty::session::replay_event_log;
 use crate::multiparty::session::{
@@ -308,11 +308,14 @@ impl SessionCreatorBuilder {
 
         let transition = self.build().map_err(SessionCreatorPromoteError::Build)?;
 
-        let graduation = SessionParametersGraduation::new(session_parameters);
+        // TODO: all of this should saving and closing should be handled by the registry.
+        let promotion = SessionCreatorPromotion::new(session_parameters);
         for persister in &awaiting_persisters {
-            registry.close_graduated(persister, &graduation).map_err(|err| match err {
-                GraduationError::Registry(e) => SessionCreatorPromoteError::Registry(e),
-                GraduationError::Storage(e) => SessionCreatorPromoteError::Storage(e),
+            registry.close_awaiting_for_session_creator(persister, &promotion).map_err(|err| {
+                match err {
+                    GraduationError::Registry(e) => SessionCreatorPromoteError::Registry(e),
+                    GraduationError::Storage(e) => SessionCreatorPromoteError::Storage(e),
+                }
             })?;
         }
 

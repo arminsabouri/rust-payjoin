@@ -271,8 +271,8 @@ mod integration {
             ohttp_relay: &str,
             expected: &SessionParameters,
         ) -> Result<InMemoryPersister<MultipartySessionEvent>, BoxSendSyncError> {
-            let (participant, _) = replay_event_log(persister)?;
-            let mut participant = match participant {
+            let (participant_state, _) = replay_event_log(persister)?;
+            let participant = match participant_state {
                 MultipartySession::ParticipantAwaitingSessionParameters(state) => state,
                 _ => panic!("participant must await session parameters"),
             };

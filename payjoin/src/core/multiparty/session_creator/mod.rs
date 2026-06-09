@@ -10,8 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::hpke::{encrypt_message_a, HpkeKeyPair, HpkePublicKey};
 use crate::multiparty::participant::{AwaitingSessionParameters, Participant};
 use crate::multiparty::persist::{
-    GraduationError, MultipartySessionRegistry, SessionCreatorPromotion,
-    SessionCreatorPromotionTransition,
+    GraduationError, MultipartyGraduationTransition, MultipartySessionRegistry,
 };
 pub use crate::multiparty::session::replay_event_log;
 use crate::multiparty::session::{
@@ -136,7 +135,7 @@ impl From<OhttpEncapsulationError> for SessionCreatorError {
 }
 
 /// Errors from [`SessionCreatorBuilder::build_and_promote`] and
-/// [`SessionCreatorPromotionTransition::save`].
+/// [`MultipartyGraduationTransition::save`].
 pub enum SessionCreatorPromoteError<R: MultipartySessionRegistry> {
     Collect(CollectAwaitingParametersError<R>),
     Build(SessionCreatorError),
@@ -192,7 +191,10 @@ impl SessionCreatorBuilder {
     pub fn build_and_promote<R>(
         registry: &R,
         session_parameters: SessionParameters,
-    ) -> Result<SessionCreatorPromotionTransition<R::Persister>, SessionCreatorPromoteError<R>>
+    ) -> Result<
+        MultipartyGraduationTransition<R::Persister, SessionCreator<CollectedSessions>>,
+        SessionCreatorPromoteError<R>,
+    >
     where
         R: MultipartySessionRegistry,
         R::Persister: Clone,
@@ -203,9 +205,9 @@ impl SessionCreatorBuilder {
             build_from_open_awaiting(session_parameters.clone(), &awaiting)
                 .map_err(SessionCreatorPromoteError::Build)?;
 
-        Ok(SessionCreatorPromotionTransition::new(
-            SessionCreatorPromotion::new(session_parameters),
+        Ok(MultipartyGraduationTransition::new(
             committed_awaiting,
+            MultipartySessionEvent::Closed(MultipartySessionOutcome::Graduated(session_parameters)),
             creator,
         ))
     }

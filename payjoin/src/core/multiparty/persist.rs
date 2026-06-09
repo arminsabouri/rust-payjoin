@@ -2,10 +2,8 @@
 //!
 //! Each role keeps its own event log(s) on a [`crate::persist::SessionPersister`]. Wallets
 //! register the logs they own and pass the returned persister handles into `.save(&persister)`
-//! transitions. Closing awaiting logs and opening post-adoption logs is persisted through the
-//! registry via [`SessionCreatorPromotionTransition::save`],
-//! [`MultipartySessionRegistry::save_session_creator_promotion`], and
-//! [`MultipartySessionRegistry::adopt_participant_parameters`].
+//! transitions. Closing awaiting logs and opening successor logs is persisted through
+//! [`MultipartyGraduationTransition::save`] and [`MultipartySessionRegistry::new_session`].
 //!
 //! An initiator wallet that becomes session creator registers initiator bootstrap logs and the
 //! session-creator log, then uses
@@ -17,12 +15,11 @@ use core::fmt;
 use std::error;
 
 use crate::error::ReplayError;
-use crate::multiparty::participant::{AwaitingSessionParameters, Participant, ParticipantContext};
+use crate::multiparty::participant::{
+    AwaitingSessionParameters, HasSessionParameters, Participant, ParticipantContext,
+};
 use crate::multiparty::session::{
     MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
-};
-use crate::multiparty::session_creator::{
-    CollectedSessions, SessionCreator, SessionCreatorPromoteError,
 };
 use crate::multiparty::SessionParameters;
 use crate::persist::{
@@ -44,107 +41,44 @@ pub trait MultipartySessionRegistry {
     /// TODO: do we want to link the previous session with the new one?
     /// TODO: does not need to be mut. Use interior mutability for the inmemory registry.
     fn new_session(&mut self) -> Result<Self::Persister, Self::Error>;
-
-    /// Close matching awaiting logs, register a session-creator log, and persist `transition`.
-    ///
-    /// Persists [`MultipartySessionEvent::SessionCreatorCreated`] first, then closes every log
-    /// committed in `transition` at build time.
-    fn save_session_creator_promotion(
-        &mut self,
-        transition: SessionCreatorPromotionTransition<Self::Persister>,
-    ) -> Result<
-        (Self::Persister, SessionCreator<CollectedSessions>),
-        GraduationError<Self::Error, <Self::Persister as SessionPersister>::InternalStorageError>,
-    >
-    where
-        Self::Persister: Clone,
-    {
-        let SessionCreatorPromotionTransition { promotion, committed_awaiting, creator } =
-            transition;
-
-        let creator_persister = self.new_session().map_err(GraduationError::Registry)?;
-        let creator = creator.save(&creator_persister).map_err(GraduationError::Storage)?;
-
-        for persister in &committed_awaiting {
-            persister.save_event(promotion.close_event()).map_err(GraduationError::Storage)?;
-            persister.close().map_err(GraduationError::Storage)?;
-        }
-
-        Ok((creator_persister, creator))
-    }
-
-    /// Close a participant awaiting-parameters log and register a successor log whose first
-    /// event is [`MultipartySessionEvent::SessionParametersAdopted`].
-    fn adopt_participant_parameters(
-        &mut self,
-        from: &Self::Persister,
-        adoption: ParticipantParametersAdoption,
-    ) -> Result<
-        Self::Persister,
-        GraduationError<Self::Error, <Self::Persister as SessionPersister>::InternalStorageError>,
-    > {
-        from.save_event(adoption.close_event()).map_err(GraduationError::Storage)?;
-        from.close().map_err(GraduationError::Storage)?;
-        let new = self.new_session().map_err(GraduationError::Registry)?;
-        new.save_event(adoption.adopted_event()).map_err(GraduationError::Storage)?;
-        Ok(new)
-    }
 }
 
-/// Close an awaiting session log when session creator promotion replaces parameter polling on
-/// that log.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionCreatorPromotion {
-    session_parameters: SessionParameters,
+/// Open a successor log, then close one or more existing logs.
+pub struct MultipartyGraduationTransition<P, S> {
+    from: Vec<P>,
+    close_event: MultipartySessionEvent,
+    successor: NextStateTransition<MultipartySessionEvent, S>,
 }
 
-impl SessionCreatorPromotion {
-    pub(crate) fn new(session_parameters: SessionParameters) -> Self { Self { session_parameters } }
-
-    /// Session parameters the session creator will distribute.
-    pub fn session_parameters(&self) -> &SessionParameters { &self.session_parameters }
-
-    pub(crate) fn close_event(&self) -> MultipartySessionEvent {
-        MultipartySessionEvent::Closed(MultipartySessionOutcome::Graduated(
-            self.session_parameters.clone(),
-        ))
-    }
-}
-
-/// Promote open awaiting sessions to session-creator distribution.
-///
-/// Returned from [`crate::multiparty::session_creator::SessionCreatorBuilder::build_and_promote`].
-/// The participant set is committed at build time together with the awaiting logs that will close
-/// when [`SessionCreatorPromotionTransition::save`] persists
-/// [`MultipartySessionEvent::SessionCreatorCreated`].
-pub struct SessionCreatorPromotionTransition<P> {
-    promotion: SessionCreatorPromotion,
-    committed_awaiting: Vec<P>,
-    creator: NextStateTransition<MultipartySessionEvent, SessionCreator<CollectedSessions>>,
-}
-
-impl<P> SessionCreatorPromotionTransition<P> {
+impl<P, S> MultipartyGraduationTransition<P, S> {
     pub(crate) fn new(
-        promotion: SessionCreatorPromotion,
-        committed_awaiting: Vec<P>,
-        creator: NextStateTransition<MultipartySessionEvent, SessionCreator<CollectedSessions>>,
+        from: Vec<P>,
+        close_event: MultipartySessionEvent,
+        successor: NextStateTransition<MultipartySessionEvent, S>,
     ) -> Self {
-        Self { promotion, committed_awaiting, creator }
+        Self { from, close_event, successor }
     }
 
-    /// Persist [`MultipartySessionEvent::SessionCreatorCreated`], then close every awaiting log
-    /// committed at build time.
     pub fn save<R>(
         self,
         registry: &mut R,
-    ) -> Result<(R::Persister, SessionCreator<CollectedSessions>), SessionCreatorPromoteError<R>>
+    ) -> Result<
+        (R::Persister, S),
+        GraduationError<R::Error, <R::Persister as SessionPersister>::InternalStorageError>,
+    >
     where
         R: MultipartySessionRegistry<Persister = P>,
         P: Clone + SessionPersister<SessionEvent = MultipartySessionEvent>,
     {
-        registry
-            .save_session_creator_promotion(self)
-            .map_err(SessionCreatorPromoteError::Graduation)
+        let Self { from, close_event, successor } = self;
+
+        let new = registry.new_session().map_err(GraduationError::Registry)?;
+        let state = successor.save(&new).map_err(GraduationError::Storage)?;
+        for persister in &from {
+            persister.save_event(close_event.clone()).map_err(GraduationError::Storage)?;
+            persister.close().map_err(GraduationError::Storage)?;
+        }
+        Ok((new, state))
     }
 }
 
@@ -172,10 +106,26 @@ impl ParticipantParametersAdoption {
         ))
     }
 
-    pub(crate) fn adopted_event(&self) -> MultipartySessionEvent {
-        let mut context = self.participant_context.clone();
-        context.session_parameters = Some(self.session_parameters.clone());
-        MultipartySessionEvent::SessionParametersAdopted(context)
+    pub(crate) fn graduation_transition<P>(
+        self,
+        from: P,
+    ) -> MultipartyGraduationTransition<P, Participant<HasSessionParameters>> {
+        MultipartyGraduationTransition::new(
+            vec![from],
+            self.close_event(),
+            self.successor_transition(),
+        )
+    }
+
+    fn successor_transition(
+        self,
+    ) -> NextStateTransition<MultipartySessionEvent, Participant<HasSessionParameters>> {
+        let mut context = self.participant_context;
+        context.session_parameters = Some(self.session_parameters);
+        NextStateTransition::success(
+            MultipartySessionEvent::SessionParametersAdopted(context.clone()),
+            Participant::from_adopted_context(context),
+        )
     }
 }
 
@@ -203,11 +153,12 @@ impl SessionParametersPollTransition {
     >
     where
         R: MultipartySessionRegistry,
+        R::Persister: Clone,
     {
         match self {
             Self::Stasis(participant) => Ok(OptionalTransitionOutcome::Stasis(participant)),
             Self::Adoption(adoption) => {
-                let new = registry.adopt_participant_parameters(from, adoption)?;
+                let (new, _) = adoption.graduation_transition(from.clone()).save(registry)?;
                 Ok(OptionalTransitionOutcome::Progress(new))
             }
         }
@@ -236,8 +187,7 @@ impl fmt::Debug for SessionParametersPollFailure {
     }
 }
 
-/// Errors from [`MultipartySessionRegistry::adopt_participant_parameters`] and
-/// [`MultipartySessionRegistry::save_session_creator_promotion`].
+/// Errors from [`MultipartyGraduationTransition::save`].
 #[derive(Debug)]
 pub enum GraduationError<E, S> {
     CollectRegistry(E),

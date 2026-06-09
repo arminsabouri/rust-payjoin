@@ -23,8 +23,8 @@ pub use participant::{
 };
 pub use persist::{
     GraduationError, InMemoryMultipartyRegistry, MultipartySessionRegistry, RegistryError,
-    SessionId, SessionParametersGraduation, SessionParametersPollFailure,
-    SessionParametersPollSaveOutcome, SessionParametersPollTransition,
+    SessionParametersGraduation, SessionParametersPollFailure, SessionParametersPollSaveOutcome,
+    SessionParametersPollTransition,
 };
 pub use responder::{
     Initialized as ResponderInitialized, Responder, ResponderBuilder, ResponderContext,

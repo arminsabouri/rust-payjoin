@@ -1,11 +1,14 @@
-//! Multiparty session registry for a coordinator wallet (initiator / session creator).
+//! Multiparty session registry: one [`MultipartySessionRegistry`] per wallet.
 //!
-//! Each protocol session has its own [`crate::persist::SessionPersister`] event log (one log per
-//! initiator bootstrap, per responder bootstrap, per creator distribution, …). Only the
-//! coordinator needs a [`MultipartySessionRegistry`]: it registers handles for every log it
-//! orchestrates (including responders' logs in tests and integrated apps) and uses
-//! [`crate::multiparty::collect_open_sessions_awaiting_parameters`] to find participants ready
-//! for session parameters.
+//! Each role keeps its own event log(s) on a [`crate::persist::SessionPersister`]. Wallets
+//! register the logs they own and pass the returned persister handles into `.save(&persister)`
+//! transitions. Graduation is persisted through the registry via
+//! [`MultipartySessionRegistry::save_graduation`] and [`MultipartySessionRegistry::close_graduated`].
+//!
+//! A coordinator wallet registers initiator bootstrap logs and the session-creator log, then uses
+//! [`crate::multiparty::collect_open_sessions_awaiting_parameters`] to find its own sessions
+//! awaiting session parameters. Participant wallets (e.g. responders) use a separate registry
+//! for bootstrap and post-adoption logs.
 
 use core::fmt;
 use std::error;
@@ -25,8 +28,8 @@ pub trait MultipartySessionRegistry {
     /// Handles for session logs that are not closed.
     fn list_open(&self) -> Result<Vec<&Self::Persister>, Self::Error>;
 
-    /// Create new session
-    /// TODO: do we want to link the previous session wiht the new one?
+    /// Create a new empty session log and return its persister handle.
+    /// TODO: do we want to link the previous session with the new one?
     /// TODO: does not need to be mut. Use interior mutability for the inmemory registry.
     fn new_session(&mut self) -> Result<Self::Persister, Self::Error>;
 
@@ -211,32 +214,21 @@ where
 }
 
 /// Errors from [`InMemoryMultipartyRegistry`].
+///
+/// The in-memory implementation does not currently fail registry operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RegistryError {
-    /// No session is registered under this handle.
-    NotFound(SessionId),
-}
+pub enum RegistryError {}
 
 impl fmt::Display for RegistryError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotFound(id) => write!(f, "multiparty session not found: {:?}", id),
-        }
-    }
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result { match *self {} }
 }
 
 impl error::Error for RegistryError {}
 
-/// Opaque identifier for one persisted multiparty session log.
-///
-/// The registry assigns handles; the library does not embed protocol semantics in the id.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SessionId(u64);
-
 /// In-memory registry for tests and prototyping.
 ///
-/// Use [`InMemoryMultipartyRegistry::create_session`] to register a new empty log, then pass
-/// the returned [`SessionId`] into transition `.save(&registry.persister(&id)?)` flows.
+/// Call [`MultipartySessionRegistry::new_session`] to register a new empty log and use the
+/// returned [`InMemoryPersister`] directly in `.save(&persister)` flows.
 // TODO: move this to test-utils
 #[derive(Default)]
 pub struct InMemoryMultipartyRegistry {

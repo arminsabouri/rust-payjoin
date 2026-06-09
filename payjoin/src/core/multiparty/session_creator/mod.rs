@@ -139,6 +139,10 @@ impl From<OhttpEncapsulationError> for SessionCreatorError {
 pub enum SessionCreatorPromoteError<R: MultipartySessionRegistry> {
     Collect(CollectAwaitingParametersError<R>),
     Build(SessionCreatorError),
+    /// An awaiting log for a builder participant is missing from `registry`, or the registry
+    /// changed between [`SessionCreatorBuilder::from_open_awaiting`] and
+    /// [`SessionCreatorBuilder::build_and_promote`].
+    IncompleteAwaitingRegistry,
     Registry(R::Error),
     Storage(<R::Persister as SessionPersister>::InternalStorageError),
 }
@@ -152,6 +156,7 @@ where
         match self {
             Self::Collect(err) => f.debug_tuple("Collect").field(err).finish(),
             Self::Build(err) => f.debug_tuple("Build").field(err).finish(),
+            Self::IncompleteAwaitingRegistry => f.write_str("IncompleteAwaitingRegistry"),
             Self::Registry(err) => f.debug_tuple("Registry").field(err).finish(),
             Self::Storage(err) => f.debug_tuple("Storage").field(err).finish(),
         }
@@ -167,6 +172,8 @@ where
         match self {
             Self::Collect(err) => write!(f, "collect awaiting sessions: {err}"),
             Self::Build(err) => write!(f, "session creator build: {err}"),
+            Self::IncompleteAwaitingRegistry =>
+                write!(f, "registry is missing an open awaiting log for a builder participant"),
             Self::Registry(err) => write!(f, "registry error: {err}"),
             Self::Storage(err) => write!(f, "storage error: {err}"),
         }
@@ -182,6 +189,7 @@ where
         match self {
             Self::Collect(err) => Some(err),
             Self::Build(err) => Some(err),
+            Self::IncompleteAwaitingRegistry => None,
             Self::Registry(err) => Some(err),
             Self::Storage(err) => Some(err),
         }
@@ -265,8 +273,8 @@ impl SessionCreatorBuilder {
             .map_err(SessionCreatorPromoteError::Build)
     }
 
-    /// Close every open awaiting log in `registry`, register a session-creator log, and persist
-    /// the built creator state.
+    /// Close awaiting logs for this builder's participants in `registry`, register a
+    /// session-creator log, and persist the built creator state.
     pub fn build_and_promote<R>(
         self,
         registry: &mut R,
@@ -276,12 +284,28 @@ impl SessionCreatorBuilder {
         R::Persister: Clone,
     {
         let session_parameters = self.session_parameters.clone();
-        let awaiting_persisters: Vec<R::Persister> =
+        let participant_keys = self.participant_keys.clone();
+        let mut matched_participant_indices = Vec::new();
+        let mut awaiting_persisters: Vec<R::Persister> = Vec::new();
+        for (persister, participant) in
             collect_open_sessions_awaiting_parameters_with_persisters(registry)
                 .map_err(SessionCreatorPromoteError::Collect)?
-                .into_iter()
-                .map(|(persister, _)| persister.clone())
-                .collect();
+        {
+            let key = participant.parameters_mailbox_public_key();
+            let Some(participant_index) = participant_keys.iter().position(|k| k == key) else {
+                continue;
+            };
+            if matched_participant_indices.contains(&participant_index) {
+                continue;
+            }
+            matched_participant_indices.push(participant_index);
+            awaiting_persisters.push(persister.clone());
+        }
+
+        if matched_participant_indices.len() != participant_keys.len() {
+            return Err(SessionCreatorPromoteError::IncompleteAwaitingRegistry);
+        }
+
         let transition = self.build().map_err(SessionCreatorPromoteError::Build)?;
 
         let graduation = SessionParametersGraduation::new(session_parameters);

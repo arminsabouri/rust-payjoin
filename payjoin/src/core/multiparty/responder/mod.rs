@@ -173,7 +173,7 @@ impl Responder<Initialized> {
                 ),
         };
         MaybeFatalTransition::success(
-            MultipartySessionEvent::ResponderSentReplyKey(sent_reply_key.clone()),
+            MultipartySessionEvent::ResponderSentReplyKey,
             Participant {
                 state: AwaitingSessionParameters { parameters_mailbox_public_key: sent_reply_key },
                 context: participant_context,
@@ -181,7 +181,7 @@ impl Responder<Initialized> {
         )
     }
 
-    pub(crate) fn apply_sent_reply_key(self, _sent_reply_key: HpkePublicKey) -> MultipartySession {
+    pub(crate) fn apply_sent_reply_key(self) -> MultipartySession {
         MultipartySession::ParticipantAwaitingSessionParameters(Participant {
             state: AwaitingSessionParameters {
                 parameters_mailbox_public_key: self.context.responder_public_key().clone(),

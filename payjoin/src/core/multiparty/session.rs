@@ -29,7 +29,7 @@ pub enum MultipartySessionEvent {
     InitiatorCreated(InitiatorContext),
     InitiatorRetrievedReplyKey(HpkePublicKey),
     ResponderCreated(ResponderContext),
-    ResponderSentReplyKey(HpkePublicKey),
+    ResponderSentReplyKey,
     /// First event of a post-graduation participant log.
     SessionParametersAdopted(ParticipantContext),
     SessionCreatorCreated(SessionCreatorContext),
@@ -82,8 +82,8 @@ impl MultipartySession {
 
             (
                 MultipartySession::ResponderInitialized(state),
-                MultipartySessionEvent::ResponderSentReplyKey(reply_key),
-            ) => Ok(state.apply_sent_reply_key(reply_key)),
+                MultipartySessionEvent::ResponderSentReplyKey,
+            ) => Ok(state.apply_sent_reply_key()),
 
             (
                 MultipartySession::SessionCreatorCollectedSessions(state),

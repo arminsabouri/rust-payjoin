@@ -34,6 +34,8 @@ pub enum MultipartySessionEvent {
     SessionParametersAdopted(ParticipantContext),
     SessionCreatorCreated(SessionCreatorContext),
     SessionCreatorParametersDeliveredTo(HpkePublicKey),
+    /// Session parameters were acknowledged by every committed participant.
+    SessionCreatorAllParametersDelivered,
     Closed(MultipartySessionOutcome),
 }
 
@@ -89,6 +91,11 @@ impl MultipartySession {
                 MultipartySession::SessionCreatorCollectedSessions(state),
                 MultipartySessionEvent::SessionCreatorParametersDeliveredTo(recipient),
             ) => Ok(state.apply_parameters_delivered(recipient)),
+
+            (
+                MultipartySession::SessionCreatorCollectedSessions(state),
+                MultipartySessionEvent::SessionCreatorAllParametersDelivered,
+            ) => Ok(state.apply_all_parameters_delivered()),
 
             (_, MultipartySessionEvent::Closed(outcome)) => Ok(MultipartySession::Closed(outcome)),
 

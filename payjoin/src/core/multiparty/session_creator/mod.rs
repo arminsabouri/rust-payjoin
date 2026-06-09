@@ -11,6 +11,7 @@ use crate::hpke::{encrypt_message_a, HpkeKeyPair, HpkePublicKey};
 use crate::multiparty::participant::{AwaitingSessionParameters, Participant};
 use crate::multiparty::persist::{
     GraduationError, MultipartySessionRegistry, SessionCreatorPromotion,
+    SessionCreatorPromotionTransition,
 };
 pub use crate::multiparty::session::replay_event_log;
 use crate::multiparty::session::{
@@ -134,17 +135,12 @@ impl From<OhttpEncapsulationError> for SessionCreatorError {
     fn from(value: OhttpEncapsulationError) -> Self { Self::OhttpEncapsulation(value) }
 }
 
-/// Errors from [`SessionCreatorBuilder::from_open_awaiting`] and
-/// [`SessionCreatorBuilder::build_and_promote`].
+/// Errors from [`SessionCreatorBuilder::build_and_promote`] and
+/// [`SessionCreatorPromotionTransition::save`].
 pub enum SessionCreatorPromoteError<R: MultipartySessionRegistry> {
     Collect(CollectAwaitingParametersError<R>),
     Build(SessionCreatorError),
-    /// An awaiting log for a builder participant is missing from `registry`, or the registry
-    /// changed between [`SessionCreatorBuilder::from_open_awaiting`] and
-    /// [`SessionCreatorBuilder::build_and_promote`].
-    IncompleteAwaitingRegistry,
-    Registry(R::Error),
-    Storage(<R::Persister as SessionPersister>::InternalStorageError),
+    Graduation(GraduationError<R::Error, <R::Persister as SessionPersister>::InternalStorageError>),
 }
 
 impl<R: MultipartySessionRegistry> fmt::Debug for SessionCreatorPromoteError<R>
@@ -156,9 +152,7 @@ where
         match self {
             Self::Collect(err) => f.debug_tuple("Collect").field(err).finish(),
             Self::Build(err) => f.debug_tuple("Build").field(err).finish(),
-            Self::IncompleteAwaitingRegistry => f.write_str("IncompleteAwaitingRegistry"),
-            Self::Registry(err) => f.debug_tuple("Registry").field(err).finish(),
-            Self::Storage(err) => f.debug_tuple("Storage").field(err).finish(),
+            Self::Graduation(err) => f.debug_tuple("Graduation").field(err).finish(),
         }
     }
 }
@@ -172,10 +166,7 @@ where
         match self {
             Self::Collect(err) => write!(f, "collect awaiting sessions: {err}"),
             Self::Build(err) => write!(f, "session creator build: {err}"),
-            Self::IncompleteAwaitingRegistry =>
-                write!(f, "registry is missing an open awaiting log for a builder participant"),
-            Self::Registry(err) => write!(f, "registry error: {err}"),
-            Self::Storage(err) => write!(f, "storage error: {err}"),
+            Self::Graduation(err) => write!(f, "session creator promotion: {err}"),
         }
     }
 }
@@ -189,172 +180,84 @@ where
         match self {
             Self::Collect(err) => Some(err),
             Self::Build(err) => Some(err),
-            Self::IncompleteAwaitingRegistry => None,
-            Self::Registry(err) => Some(err),
-            Self::Storage(err) => Some(err),
+            Self::Graduation(err) => Some(err),
         }
     }
 }
 
-pub struct SessionCreatorBuilder {
-    session_parameters: SessionParameters,
-    participant_keys: Vec<HpkePublicKey>,
-    directory: Url,
-    ohttp_keys: OhttpKeys,
-}
+pub struct SessionCreatorBuilder;
 
 impl SessionCreatorBuilder {
-    /// Start a session-creator that will distribute [`SessionParameters`] to each participant.
-    ///
-    /// `participant_keys` are each participant's session-parameters mailbox HPKE public keys (see
-    /// [`Participant::parameters_mailbox_public_key`]); each key identifies that mailbox on the
-    /// Payjoin Directory.
-    pub fn new(
-        session_parameters: SessionParameters,
-        participant_keys: impl IntoIterator<Item = HpkePublicKey>,
-        directory: impl IntoUrl,
-        ohttp_keys: OhttpKeys,
-    ) -> Result<Self, crate::into_url::Error> {
-        let participant_keys: Vec<_> = participant_keys.into_iter().collect();
-        Ok(Self {
-            session_parameters,
-            participant_keys,
-            directory: directory.into_url()?,
-            ohttp_keys,
-        })
-    }
-
-    /// Build from participants awaiting session parameters.
-    ///
-    /// Delivers to each participant's [`Participant::parameters_mailbox_public_key`] (directory
-    /// short id `H(parameters mailbox)`), set when the role transitions into
-    /// [`AwaitingSessionParameters`].
-    pub fn from_awaiting_participants<'a>(
-        session_parameters: SessionParameters,
-        participants: impl IntoIterator<Item = &'a Participant<AwaitingSessionParameters>>,
-    ) -> Result<Self, SessionCreatorError> {
-        let mut participants = participants.into_iter();
-        let first = participants.next().ok_or(SessionCreatorError::NoPendingParticipants)?;
-        // TOOD: can we just encode the directory and ohttp keys in the session parameters?
-        let directory = first.context.directory.clone();
-        let mut participant_keys = vec![first.parameters_mailbox_public_key().clone()];
-
-        for participant in participants {
-            if participant.context.directory != directory {
-                return Err(SessionCreatorError::InconsistentDirectory);
-            }
-            let key = participant.parameters_mailbox_public_key().clone();
-            if participant_keys.contains(&key) {
-                return Err(SessionCreatorError::DuplicateParticipant);
-            }
-            participant_keys.push(key);
-        }
-
-        Ok(Self {
-            session_parameters,
-            participant_keys,
-            directory,
-            ohttp_keys: first.context.ohttp_keys.clone(),
-        })
-    }
-
-    /// Build from every open session in `registry` that awaits session parameters.
-    pub fn from_open_awaiting<R>(
+    /// Build a session-creator promotion from open awaiting sessions in `registry`.
+    pub fn build_and_promote<R>(
         registry: &R,
         session_parameters: SessionParameters,
-    ) -> Result<Self, SessionCreatorPromoteError<R>>
-    where
-        R: MultipartySessionRegistry,
-    {
-        let awaiting = collect_open_sessions_awaiting_parameters_with_persisters(registry)
-            .map_err(SessionCreatorPromoteError::Collect)?;
-        let participants = awaiting.iter().map(|(_, participant)| participant);
-        Self::from_awaiting_participants(session_parameters, participants)
-            .map_err(SessionCreatorPromoteError::Build)
-    }
-
-    /// Close awaiting logs for this builder's participants in `registry`, register a
-    /// session-creator log, and persist the built creator state.
-    pub fn build_and_promote<R>(
-        self,
-        registry: &mut R,
-    ) -> Result<(R::Persister, SessionCreator<CollectedSessions>), SessionCreatorPromoteError<R>>
+    ) -> Result<SessionCreatorPromotionTransition<R::Persister>, SessionCreatorPromoteError<R>>
     where
         R: MultipartySessionRegistry,
         R::Persister: Clone,
     {
-        let session_parameters = self.session_parameters.clone();
-        let participant_keys = self.participant_keys.clone();
-        let mut matched_participant_indices = Vec::new();
-        let mut awaiting_persisters: Vec<R::Persister> = Vec::new();
-        for (persister, participant) in
-            collect_open_sessions_awaiting_parameters_with_persisters(registry)
-                .map_err(SessionCreatorPromoteError::Collect)?
-        {
-            let key = participant.parameters_mailbox_public_key();
-            let Some(participant_index) = participant_keys.iter().position(|k| k == key) else {
-                continue;
-            };
-            if matched_participant_indices.contains(&participant_index) {
-                continue;
-            }
-            matched_participant_indices.push(participant_index);
-            awaiting_persisters.push(persister.clone());
-        }
+        let awaiting = collect_open_sessions_awaiting_parameters_with_persisters(registry)
+            .map_err(SessionCreatorPromoteError::Collect)?;
+        let (creator, committed_awaiting) =
+            build_from_open_awaiting(session_parameters.clone(), &awaiting)
+                .map_err(SessionCreatorPromoteError::Build)?;
 
-        if matched_participant_indices.len() != participant_keys.len() {
-            return Err(SessionCreatorPromoteError::IncompleteAwaitingRegistry);
-        }
-
-        let transition = self.build().map_err(SessionCreatorPromoteError::Build)?;
-
-        // TODO: all of this should saving and closing should be handled by the registry.
-        let promotion = SessionCreatorPromotion::new(session_parameters);
-        for persister in &awaiting_persisters {
-            registry.close_awaiting_for_session_creator(persister, &promotion).map_err(|err| {
-                match err {
-                    GraduationError::Registry(e) => SessionCreatorPromoteError::Registry(e),
-                    GraduationError::Storage(e) => SessionCreatorPromoteError::Storage(e),
-                }
-            })?;
-        }
-
-        let creator_persister =
-            registry.new_session().map_err(SessionCreatorPromoteError::Registry)?;
-        let creator =
-            transition.save(&creator_persister).map_err(SessionCreatorPromoteError::Storage)?;
-        Ok((creator_persister, creator))
-    }
-
-    fn build(
-        self,
-    ) -> Result<
-        NextStateTransition<MultipartySessionEvent, SessionCreator<CollectedSessions>>,
-        SessionCreatorError,
-    > {
-        if self.participant_keys.is_empty() {
-            return Err(SessionCreatorError::NoPendingParticipants);
-        }
-
-        let participants = self
-            .participant_keys
-            .into_iter()
-            .map(|public_key| PendingParticipant { public_key, parameters_delivered: false })
-            .collect();
-
-        let context = SessionCreatorContext {
-            creator_key: HpkeKeyPair::gen_keypair(),
-            directory: self.directory,
-            ohttp_keys: self.ohttp_keys,
-            session_parameters: self.session_parameters,
-            participants,
-        };
-
-        Ok(NextStateTransition::success(
-            MultipartySessionEvent::SessionCreatorCreated(context.clone()),
-            SessionCreator { state: CollectedSessions {}, context },
+        Ok(SessionCreatorPromotionTransition::new(
+            SessionCreatorPromotion::new(session_parameters),
+            committed_awaiting,
+            creator,
         ))
     }
+}
+
+fn build_from_open_awaiting<P>(
+    session_parameters: SessionParameters,
+    awaiting: &[(&P, Participant<AwaitingSessionParameters>)],
+) -> Result<
+    (NextStateTransition<MultipartySessionEvent, SessionCreator<CollectedSessions>>, Vec<P>),
+    SessionCreatorError,
+>
+where
+    P: Clone,
+{
+    let mut iter = awaiting.iter();
+    let (first_persister, first) = iter.next().ok_or(SessionCreatorError::NoPendingParticipants)?;
+    let directory = first.context.directory.clone();
+    let mut participant_keys = vec![first.parameters_mailbox_public_key().clone()];
+    let mut committed_awaiting = vec![(*first_persister).clone()];
+
+    for (persister, participant) in iter {
+        if participant.context.directory != directory {
+            return Err(SessionCreatorError::InconsistentDirectory);
+        }
+        let key = participant.parameters_mailbox_public_key().clone();
+        if participant_keys.contains(&key) {
+            return Err(SessionCreatorError::DuplicateParticipant);
+        }
+        participant_keys.push(key);
+        committed_awaiting.push((*persister).clone());
+    }
+
+    let participants = participant_keys
+        .into_iter()
+        .map(|public_key| PendingParticipant { public_key, parameters_delivered: false })
+        .collect();
+
+    let context = SessionCreatorContext {
+        creator_key: HpkeKeyPair::gen_keypair(),
+        directory,
+        ohttp_keys: first.context.ohttp_keys.clone(),
+        session_parameters,
+        participants,
+    };
+
+    let creator = NextStateTransition::success(
+        MultipartySessionEvent::SessionCreatorCreated(context.clone()),
+        SessionCreator { state: CollectedSessions {}, context },
+    );
+
+    Ok((creator, committed_awaiting))
 }
 
 /// Session creator has collected participant mailboxes and is distributing parameters.
@@ -372,6 +275,52 @@ pub enum ParametersDelivery {
     Collecting(SessionCreator<CollectedSessions>),
     /// Every participant has acknowledged delivery.
     Distributed(SessionCreator<ParametersDistributed>),
+}
+
+/// Persisted outcome of processing one session-parameters distribution response.
+pub struct ParametersDistributionTransition {
+    recipient: HpkePublicKey,
+    delivery: ParametersDelivery,
+}
+
+impl ParametersDistributionTransition {
+    /// Append per-participant delivery events to the session-creator log.
+    ///
+    /// When every committed participant has acknowledged, also appends
+    /// [`MultipartySessionEvent::SessionCreatorAllParametersDelivered`]. The log stays open.
+    pub fn save<P>(self, persister: &P) -> Result<ParametersDelivery, P::InternalStorageError>
+    where
+        P: SessionPersister<SessionEvent = MultipartySessionEvent>,
+    {
+        persister.save_event(MultipartySessionEvent::SessionCreatorParametersDeliveredTo(
+            self.recipient,
+        ))?;
+        if matches!(self.delivery, ParametersDelivery::Distributed(_)) {
+            persister.save_event(MultipartySessionEvent::SessionCreatorAllParametersDelivered)?;
+        }
+        Ok(self.delivery)
+    }
+}
+
+/// Failure while processing a session-parameters distribution response.
+pub enum SessionParametersDistributionFailure {
+    Transient(SessionCreatorSessionError),
+    Fatal(
+        MaybeFatalTransition<
+            MultipartySessionEvent,
+            ParametersDelivery,
+            SessionCreatorSessionError,
+        >,
+    ),
+}
+
+impl fmt::Debug for SessionParametersDistributionFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transient(err) => f.debug_tuple("Transient").field(err).finish(),
+            Self::Fatal(_) => f.write_str("Fatal"),
+        }
+    }
 }
 
 impl From<ParametersDelivery> for MultipartySession {
@@ -419,36 +368,38 @@ impl SessionCreator<CollectedSessions> {
         recipient: HpkePublicKey,
         body: &[u8],
         ohttp_context: ohttp::ClientResponse,
-    ) -> MaybeFatalTransition<MultipartySessionEvent, ParametersDelivery, SessionCreatorSessionError>
-    {
+    ) -> Result<ParametersDistributionTransition, SessionParametersDistributionFailure> {
         match process_post_res(body, ohttp_context) {
             Ok(()) => {}
             Err(e) => {
                 if !e.is_fatal() {
-                    return MaybeFatalTransition::transient(
+                    return Err(SessionParametersDistributionFailure::Transient(
                         InternalSessionCreatorSessionError::DirectoryResponse(e).into(),
-                    );
+                    ));
                 }
                 // TODO: should we should treat all of these as transient and re-try?
-                return MaybeFatalTransition::fatal(
-                    MultipartySessionEvent::Closed(MultipartySessionOutcome::Failure),
-                    InternalSessionCreatorSessionError::DirectoryResponse(e).into(),
-                );
+                return Err(SessionParametersDistributionFailure::Fatal(
+                    MaybeFatalTransition::fatal(
+                        MultipartySessionEvent::Closed(MultipartySessionOutcome::Failure),
+                        InternalSessionCreatorSessionError::DirectoryResponse(e).into(),
+                    ),
+                ));
             }
         }
 
-        let event = MultipartySessionEvent::SessionCreatorParametersDeliveredTo(recipient.clone());
-        let delivery = match self.parameters_delivered_to(recipient) {
+        let delivery = match self.parameters_delivered_to(recipient.clone()) {
             Ok(delivery) => delivery,
             Err(e) => {
-                return MaybeFatalTransition::fatal(
-                    MultipartySessionEvent::Closed(MultipartySessionOutcome::Failure),
-                    e.into(),
-                );
+                return Err(SessionParametersDistributionFailure::Fatal(
+                    MaybeFatalTransition::fatal(
+                        MultipartySessionEvent::Closed(MultipartySessionOutcome::Failure),
+                        e.into(),
+                    ),
+                ));
             }
         };
 
-        MaybeFatalTransition::success(event, delivery)
+        Ok(ParametersDistributionTransition { recipient, delivery })
     }
 
     fn parameters_delivered_to(
@@ -488,9 +439,25 @@ impl SessionCreator<CollectedSessions> {
     }
 
     pub(crate) fn apply_parameters_delivered(self, recipient: HpkePublicKey) -> MultipartySession {
-        self.parameters_delivered_to(recipient)
-            .expect("replay only applies valid ParametersDeliveredTo events")
-            .into()
+        let mut context = self.context;
+        context
+            .mark_parameters_delivered(&recipient)
+            .expect("replay only applies valid ParametersDeliveredTo events");
+        MultipartySession::SessionCreatorCollectedSessions(SessionCreator {
+            state: CollectedSessions {},
+            context,
+        })
+    }
+
+    pub(crate) fn apply_all_parameters_delivered(self) -> MultipartySession {
+        assert!(
+            self.context.all_parameters_delivered(),
+            "AllParametersDelivered only replays after every committed participant acknowledged"
+        );
+        MultipartySession::SessionCreatorParametersDistributed(SessionCreator {
+            state: ParametersDistributed {},
+            context: self.context,
+        })
     }
 }
 

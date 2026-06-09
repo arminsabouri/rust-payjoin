@@ -24,8 +24,8 @@ pub use participant::{
 pub use persist::{
     GraduationError, InMemoryMultipartyRegistry, MultipartySessionRegistry,
     ParticipantParametersAdoption, RegistryError, SessionCreatorPromotion,
-    SessionParametersPollFailure, SessionParametersPollSaveOutcome,
-    SessionParametersPollTransition,
+    SessionCreatorPromotionTransition, SessionParametersPollFailure,
+    SessionParametersPollSaveOutcome, SessionParametersPollTransition,
 };
 pub use responder::{
     Initialized as ResponderInitialized, Responder, ResponderBuilder, ResponderContext,
@@ -38,9 +38,10 @@ pub use session::{
     MultipartySessionOutcome, SessionHistory, SessionStatus,
 };
 pub use session_creator::{
-    CollectedSessions, ParametersDelivery, ParametersDistributed, PendingParticipant,
-    SessionCreator, SessionCreatorBuilder, SessionCreatorContext, SessionCreatorError,
-    SessionCreatorPromoteError, SessionCreatorSessionError, SessionParametersDistributionMessage,
+    CollectedSessions, ParametersDelivery, ParametersDistributed, ParametersDistributionTransition,
+    PendingParticipant, SessionCreator, SessionCreatorBuilder, SessionCreatorContext,
+    SessionCreatorError, SessionCreatorPromoteError, SessionCreatorSessionError,
+    SessionParametersDistributionFailure, SessionParametersDistributionMessage,
 };
 pub use session_parameters::{
     InputScriptType, SessionParameters, SessionParametersError, SESSION_SECRET_LEN,

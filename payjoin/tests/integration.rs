@@ -194,7 +194,7 @@ mod integration {
             replay_event_log, InMemoryMultipartyRegistry, InitiatorBuilder, InputScriptType,
             MultipartyPjUri, MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
             MultipartySessionRegistry, ParametersDelivery, ResponderBuilder, SessionCreatorBuilder,
-            SessionParameters, SessionParametersPollFailure, SessionParametersPollSaveOutcome,
+            SessionParameters, SessionParametersPollSaveOutcome,
         };
         use payjoin::persist::OptionalTransitionOutcome;
         use payjoin::Request;
@@ -295,13 +295,7 @@ mod integration {
                         "participant poll should retrieve session parameters immediately after creator distribution"
                     ),
                 },
-                Err(SessionParametersPollFailure::Transient(err)) => {
-                    panic!("unexpected transient session-parameters poll failure: {err:?}")
-                }
-                Err(SessionParametersPollFailure::Fatal(fatal)) => {
-                    fatal.save(persister)?;
-                    panic!("fatal session-parameters poll failure")
-                }
+                _ => panic!("unexpected session-parameters poll response"),
             }
         }
 
@@ -355,8 +349,8 @@ mod integration {
             initiator_poll_reply_key(&agent, &initiator_b_persister, &ohttp_relay).await?;
 
             let (creator_persister, mut creator) =
-                SessionCreatorBuilder::from_open_awaiting(&registry, expected_params.clone())?
-                    .build_and_promote(&mut registry)?;
+                SessionCreatorBuilder::build_and_promote(&registry, expected_params.clone())?
+                    .save(&mut registry)?;
 
             // Distribute session parameters to responders
             loop {
@@ -366,9 +360,14 @@ mod integration {
                     break;
                 };
                 let body = send_ohttp_request(&agent, req).await?;
-                let delivery = creator
-                    .process_session_parameters_distribution_response(message.recipient, &body, ctx)
-                    .save(&creator_persister)?;
+                let delivery = match creator.process_session_parameters_distribution_response(
+                    message.recipient,
+                    &body,
+                    ctx,
+                ) {
+                    Ok(transition) => transition.save(&creator_persister)?,
+                    _ => panic!("unexpected session-parameters distribution failure"),
+                };
                 match delivery {
                     ParametersDelivery::Collecting(next) => creator = next,
                     ParametersDelivery::Distributed(_) => break,

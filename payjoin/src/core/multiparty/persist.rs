@@ -3,7 +3,8 @@
 //! Each role keeps its own event log(s) on a [`crate::persist::SessionPersister`]. Wallets
 //! register the logs they own and pass the returned persister handles into `.save(&persister)`
 //! transitions. Closing awaiting logs and opening post-adoption logs is persisted through the
-//! registry via [`MultipartySessionRegistry::close_awaiting_for_session_creator`] and
+//! registry via [`SessionCreatorPromotionTransition::save`],
+//! [`MultipartySessionRegistry::save_session_creator_promotion`], and
 //! [`MultipartySessionRegistry::adopt_participant_parameters`].
 //!
 //! An initiator wallet that becomes session creator registers initiator bootstrap logs and the
@@ -15,10 +16,18 @@
 use core::fmt;
 use std::error;
 
+use crate::error::ReplayError;
 use crate::multiparty::participant::{AwaitingSessionParameters, Participant, ParticipantContext};
-use crate::multiparty::session::{MultipartySessionEvent, MultipartySessionOutcome};
+use crate::multiparty::session::{
+    MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
+};
+use crate::multiparty::session_creator::{
+    CollectedSessions, SessionCreator, SessionCreatorPromoteError,
+};
 use crate::multiparty::SessionParameters;
-use crate::persist::{InMemoryPersister, MaybeFatalTransitionWithNoResults, SessionPersister};
+use crate::persist::{
+    InMemoryPersister, MaybeFatalTransitionWithNoResults, NextStateTransition, SessionPersister,
+};
 
 /// Index of many multiparty session persisters.
 pub trait MultipartySessionRegistry {
@@ -35,18 +44,32 @@ pub trait MultipartySessionRegistry {
     /// TODO: does not need to be mut. Use interior mutability for the inmemory registry.
     fn new_session(&mut self) -> Result<Self::Persister, Self::Error>;
 
-    /// Close an awaiting session log when [`SessionCreatorBuilder::build_and_promote`] runs.
-    fn close_awaiting_for_session_creator(
+    /// Close matching awaiting logs, register a session-creator log, and persist `transition`.
+    ///
+    /// Persists [`MultipartySessionEvent::SessionCreatorCreated`] first, then closes every log
+    /// committed in `transition` at build time.
+    fn save_session_creator_promotion(
         &mut self,
-        from: &Self::Persister,
-        promotion: &SessionCreatorPromotion,
+        transition: SessionCreatorPromotionTransition<Self::Persister>,
     ) -> Result<
-        (),
+        (Self::Persister, SessionCreator<CollectedSessions>),
         GraduationError<Self::Error, <Self::Persister as SessionPersister>::InternalStorageError>,
-    > {
-        from.save_event(promotion.close_event()).map_err(GraduationError::Storage)?;
-        from.close().map_err(GraduationError::Storage)?;
-        Ok(())
+    >
+    where
+        Self::Persister: Clone,
+    {
+        let SessionCreatorPromotionTransition { promotion, committed_awaiting, creator } =
+            transition;
+
+        let creator_persister = self.new_session().map_err(GraduationError::Registry)?;
+        let creator = creator.save(&creator_persister).map_err(GraduationError::Storage)?;
+
+        for persister in &committed_awaiting {
+            persister.save_event(promotion.close_event()).map_err(GraduationError::Storage)?;
+            persister.close().map_err(GraduationError::Storage)?;
+        }
+
+        Ok((creator_persister, creator))
     }
 
     /// Close a participant awaiting-parameters log and register a successor log whose first
@@ -84,6 +107,43 @@ impl SessionCreatorPromotion {
         MultipartySessionEvent::Closed(MultipartySessionOutcome::Graduated(
             self.session_parameters.clone(),
         ))
+    }
+}
+
+/// Promote open awaiting sessions to session-creator distribution.
+///
+/// Returned from [`crate::multiparty::session_creator::SessionCreatorBuilder::build_and_promote`].
+/// The participant set is committed at build time together with the awaiting logs that will close
+/// when [`SessionCreatorPromotionTransition::save`] persists
+/// [`MultipartySessionEvent::SessionCreatorCreated`].
+pub struct SessionCreatorPromotionTransition<P> {
+    promotion: SessionCreatorPromotion,
+    committed_awaiting: Vec<P>,
+    creator: NextStateTransition<MultipartySessionEvent, SessionCreator<CollectedSessions>>,
+}
+
+impl<P> SessionCreatorPromotionTransition<P> {
+    pub(crate) fn new(
+        promotion: SessionCreatorPromotion,
+        committed_awaiting: Vec<P>,
+        creator: NextStateTransition<MultipartySessionEvent, SessionCreator<CollectedSessions>>,
+    ) -> Self {
+        Self { promotion, committed_awaiting, creator }
+    }
+
+    /// Persist [`MultipartySessionEvent::SessionCreatorCreated`], then close every awaiting log
+    /// committed at build time.
+    pub fn save<R>(
+        self,
+        registry: &mut R,
+    ) -> Result<(R::Persister, SessionCreator<CollectedSessions>), SessionCreatorPromoteError<R>>
+    where
+        R: MultipartySessionRegistry<Persister = P>,
+        P: Clone + SessionPersister<SessionEvent = MultipartySessionEvent>,
+    {
+        registry
+            .save_session_creator_promotion(self)
+            .map_err(SessionCreatorPromoteError::Graduation)
     }
 }
 
@@ -194,30 +254,42 @@ impl fmt::Debug for SessionParametersPollFailure {
 }
 
 /// Errors from [`MultipartySessionRegistry::adopt_participant_parameters`] and
-/// [`MultipartySessionRegistry::close_awaiting_for_session_creator`].
+/// [`MultipartySessionRegistry::save_session_creator_promotion`].
 #[derive(Debug)]
-pub enum GraduationError<R, S> {
-    Registry(R),
+pub enum GraduationError<E, S> {
+    CollectRegistry(E),
+    CollectReplay(ReplayError<MultipartySession, MultipartySessionEvent>),
+    IncompleteAwaitingRegistry,
+    Registry(E),
     Storage(S),
 }
 
-impl<R: fmt::Display, S: fmt::Display> fmt::Display for GraduationError<R, S> {
+impl<E: fmt::Display, S: fmt::Display> fmt::Display for GraduationError<E, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CollectRegistry(err) =>
+                write!(f, "collect awaiting sessions: registry error: {err}"),
+            Self::CollectReplay(err) => write!(f, "collect awaiting sessions: replay error: {err}"),
+            Self::IncompleteAwaitingRegistry => write!(
+                f,
+                "registry is missing an open awaiting log for a session creator participant"
+            ),
             Self::Registry(err) => write!(f, "registry error: {err}"),
             Self::Storage(err) => write!(f, "storage error: {err}"),
         }
     }
 }
 
-impl<R, S> error::Error for GraduationError<R, S>
+impl<E, S> error::Error for GraduationError<E, S>
 where
-    R: error::Error + 'static,
+    E: error::Error + 'static,
     S: error::Error + 'static,
 {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
-            Self::Registry(err) => Some(err),
+            Self::CollectRegistry(err) | Self::Registry(err) => Some(err),
+            Self::CollectReplay(err) => Some(err),
+            Self::IncompleteAwaitingRegistry => None,
             Self::Storage(err) => Some(err),
         }
     }

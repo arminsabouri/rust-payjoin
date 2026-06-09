@@ -26,7 +26,8 @@ use crate::multiparty::session_creator::{
 };
 use crate::multiparty::SessionParameters;
 use crate::persist::{
-    InMemoryPersister, MaybeFatalTransitionWithNoResults, NextStateTransition, SessionPersister,
+    InMemoryPersister, MaybeFatalTransitionWithNoResults, NextStateTransition,
+    OptionalTransitionOutcome, SessionPersister,
 };
 
 /// Index of many multiparty session persisters.
@@ -187,24 +188,6 @@ pub enum SessionParametersPollTransition {
     Adoption(ParticipantParametersAdoption),
 }
 
-/// Outcome of persisting a session-parameters poll transition via the registry.
-pub enum SessionParametersPollSaveOutcome<P> {
-    /// Directory had nothing yet; resume polling from the returned participant.
-    Stasis(Participant<AwaitingSessionParameters>),
-    /// Parameters adopted into a new registry log; `from` is closed with
-    /// [`MultipartySessionOutcome::Graduated`].
-    Graduated(P),
-}
-
-impl<P> fmt::Debug for SessionParametersPollSaveOutcome<P> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Stasis(participant) => f.debug_tuple("Stasis").field(participant).finish(),
-            Self::Graduated(_) => f.write_str("Graduated"),
-        }
-    }
-}
-
 impl SessionParametersPollTransition {
     /// Persist this poll outcome via `registry`.
     ///
@@ -215,17 +198,17 @@ impl SessionParametersPollTransition {
         registry: &mut R,
         from: &R::Persister,
     ) -> Result<
-        SessionParametersPollSaveOutcome<R::Persister>,
+        OptionalTransitionOutcome<R::Persister, Participant<AwaitingSessionParameters>>,
         GraduationError<R::Error, <R::Persister as SessionPersister>::InternalStorageError>,
     >
     where
         R: MultipartySessionRegistry,
     {
         match self {
-            Self::Stasis(participant) => Ok(SessionParametersPollSaveOutcome::Stasis(participant)),
+            Self::Stasis(participant) => Ok(OptionalTransitionOutcome::Stasis(participant)),
             Self::Adoption(adoption) => {
                 let new = registry.adopt_participant_parameters(from, adoption)?;
-                Ok(SessionParametersPollSaveOutcome::Graduated(new))
+                Ok(OptionalTransitionOutcome::Progress(new))
             }
         }
     }

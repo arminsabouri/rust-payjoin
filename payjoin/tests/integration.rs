@@ -194,7 +194,7 @@ mod integration {
             replay_event_log, InMemoryMultipartyRegistry, InitiatorBuilder, InputScriptType,
             MultipartyPjUri, MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
             MultipartySessionRegistry, ParametersDelivery, ResponderBuilder, SessionCreatorBuilder,
-            SessionParameters, SessionParametersPollSaveOutcome,
+            SessionParameters,
         };
         use payjoin::persist::OptionalTransitionOutcome;
         use payjoin::Request;
@@ -281,7 +281,7 @@ mod integration {
             let body = send_ohttp_request(agent, req).await?;
             match participant.process_session_parameters_poll_response(&body, ctx) {
                 Ok(transition) => match transition.save(registry, persister)? {
-                    SessionParametersPollSaveOutcome::Graduated(adopted_persister) => {
+                    OptionalTransitionOutcome::Progress(adopted_persister) => {
                         let (session_state, _) = replay_event_log(&adopted_persister)?;
                         let MultipartySession::ParticipantHasSessionParameters(participant) =
                             session_state
@@ -291,7 +291,7 @@ mod integration {
                         assert_eq!(participant.session_parameters(), expected);
                         Ok(adopted_persister)
                     }
-                    SessionParametersPollSaveOutcome::Stasis(_) => panic!(
+                    OptionalTransitionOutcome::Stasis(_) => panic!(
                         "participant poll should retrieve session parameters immediately after creator distribution"
                     ),
                 },

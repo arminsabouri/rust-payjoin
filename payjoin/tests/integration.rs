@@ -193,7 +193,6 @@ mod integration {
         use payjoin::append_mailbox::{
             append_request, process_append_response, process_read_response, read_request,
         };
-        use payjoin::directory::ShortId;
         use payjoin::multiparty::{
             replay_event_log, InMemoryMultipartyRegistry, InitiatorBuilder, InputScriptType,
             MultipartyPjUri, MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
@@ -459,10 +458,10 @@ mod integration {
             let ohttp_relay = services.ohttp_relay_url();
 
             // The mailbox owner reads; two senders append independently sealed frames.
-            let receiver = HpkeKeyPair::gen_keypair();
+            let shared_secret_context = HpkeKeyPair::gen_keypair();
             let sender_a = HpkeKeyPair::gen_keypair();
             let sender_b = HpkeKeyPair::gen_keypair();
-            let mailbox = ShortId([7u8; 8]);
+            let mailbox = shared_secret_context.public_key().short_id();
 
             // Each append seals one frame to the receiver. With append semantics
             // the directory accepts every write to the same mailbox instead of
@@ -472,15 +471,13 @@ mod integration {
                 (&sender_b, b"hello from B"),
                 (&sender_a, b"second from A"),
             ];
-            for (sender, message) in appends {
+            for (_, message) in appends {
                 let (req, ctx) = append_request(
                     &ohttp_keys,
                     &directory,
                     &ohttp_relay,
-                    &mailbox,
                     message,
-                    sender.public_key(),
-                    receiver.public_key(),
+                    shared_secret_context.public_key(),
                 )?;
                 let body = send_ohttp_request(&agent, req).await?;
                 process_append_response(&body, ctx)?;
@@ -492,22 +489,19 @@ mod integration {
             // before comparing to the original messages.
             let (req, ctx) = read_request(&ohttp_keys, &directory, &ohttp_relay, &mailbox)?;
             let body = send_ohttp_request(&agent, req).await?;
-            let messages = process_read_response(&body, ctx, &receiver)?;
+            let messages = process_read_response(&body, ctx, &shared_secret_context)?;
 
+            // TODO: triming shopuld be done in process_read_response
             let trim = |bytes: &[u8]| -> Vec<u8> {
                 let end = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
                 bytes[..end].to_vec()
             };
-            let plaintexts: Vec<Vec<u8>> = messages.iter().map(|m| trim(&m.plaintext)).collect();
+            let plaintexts: Vec<Vec<u8>> = messages.iter().map(|m| trim(&m)).collect();
             assert_eq!(
                 plaintexts,
                 vec![b"hello from A".to_vec(), b"hello from B".to_vec(), b"second from A".to_vec(),],
                 "all appended frames returned in append order"
             );
-            // TODO: reply keys should be set to the same shared secret * G
-            assert_eq!(messages[0].reply_key, *sender_a.public_key());
-            assert_eq!(messages[1].reply_key, *sender_b.public_key());
-            assert_eq!(messages[2].reply_key, *sender_a.public_key());
 
             // A reader the frames were not sealed to recovers nothing from the
             // same mailbox: frames stay confidential under append.

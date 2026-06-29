@@ -2,6 +2,7 @@ use core::fmt;
 use std::error;
 use std::ops::Deref;
 
+use bitcoin::hashes::{sha256, Hash};
 use bitcoin::key::constants::{ELLSWIFT_ENCODING_SIZE, PUBLIC_KEY_SIZE};
 use bitcoin::secp256k1;
 use bitcoin::secp256k1::ellswift::ElligatorSwift;
@@ -13,6 +14,7 @@ use hpke::{Deserializable, OpModeR, OpModeS, Serializable};
 use serde::{Deserialize, Serialize};
 
 pub use crate::directory::PADDED_MESSAGE_BYTES;
+use crate::uri::ShortId;
 pub const PADDED_PLAINTEXT_A_LENGTH: usize =
     PADDED_MESSAGE_BYTES - (ELLSWIFT_ENCODING_SIZE + PUBLIC_KEY_SIZE + POLY1305_TAG_SIZE);
 pub const PADDED_PLAINTEXT_B_LENGTH: usize =
@@ -133,6 +135,8 @@ impl HpkePublicKey {
             compressed_key.serialize_uncompressed().as_slice(),
         )?))
     }
+
+    pub fn short_id(&self) -> ShortId { sha256::Hash::hash(&self.0.to_bytes()).into() }
 }
 
 impl Deref for HpkePublicKey {

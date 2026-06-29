@@ -27,19 +27,19 @@ pub fn append_request(
     ohttp_keys: &OhttpKeys,
     directory: &Url,
     ohttp_relay: impl IntoUrl,
-    mailbox: &ShortId,
     message: &[u8],
-    reply_key: &HpkePublicKey,
     receiver_key: &HpkePublicKey,
 ) -> Result<(Request, ohttp::ClientResponse), MailboxError> {
-    let frame = encrypt_message_a(message.to_vec(), reply_key, receiver_key)?;
-    let target = mailbox_endpoint(directory, mailbox);
+    let mailbox = receiver_key.short_id();
+    let frame = encrypt_message_a(message.to_vec(), receiver_key, receiver_key)?;
+    let target = mailbox_endpoint(directory, &mailbox);
     let (body, ctx) = ohttp_encapsulate(&ohttp_keys.0, "POST", target.as_str(), Some(&frame))?;
     let request = Request::new_v2(&relay_url(ohttp_relay, directory)?, &body);
     Ok((request, ctx))
 }
 
 /// Process the response to an [`append_request`].
+// TODO: remove this later. this only exists for integration tests
 pub fn process_append_response(res: &[u8], ctx: ohttp::ClientResponse) -> Result<(), MailboxError> {
     process_post_res(res, ctx).map_err(MailboxError::from)
 }
@@ -57,39 +57,31 @@ pub fn read_request(
     Ok((request, ctx))
 }
 
-/// A mailbox frame decrypted by the reader.
-pub struct DecryptedMessage {
-    /// The plaintext message.
-    pub plaintext: Vec<u8>,
-    /// The sender's reply public key, carried in the frame, to reply to them.
-    pub reply_key: HpkePublicKey,
-}
-
 /// Process the response to a [`read_request`] into the messages addressed to the
 /// reader.
 ///
 /// Each frame is HPKE-sealed to one recipient, so the whole mailbox is read and
-/// every frame is decrypted with `receiver_keypair`; frames sealed to other
+/// every frame is decrypted with `shared_secret_ctx`; frames sealed to other
 /// recipients don't open and are skipped. Returns an empty `Vec` if the mailbox
 /// has no messages yet.
 pub fn process_read_response(
     res: &[u8],
     ctx: ohttp::ClientResponse,
-    receiver_keypair: &HpkeKeyPair,
-) -> Result<Vec<DecryptedMessage>, MailboxError> {
+     shared_secret_ctx: &HpkeKeyPair,
+    ) -> Result<Vec<Vec<u8>>, MailboxError> {
     let frames = match process_get_res(res, ctx)? {
         Some(blob) => split_frames(&blob)?,
         None => return Ok(Vec::new()),
     };
-    Ok(decrypt_frames(&frames, receiver_keypair))
+    Ok(decrypt_frames(&frames, shared_secret_ctx))
 }
 
-/// Decrypt the frames addressed to `receiver_keypair`, skipping the rest.
-fn decrypt_frames(frames: &[Vec<u8>], receiver_keypair: &HpkeKeyPair) -> Vec<DecryptedMessage> {
+/// Decrypt the frames addressed to `shared_secret_ctx`, skipping the rest.
+fn decrypt_frames(frames: &[Vec<u8>], shared_secret_ctx: &HpkeKeyPair) -> Vec<Vec<u8>> {
     frames
         .iter()
-        .filter_map(|frame| decrypt_message_a(frame, receiver_keypair.secret_key()).ok())
-        .map(|(plaintext, reply_key)| DecryptedMessage { plaintext, reply_key })
+        .filter_map(|frame| decrypt_message_a(frame, shared_secret_ctx.secret_key()).ok())
+        .map(|(plaintext, _)| plaintext)
         .collect()
 }
 
@@ -231,9 +223,8 @@ mod tests {
 
         // Alice reads only the two frames sealed to her, in order.
         let alice_msgs = decrypt_frames(&frames, &alice);
-        let plaintexts: Vec<&[u8]> = alice_msgs.iter().map(|m| m.plaintext.as_slice()).collect();
+        let plaintexts: Vec<&[u8]> = alice_msgs.iter().map(|m| m.as_slice()).collect();
         assert_eq!(plaintexts, vec![&b"for alice 1"[..], &b"for alice 2"[..]]);
-        assert!(alice_msgs.iter().all(|m| m.reply_key == *sender.public_key()));
 
         // Bob reads only his one frame; a stranger reads none.
         assert_eq!(decrypt_frames(&frames, &bob).len(), 1);

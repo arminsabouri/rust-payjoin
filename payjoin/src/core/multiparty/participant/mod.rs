@@ -1,18 +1,25 @@
 mod error;
+mod plan;
 
 use bitcoin::hashes::{sha256, Hash};
 pub use error::{ParticipantError, ParticipantSessionError};
+pub use plan::Plan;
 use serde::{Deserialize, Serialize};
 
+use crate::append_mailbox::{append_request, MailboxError};
 use crate::hpke::{decrypt_message_a, HpkeKeyPair, HpkePublicKey};
+use crate::multiparty::participant::plan::PlanBuilder;
 use crate::multiparty::persist::{
     ParticipantParametersAdoption, SessionParametersPollFailure, SessionParametersPollTransition,
 };
-use crate::multiparty::session::{MultipartySessionEvent, MultipartySessionOutcome};
+use crate::multiparty::session::{
+    MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
+};
 use crate::multiparty::session_parameters::SessionParameters;
-use crate::ohttp::{ohttp_encapsulate, process_get_res};
-use crate::persist::MaybeFatalTransitionWithNoResults;
+use crate::ohttp::{ohttp_encapsulate, process_get_res, process_post_res};
+use crate::persist::{MaybeFatalTransitionWithNoResults, NextStateTransition};
 use crate::receive::v2::mailbox_endpoint;
+use crate::receive::InputPair;
 use crate::uri::ShortId;
 use crate::{IntoUrl, OhttpKeys, Request, Url};
 
@@ -169,4 +176,99 @@ impl Participant<HasSessionParameters> {
             .as_ref()
             .expect("HasSessionParameters state must have session_parameters in context")
     }
+
+    pub(crate) fn apply_with_plan(self, plan: Plan) -> MultipartySession {
+        MultipartySession::ParticipantHasPlan(Participant {
+            state: HasPlan { plan, plan_cursor: 0 },
+            context: self.context,
+        })
+    }
+
+    // Next state should be one where we generate our plan:
+    // What actions are we going to take in the "best worst" case
+    // `HasPlan` state then iterates over available actions while reading from the directory and persisting others' actions
+    // We do want to save the first plan we come up with. And as we learn new information from others we will prune the plan and pick
+    // a better branch of the decision tree -- based on some cost / privacy metric.
+
+    pub(crate) fn generate_plan(
+        &self,
+        candidate_inputs: impl IntoIterator<Item = InputPair>,
+        payment_obligations: impl IntoIterator<Item = bitcoin::TxOut>,
+    ) -> NextStateTransition<MultipartySessionEvent, Participant<HasPlan>> {
+        let mut plan = PlanBuilder::new();
+        for input in candidate_inputs {
+            plan = plan.add_input(input);
+        }
+        for output in payment_obligations {
+            plan = plan.add_output(output);
+        }
+        let plan = plan.build();
+        NextStateTransition::success(
+            MultipartySessionEvent::PlanGenerated(plan.clone()),
+            Participant { state: HasPlan { plan, plan_cursor: 0 }, context: self.context.clone() },
+        )
+    }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HasPlan {
+    pub(crate) plan: Plan,
+    pub(crate) plan_cursor: usize,
+}
+
+// Once you have a plan, we should read over the available actions and execute them.
+// we will also need to read existing messages from the directory and persist them
+// For now lets just execute the actions and then read other's. once we read a others
+// messages we will need to re-evaluate the plan and update our cursor. And potentially decide a better
+// branch in the plan
+impl Participant<HasPlan> {
+    pub(crate) fn apply_with_plan_cursor(mut self, plan_cursor: usize) -> MultipartySession {
+        self.state.plan_cursor = plan_cursor;
+        MultipartySession::ParticipantHasPlan(self)
+    }
+
+    pub fn execute_action_from_plan(
+        &self,
+        ohttp_relay: impl IntoUrl,
+    ) -> Result<(Request, ohttp::ClientResponse), MailboxError> {
+        let action =
+            self.state.plan.action(self.state.plan_cursor).expect("plan cursor is out of bounds");
+        let msg = action.as_psbt_fragment().serialize();
+        append_request(
+            &self.context.ohttp_keys,
+            &self.context.directory,
+            ohttp_relay,
+            &msg,
+            &self.context.reply_key,
+        )
+    }
+
+    pub fn process_action_response(
+        &self,
+        body: &[u8],
+        context: ohttp::ClientResponse,
+    ) -> MaybeFatalTransitionWithNoResults<
+        MultipartySessionEvent,
+        Participant<PlanExecuted>,
+        Participant<HasPlan>,
+        ParticipantError,
+    > {
+        let plan = self.state.plan.clone();
+        let plan_cursor = self.state.plan_cursor + 1;
+
+        process_post_res(body, context).expect("remove this later TODO");
+        if plan_cursor >= plan.len() {
+            return MaybeFatalTransitionWithNoResults::success(
+                MultipartySessionEvent::PlanExecuted(plan_cursor),
+                Participant { state: PlanExecuted {}, context: self.context.clone() },
+            );
+        } 
+        MaybeFatalTransitionWithNoResults::no_results(
+            MultipartySessionEvent::PlanExecuted(plan_cursor),
+            Participant { state: HasPlan { plan, plan_cursor }, context: self.context.clone() },
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanExecuted {}

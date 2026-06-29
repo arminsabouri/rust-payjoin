@@ -9,7 +9,7 @@ use crate::multiparty::initiator::{
     Initialized as InitiatorInitialized, Initiator, InitiatorContext,
 };
 use crate::multiparty::participant::{
-    AwaitingSessionParameters, HasSessionParameters, Participant, ParticipantContext,
+    AwaitingSessionParameters, HasPlan, HasSessionParameters, Participant, ParticipantContext, Plan,
 };
 use crate::multiparty::persist::MultipartySessionRegistry;
 use crate::multiparty::responder::{
@@ -32,6 +32,10 @@ pub enum MultipartySessionEvent {
     ResponderSentReplyKey,
     /// First event of a post-graduation participant log.
     SessionParametersAdopted(ParticipantContext),
+    /// Participant generated its initial plan from available inputs and payment obligations.
+    PlanGenerated(Plan),
+    /// Participant executed a plan action and advanced to this cursor.
+    PlanExecuted(usize),
     SessionCreatorCreated(SessionCreatorContext),
     SessionCreatorParametersDeliveredTo(HpkePublicKey),
     /// Session parameters were acknowledged by every committed participant.
@@ -60,6 +64,7 @@ pub enum MultipartySession {
     ResponderInitialized(Responder<ResponderInitialized>),
     ParticipantAwaitingSessionParameters(Participant<AwaitingSessionParameters>),
     ParticipantHasSessionParameters(Participant<HasSessionParameters>),
+    ParticipantHasPlan(Participant<HasPlan>),
     SessionCreatorCollectedSessions(SessionCreator<CollectedSessions>),
     SessionCreatorParametersDistributed(SessionCreator<ParametersDistributed>),
     Closed(MultipartySessionOutcome),
@@ -96,6 +101,16 @@ impl MultipartySession {
                 MultipartySession::SessionCreatorCollectedSessions(state),
                 MultipartySessionEvent::SessionCreatorAllParametersDelivered,
             ) => Ok(state.apply_all_parameters_delivered()),
+
+            (
+                MultipartySession::ParticipantHasSessionParameters(state),
+                MultipartySessionEvent::PlanGenerated(plan),
+            ) => Ok(state.apply_with_plan(plan)),
+
+            (
+                MultipartySession::ParticipantHasPlan(state),
+                MultipartySessionEvent::PlanExecuted(plan_cursor),
+            ) => Ok(state.apply_with_plan_cursor(plan_cursor)),
 
             (_, MultipartySessionEvent::Closed(outcome)) => Ok(MultipartySession::Closed(outcome)),
 
@@ -279,6 +294,7 @@ pub enum SessionStatus {
     ResponderActive,
     ParticipantAwaitingSessionParameters,
     ParticipantHasSessionParameters,
+    ParticipantHasPlan,
     SessionCreatorCollectingParameters,
     SessionCreatorParametersDistributed,
     Closed(MultipartySessionOutcome),

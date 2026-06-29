@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::hpke::{encrypt_message_a, HpkeKeyPair, HpkePublicKey};
 use crate::multiparty::participant::{AwaitingSessionParameters, Participant};
 use crate::multiparty::persist::{
-    GraduationError, MultipartyGraduationTransition, MultipartySessionRegistry,
+    EventfulTransition, GraduationError, MultipartyGraduationTransition, MultipartySessionRegistry,
 };
 pub use crate::multiparty::session::replay_event_log;
 use crate::multiparty::session::{
@@ -19,7 +19,7 @@ use crate::multiparty::session::{
 };
 use crate::multiparty::session_parameters::SessionParameters;
 use crate::ohttp::{ohttp_encapsulate, process_post_res, OhttpEncapsulationError};
-use crate::persist::{MaybeFatalTransition, NextStateTransition, SessionPersister};
+use crate::persist::{NextStateTransition, SessionPersister};
 use crate::receive::v2::mailbox_endpoint;
 use crate::uri::ShortId;
 use crate::{IntoUrl, OhttpKeys, Request, Url};
@@ -280,50 +280,8 @@ pub enum ParametersDelivery {
 }
 
 /// Persisted outcome of processing one session-parameters distribution response.
-pub struct ParametersDistributionTransition {
-    recipient: HpkePublicKey,
-    delivery: ParametersDelivery,
-}
-
-impl ParametersDistributionTransition {
-    /// Append per-participant delivery events to the session-creator log.
-    ///
-    /// When every committed participant has acknowledged, also appends
-    /// [`MultipartySessionEvent::SessionCreatorAllParametersDelivered`]. The log stays open.
-    pub fn save<P>(self, persister: &P) -> Result<ParametersDelivery, P::InternalStorageError>
-    where
-        P: SessionPersister<SessionEvent = MultipartySessionEvent>,
-    {
-        persister.save_event(MultipartySessionEvent::SessionCreatorParametersDeliveredTo(
-            self.recipient,
-        ))?;
-        if matches!(self.delivery, ParametersDelivery::Distributed(_)) {
-            persister.save_event(MultipartySessionEvent::SessionCreatorAllParametersDelivered)?;
-        }
-        Ok(self.delivery)
-    }
-}
-
-/// Failure while processing a session-parameters distribution response.
-pub enum SessionParametersDistributionFailure {
-    Transient(SessionCreatorSessionError),
-    Fatal(
-        MaybeFatalTransition<
-            MultipartySessionEvent,
-            ParametersDelivery,
-            SessionCreatorSessionError,
-        >,
-    ),
-}
-
-impl fmt::Debug for SessionParametersDistributionFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Transient(err) => f.debug_tuple("Transient").field(err).finish(),
-            Self::Fatal(_) => f.write_str("Fatal"),
-        }
-    }
-}
+pub type ParametersDistributionTransition =
+    EventfulTransition<MultipartySessionEvent, ParametersDelivery, SessionCreatorSessionError>;
 
 impl From<ParametersDelivery> for MultipartySession {
     fn from(delivery: ParametersDelivery) -> Self {
@@ -370,38 +328,40 @@ impl SessionCreator<CollectedSessions> {
         recipient: HpkePublicKey,
         body: &[u8],
         ohttp_context: ohttp::ClientResponse,
-    ) -> Result<ParametersDistributionTransition, SessionParametersDistributionFailure> {
+    ) -> ParametersDistributionTransition {
         match process_post_res(body, ohttp_context) {
             Ok(()) => {}
             Err(e) => {
-                if !e.is_fatal() {
-                    return Err(SessionParametersDistributionFailure::Transient(
-                        InternalSessionCreatorSessionError::DirectoryResponse(e).into(),
-                    ));
+                let is_fatal = e.is_fatal();
+                let err = InternalSessionCreatorSessionError::DirectoryResponse(e).into();
+                if !is_fatal {
+                    return ParametersDistributionTransition::transient(err);
                 }
                 // TODO: should we should treat all of these as transient and re-try?
-                return Err(SessionParametersDistributionFailure::Fatal(
-                    MaybeFatalTransition::fatal(
-                        MultipartySessionEvent::Closed(MultipartySessionOutcome::Failure),
-                        InternalSessionCreatorSessionError::DirectoryResponse(e).into(),
-                    ),
-                ));
+                return ParametersDistributionTransition::fatal(
+                    MultipartySessionEvent::Closed(MultipartySessionOutcome::Failure),
+                    err,
+                );
             }
         }
 
         let delivery = match self.parameters_delivered_to(recipient.clone()) {
             Ok(delivery) => delivery,
             Err(e) => {
-                return Err(SessionParametersDistributionFailure::Fatal(
-                    MaybeFatalTransition::fatal(
-                        MultipartySessionEvent::Closed(MultipartySessionOutcome::Failure),
-                        e.into(),
-                    ),
-                ));
+                return ParametersDistributionTransition::fatal(
+                    MultipartySessionEvent::Closed(MultipartySessionOutcome::Failure),
+                    e.into(),
+                );
             }
         };
 
-        Ok(ParametersDistributionTransition { recipient, delivery })
+        let mut events =
+            vec![MultipartySessionEvent::SessionCreatorParametersDeliveredTo(recipient)];
+        if matches!(delivery, ParametersDelivery::Distributed(_)) {
+            events.push(MultipartySessionEvent::SessionCreatorAllParametersDelivered);
+        }
+
+        ParametersDistributionTransition::success(events, delivery)
     }
 
     fn parameters_delivered_to(

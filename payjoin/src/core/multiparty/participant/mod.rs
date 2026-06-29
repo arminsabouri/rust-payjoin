@@ -10,7 +10,8 @@ use crate::append_mailbox::{append_request, MailboxError};
 use crate::hpke::{decrypt_message_a, HpkeKeyPair, HpkePublicKey};
 use crate::multiparty::participant::plan::PlanBuilder;
 use crate::multiparty::persist::{
-    ParticipantParametersAdoption, SessionParametersPollFailure, SessionParametersPollTransition,
+    EventfulTransition, ParticipantParametersAdoption, SessionParametersPollFailure,
+    SessionParametersPollTransition,
 };
 use crate::multiparty::session::{
     MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
@@ -190,7 +191,7 @@ impl Participant<HasSessionParameters> {
     // We do want to save the first plan we come up with. And as we learn new information from others we will prune the plan and pick
     // a better branch of the decision tree -- based on some cost / privacy metric.
 
-    pub(crate) fn generate_plan(
+    pub fn generate_plan(
         &self,
         candidate_inputs: impl IntoIterator<Item = InputPair>,
         payment_obligations: impl IntoIterator<Item = bitcoin::TxOut>,
@@ -223,6 +224,12 @@ pub struct HasPlan {
 // branch in the plan
 impl Participant<HasPlan> {
     pub(crate) fn apply_with_plan_cursor(mut self, plan_cursor: usize) -> MultipartySession {
+        if plan_cursor >= self.state.plan.len() {
+            return MultipartySession::ParticipantPlanExecuted(Participant {
+                state: PlanExecuted {},
+                context: self.context,
+            });
+        }
         self.state.plan_cursor = plan_cursor;
         MultipartySession::ParticipantHasPlan(self)
     }
@@ -247,28 +254,60 @@ impl Participant<HasPlan> {
         &self,
         body: &[u8],
         context: ohttp::ClientResponse,
-    ) -> MaybeFatalTransitionWithNoResults<
-        MultipartySessionEvent,
-        Participant<PlanExecuted>,
-        Participant<HasPlan>,
-        ParticipantError,
-    > {
+    ) -> PlanExecutionTransition {
         let plan = self.state.plan.clone();
         let plan_cursor = self.state.plan_cursor + 1;
 
-        process_post_res(body, context).expect("remove this later TODO");
-        if plan_cursor >= plan.len() {
-            return MaybeFatalTransitionWithNoResults::success(
-                MultipartySessionEvent::PlanExecuted(plan_cursor),
-                Participant { state: PlanExecuted {}, context: self.context.clone() },
+        if let Err(e) = process_post_res(body, context) {
+            let is_fatal = e.is_fatal();
+            let err = ParticipantError::DirectoryResponse(e);
+            if !is_fatal {
+                return PlanExecutionTransition::transient(err);
+            }
+            return PlanExecutionTransition::fatal(
+                MultipartySessionEvent::Closed(MultipartySessionOutcome::Failure),
+                err,
             );
-        } 
-        MaybeFatalTransitionWithNoResults::no_results(
-            MultipartySessionEvent::PlanExecuted(plan_cursor),
-            Participant { state: HasPlan { plan, plan_cursor }, context: self.context.clone() },
+        }
+
+        let execution = if plan_cursor >= plan.len() {
+            PlanExecution::Executed(Participant {
+                state: PlanExecuted {},
+                context: self.context.clone(),
+            })
+        } else {
+            PlanExecution::Executing(Participant {
+                state: HasPlan { plan, plan_cursor },
+                context: self.context.clone(),
+            })
+        };
+
+        PlanExecutionTransition::success(
+            [MultipartySessionEvent::PlanExecuted(plan_cursor)],
+            execution,
         )
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanExecution {
+    Executing(Participant<HasPlan>),
+    Executed(Participant<PlanExecuted>),
+}
+
+impl From<PlanExecution> for MultipartySession {
+    fn from(execution: PlanExecution) -> Self {
+        match execution {
+            PlanExecution::Executing(state) => MultipartySession::ParticipantHasPlan(state),
+            PlanExecution::Executed(state) => MultipartySession::ParticipantPlanExecuted(state),
+        }
+    }
+}
+
+// TODO: evaluate if we want stronger state transition types than just PlanExecution. In the current use case we just have two states: current and next
+// And rn I cant think of any other states we would end up in from process a post res
+pub type PlanExecutionTransition =
+    EventfulTransition<MultipartySessionEvent, PlanExecution, ParticipantError>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanExecuted {}

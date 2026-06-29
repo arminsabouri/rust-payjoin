@@ -23,9 +23,88 @@ use crate::multiparty::session::{
 };
 use crate::multiparty::SessionParameters;
 use crate::persist::{
-    InMemoryPersister, MaybeFatalTransitionWithNoResults, NextStateTransition,
-    OptionalTransitionOutcome, SessionPersister,
+    ApiError, InMemoryPersister, InternalPersistedError, MaybeFatalTransitionWithNoResults,
+    NextStateTransition, OptionalTransitionOutcome, PersistedError, SessionPersister,
 };
+
+enum EventfulPersistActions<Event> {
+    NoOp,
+    Save(Vec<Event>),
+    SaveAndClose(Event),
+}
+
+impl<Event> EventfulPersistActions<Event> {
+    fn execute<P>(self, persister: &P) -> Result<(), P::InternalStorageError>
+    where
+        P: SessionPersister<SessionEvent = Event>,
+    {
+        match self {
+            Self::NoOp => {}
+            Self::Save(events) =>
+                for event in events {
+                    persister.save_event(event)?;
+                },
+            Self::SaveAndClose(event) => {
+                persister.save_event(event)?;
+                persister.close()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+struct EventfulSuccess<Event, Outcome> {
+    events: Vec<Event>,
+    outcome: Outcome,
+}
+
+enum EventfulError<Event, Err> {
+    Transient(Err),
+    Fatal(Event, Err),
+}
+
+/// Saves one or more events, then returns a domain-specific transition outcome.
+pub struct EventfulTransition<Event, Outcome, Err>(
+    Result<EventfulSuccess<Event, Outcome>, EventfulError<Event, Err>>,
+);
+
+impl<Event, Outcome, Err> EventfulTransition<Event, Outcome, Err>
+where
+    Err: error::Error,
+{
+    pub(crate) fn success(events: impl IntoIterator<Item = Event>, outcome: Outcome) -> Self {
+        Self(Ok(EventfulSuccess { events: events.into_iter().collect(), outcome }))
+    }
+
+    pub(crate) fn transient(error: Err) -> Self { Self(Err(EventfulError::Transient(error))) }
+
+    pub(crate) fn fatal(event: Event, error: Err) -> Self {
+        Self(Err(EventfulError::Fatal(event, error)))
+    }
+
+    fn deconstruct(self) -> (EventfulPersistActions<Event>, Result<Outcome, ApiError<Err>>) {
+        match self.0 {
+            Ok(EventfulSuccess { events, outcome }) =>
+                (EventfulPersistActions::Save(events), Ok(outcome)),
+            Err(EventfulError::Transient(error)) =>
+                (EventfulPersistActions::NoOp, Err(ApiError::Transient(error))),
+            Err(EventfulError::Fatal(event, error)) =>
+                (EventfulPersistActions::SaveAndClose(event), Err(ApiError::Fatal(error))),
+        }
+    }
+
+    pub fn save<P>(
+        self,
+        persister: &P,
+    ) -> Result<Outcome, PersistedError<Err, P::InternalStorageError>>
+    where
+        P: SessionPersister<SessionEvent = Event>,
+    {
+        let (actions, outcome) = self.deconstruct();
+        actions.execute(persister).map_err(InternalPersistedError::Storage)?;
+        Ok(outcome.map_err(InternalPersistedError::Api)?)
+    }
+}
 
 /// Index of many multiparty session persisters.
 pub trait MultipartySessionRegistry {

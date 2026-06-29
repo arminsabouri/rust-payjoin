@@ -363,14 +363,9 @@ mod integration {
                     break;
                 };
                 let body = send_ohttp_request(&agent, req).await?;
-                let delivery = match creator.process_session_parameters_distribution_response(
-                    message.recipient,
-                    &body,
-                    ctx,
-                ) {
-                    Ok(transition) => transition.save(&creator_persister)?,
-                    _ => panic!("unexpected session-parameters distribution failure"),
-                };
+                let delivery = creator
+                    .process_session_parameters_distribution_response(message.recipient, &body, ctx)
+                    .save(&creator_persister)?;
                 match delivery {
                     ParametersDelivery::Collecting(next) => creator = next,
                     ParametersDelivery::Distributed(_) => break,

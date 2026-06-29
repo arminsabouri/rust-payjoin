@@ -67,8 +67,8 @@ pub fn read_request(
 pub fn process_read_response(
     res: &[u8],
     ctx: ohttp::ClientResponse,
-     shared_secret_ctx: &HpkeKeyPair,
-    ) -> Result<Vec<Vec<u8>>, MailboxError> {
+    shared_secret_ctx: &HpkeKeyPair,
+) -> Result<Vec<Vec<u8>>, MailboxError> {
     let frames = match process_get_res(res, ctx)? {
         Some(blob) => split_frames(&blob)?,
         None => return Ok(Vec::new()),

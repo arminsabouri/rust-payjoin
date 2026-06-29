@@ -19,12 +19,13 @@ pub use initiator::{
 };
 pub use participant::{
     AwaitingSessionParameters, HasSessionParameters, Participant, ParticipantContext,
-    ParticipantError, ParticipantSessionError,
+    ParticipantError, ParticipantSessionError, PlanExecuted, PlanExecution,
+    PlanExecutionTransition,
 };
 pub use persist::{
-    GraduationError, InMemoryMultipartyRegistry, MultipartyGraduationTransition,
-    MultipartySessionRegistry, ParticipantParametersAdoption, RegistryError,
-    SessionParametersPollFailure, SessionParametersPollTransition,
+    EventfulTransition, GraduationError, InMemoryMultipartyRegistry,
+    MultipartyGraduationTransition, MultipartySessionRegistry, ParticipantParametersAdoption,
+    RegistryError, SessionParametersPollFailure, SessionParametersPollTransition,
 };
 pub use responder::{
     Initialized as ResponderInitialized, Responder, ResponderBuilder, ResponderContext,
@@ -40,7 +41,7 @@ pub use session_creator::{
     CollectedSessions, ParametersDelivery, ParametersDistributed, ParametersDistributionTransition,
     PendingParticipant, SessionCreator, SessionCreatorBuilder, SessionCreatorContext,
     SessionCreatorError, SessionCreatorPromoteError, SessionCreatorSessionError,
-    SessionParametersDistributionFailure, SessionParametersDistributionMessage,
+    SessionParametersDistributionMessage,
 };
 pub use session_parameters::{
     InputScriptType, SessionParameters, SessionParametersError, SESSION_SECRET_LEN,

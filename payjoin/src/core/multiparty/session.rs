@@ -9,7 +9,8 @@ use crate::multiparty::initiator::{
     Initialized as InitiatorInitialized, Initiator, InitiatorContext,
 };
 use crate::multiparty::participant::{
-    AwaitingSessionParameters, HasPlan, HasSessionParameters, Participant, ParticipantContext, Plan,
+    AwaitingSessionParameters, HasPlan, HasSessionParameters, Participant, ParticipantContext,
+    Plan, PlanExecuted,
 };
 use crate::multiparty::persist::MultipartySessionRegistry;
 use crate::multiparty::responder::{
@@ -65,6 +66,7 @@ pub enum MultipartySession {
     ParticipantAwaitingSessionParameters(Participant<AwaitingSessionParameters>),
     ParticipantHasSessionParameters(Participant<HasSessionParameters>),
     ParticipantHasPlan(Participant<HasPlan>),
+    ParticipantPlanExecuted(Participant<PlanExecuted>),
     SessionCreatorCollectedSessions(SessionCreator<CollectedSessions>),
     SessionCreatorParametersDistributed(SessionCreator<ParametersDistributed>),
     Closed(MultipartySessionOutcome),
@@ -295,6 +297,7 @@ pub enum SessionStatus {
     ParticipantAwaitingSessionParameters,
     ParticipantHasSessionParameters,
     ParticipantHasPlan,
+    ParticipantPlanExecuted,
     SessionCreatorCollectingParameters,
     SessionCreatorParametersDistributed,
     Closed(MultipartySessionOutcome),

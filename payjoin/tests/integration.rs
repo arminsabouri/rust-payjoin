@@ -196,13 +196,18 @@ mod integration {
         use payjoin::multiparty::{
             replay_event_log, InMemoryMultipartyRegistry, InitiatorBuilder, InputScriptType,
             MultipartyPjUri, MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
-            MultipartySessionRegistry, ParametersDelivery, ResponderBuilder, SessionCreatorBuilder,
-            SessionParameters,
+            MultipartySessionRegistry, ParametersDelivery, PlanExecution, ResponderBuilder,
+            SessionCreatorBuilder, SessionParameters,
         };
         use payjoin::persist::OptionalTransitionOutcome;
         use payjoin::{HpkeKeyPair, Request, Url};
-        use payjoin_test_utils::{init_tracing, BoxSendSyncError, InMemoryPersister, TestServices};
+        use payjoin_test_utils::{
+            corepc_node, init_bitcoind_funded_wallets, init_tracing, BoxSendSyncError,
+            InMemoryPersister, TestServices,
+        };
         use reqwest::Client;
+
+        use super::{input_pair_from_list_unspent, Amount, InputPair, TxOut};
 
         fn sample_session_parameters() -> SessionParameters {
             SessionParameters::new(
@@ -213,6 +218,34 @@ mod integration {
                 vec![InputScriptType::P2wpkh],
                 None,
             )
+        }
+
+        struct FundedParticipantWallet {
+            name: &'static str,
+            client: corepc_node::Client,
+        }
+
+        impl FundedParticipantWallet {
+            fn new(name: &'static str, client: corepc_node::Client) -> Self {
+                Self { name, client }
+            }
+
+            fn candidate_inputs(&self) -> Result<Vec<InputPair>, BoxSendSyncError> {
+                let utxos = self.client.list_unspent().map_err(|e| -> BoxSendSyncError {
+                    format!("{} list unspent failed: {e}", self.name).into()
+                })?;
+                Ok(utxos.0.into_iter().map(input_pair_from_list_unspent).collect())
+            }
+
+            fn payment_obligations(&self) -> Result<Vec<TxOut>, BoxSendSyncError> {
+                let address = self.client.new_address().map_err(|e| -> BoxSendSyncError {
+                    format!("{} new address failed: {e}", self.name).into()
+                })?;
+                Ok(vec![TxOut {
+                    value: Amount::from_sat(50_000),
+                    script_pubkey: address.script_pubkey(),
+                }])
+            }
         }
 
         async fn send_ohttp_request(
@@ -302,6 +335,49 @@ mod integration {
             }
         }
 
+        fn participant_generate_plan(
+            persister: &InMemoryPersister<MultipartySessionEvent>,
+            funded_wallet: &FundedParticipantWallet,
+        ) -> Result<(), BoxSendSyncError> {
+            let (participant_state, _) = replay_event_log(persister)?;
+            let participant = match participant_state {
+                MultipartySession::ParticipantHasSessionParameters(state) => state,
+                _ => panic!("participant must have session parameters before generating a plan"),
+            };
+
+            participant
+                .generate_plan(
+                    funded_wallet.candidate_inputs()?,
+                    funded_wallet.payment_obligations()?,
+                )
+                .save(persister)?;
+
+            Ok(())
+        }
+
+        async fn participant_execute_plan(
+            agent: &Client,
+            persister: &InMemoryPersister<MultipartySessionEvent>,
+            ohttp_relay: &str,
+        ) -> Result<(), BoxSendSyncError> {
+            let (participant_state, _) = replay_event_log(persister)?;
+            let mut participant = match participant_state {
+                MultipartySession::ParticipantHasPlan(state) => state,
+                _ => panic!("participant must have a plan before executing it"),
+            };
+
+            loop {
+                let (req, ctx) = participant.execute_action_from_plan(ohttp_relay)?;
+                let body = send_ohttp_request(agent, req).await?;
+                match participant.process_action_response(&body, ctx).save(persister)? {
+                    PlanExecution::Executing(next) => participant = next,
+                    PlanExecution::Executed(_) => break,
+                }
+            }
+
+            Ok(())
+        }
+
         async fn do_three_participants_initiator_session_creator(
             services: &TestServices,
         ) -> Result<(), BoxSendSyncError> {
@@ -312,6 +388,20 @@ mod integration {
             let ohttp_relay = services.ohttp_relay_url();
 
             let expected_params = sample_session_parameters();
+            let (_bitcoind, wallets) = init_bitcoind_funded_wallets(vec![
+                ("responder_a", Some(corepc_node::AddressType::Bech32)),
+                ("responder_b", Some(corepc_node::AddressType::Bech32)),
+            ])
+            .map_err(|e| -> BoxSendSyncError { e.to_string().into() })?;
+            let mut wallets = wallets.into_iter();
+            let responder_a_wallet = FundedParticipantWallet::new(
+                "responder_a",
+                wallets.next().expect("responder_a wallet must exist"),
+            );
+            let responder_b_wallet = FundedParticipantWallet::new(
+                "responder_b",
+                wallets.next().expect("responder_b wallet must exist"),
+            );
 
             // Coordinator registry: one initiator wallet indexes every session log it orchestrates.
             let mut registry = InMemoryMultipartyRegistry::new();
@@ -389,15 +479,17 @@ mod integration {
             )
             .await?;
 
+            participant_generate_plan(&participant_a_persister, &responder_a_wallet)?;
+            participant_generate_plan(&participant_b_persister, &responder_b_wallet)?;
+            participant_execute_plan(&agent, &participant_a_persister, &ohttp_relay).await?;
+            participant_execute_plan(&agent, &participant_b_persister, &ohttp_relay).await?;
+
             for (pre_graduation, post_graduation) in [
                 (responder_a_persister, participant_a_persister),
                 (responder_b_persister, participant_b_persister),
             ] {
                 let (session_state, _) = replay_event_log(&post_graduation)?;
-                assert!(matches!(
-                    session_state,
-                    MultipartySession::ParticipantHasSessionParameters(_)
-                ));
+                assert!(matches!(session_state, MultipartySession::ParticipantPlanExecuted(_)));
 
                 let (session_state, _) = replay_event_log(&pre_graduation)?;
                 assert!(matches!(
@@ -429,7 +521,7 @@ mod integration {
         #[tokio::test]
         async fn three_participants_initiator_session_creator() -> Result<(), BoxSendSyncError> {
             init_tracing();
-            let mut services = TestServices::initialize().await?;
+            let mut services = TestServices::initialize_with_append().await?;
             let result = tokio::select!(
                 err = services.take_ohttp_relay_handle() =>
                     panic!("OHTTP relay exited early: {err:?}"),

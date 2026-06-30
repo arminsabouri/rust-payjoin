@@ -13,7 +13,6 @@
 //! - `allowed_input_types` (u8 length, then u8 discriminants)
 //! - `session_expiry`: `0` = absent, `1` + u32 LE unix time = present (`T_session`)
 //! - `session_secret` (32 bytes): shared Payjoin Directory mailbox namespace for all
-//!   participants (`linked_mailbox`: `H("v0-PayjoinDirectoryEntry" || secret || i)`)
 
 use std::fmt;
 
@@ -21,7 +20,11 @@ use bitcoin::absolute::LockTime;
 use bitcoin::transaction::Version;
 use bitcoin::{FeeRate, Sequence};
 use hpke::rand_core::{OsRng, RngCore};
+use hpke::Deserializable;
 use serde::{Deserialize, Serialize};
+
+use crate::hpke::{HpkeKeyPair, HpkeSecretKey, SecretKey};
+use crate::uri::ShortId;
 
 /// Length of [`SessionParameters::session_secret`] in bytes (256 bits).
 pub const SESSION_SECRET_LEN: usize = 32;
@@ -109,6 +112,19 @@ impl SessionParameters {
             session_secret: generate_session_secret(),
         }
     }
+
+    pub fn session_shared_secret_key(&self) -> HpkeSecretKey {
+        HpkeSecretKey(SecretKey::from_bytes(&self.session_secret.to_vec()).unwrap())
+    }
+
+    pub fn session_shared_keypair(&self) -> HpkeKeyPair {
+        HpkeKeyPair::from_secret_key(&self.session_shared_secret_key())
+    }
+
+    pub fn session_shared_mailbox_id(&self) -> ShortId {
+        self.session_shared_keypair().public_key().short_id()
+    }
+
     /// Serialize to the version-0 wire encoding.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(

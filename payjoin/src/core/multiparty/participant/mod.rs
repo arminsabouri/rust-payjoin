@@ -6,7 +6,7 @@ pub use error::{ParticipantError, ParticipantSessionError};
 pub use plan::Plan;
 use serde::{Deserialize, Serialize};
 
-use crate::append_mailbox::{append_request, MailboxError};
+use crate::append_mailbox::{append_request, process_read_response, read_request, MailboxError};
 use crate::hpke::{decrypt_message_a, HpkeKeyPair, HpkePublicKey};
 use crate::multiparty::participant::plan::PlanBuilder;
 use crate::multiparty::persist::{
@@ -50,6 +50,17 @@ impl ParticipantContext {
             reply_key,
         }
     }
+
+    fn session_shared_keypair(&self) -> HpkeKeyPair {
+        self.session_parameters
+            .as_ref()
+            .expect("participant context must include session parameters")
+            .session_shared_keypair()
+    }
+
+    fn session_shared_mailbox_id(&self) -> ShortId {
+        self.session_shared_keypair().public_key().short_id()
+    }
 }
 
 /// Multiparty participant state machine (post role bootstrap).
@@ -57,6 +68,28 @@ impl ParticipantContext {
 pub struct Participant<State> {
     pub(crate) state: State,
     pub(crate) context: ParticipantContext,
+}
+
+impl<State> Participant<State> {
+    fn create_read_from_directory_request(
+        &self,
+        ohttp_relay: impl IntoUrl,
+    ) -> Result<(Request, ohttp::ClientResponse), MailboxError> {
+        read_request(
+            &self.context.ohttp_keys,
+            &self.context.directory,
+            ohttp_relay,
+            &self.context.session_shared_mailbox_id(),
+        )
+    }
+
+    fn process_read_from_directory_response(
+        &self,
+        body: &[u8],
+        context: ohttp::ClientResponse,
+    ) -> Result<Vec<Vec<u8>>, MailboxError> {
+        process_read_response(body, context, &self.context.session_shared_keypair())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,12 +274,13 @@ impl Participant<HasPlan> {
         let action =
             self.state.plan.action(self.state.plan_cursor).expect("plan cursor is out of bounds");
         let msg = action.as_psbt_fragment().serialize();
+        let session_shared_keypair = self.context.session_shared_keypair();
         append_request(
             &self.context.ohttp_keys,
             &self.context.directory,
             ohttp_relay,
             &msg,
-            &self.context.reply_key,
+            session_shared_keypair.public_key(),
         )
     }
 

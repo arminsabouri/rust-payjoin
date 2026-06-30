@@ -21,6 +21,14 @@ use crate::db::{Db as DbTrait, Error as DbError};
 /// mailboxes/tx, ~4K txs/block, and ~144 blocks/24h.
 const DEFAULT_CAPACITY: usize = 1 << (1 + 12 + 8);
 
+/// Size in bytes of one v2 mailbox frame: the HPKE-padded ciphertext length.
+///
+/// The directory stores append-only mailboxes as opaque concatenated frames and
+/// doesn't slice them, so this is currently only needed by tests. It stays tied
+/// to the directory's `PADDED_MESSAGE_BYTES` as the single source of truth.
+#[cfg(test)]
+pub(crate) const FRAME_SIZE: usize = payjoin::directory::PADDED_MESSAGE_BYTES;
+
 #[derive(Debug)]
 struct V2WaitMapEntry {
     receiver: future::Shared<oneshot::Receiver<Arc<Vec<u8>>>>,
@@ -87,22 +95,23 @@ impl DiskStorage {
     }
 
     async fn get(&self, id: &ShortId) -> io::Result<Option<(SystemTime, Vec<u8>)>> {
-        // If the file doesn't exist, it's Ok(None), not Err
+        // Returns the entire mailbox: zero or more fixed-size frames
+        // concatenated verbatim. Callers slice by frame size as needed.
         let mut file = match File::open(self.mailbox_path(id)).await {
             Ok(file) => file,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err),
         };
-
         let created = file.metadata().await?.created()?;
-
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer).await?;
         self.xor_buffer(&mut buffer);
-
         Ok(Some((created, buffer)))
     }
 
+    /// Single-write insert: create the mailbox, idempotently accept an
+    /// identical re-write, or reject a conflicting write. This is the default
+    /// (non-append) behavior; append mode uses [`Self::append_frame`] instead.
     async fn try_insert(
         &self,
         id: &ShortId,
@@ -150,10 +159,49 @@ impl DiskStorage {
         }
     }
 
-    fn xor_buffer(&self, buffer: &mut [u8]) {
-        for (byte, &pattern) in buffer.iter_mut().zip(self.xor.iter().cycle()) {
-            *byte ^= pattern;
+    fn xor_buffer(&self, buffer: &mut [u8]) { self.xor_buffer_at(buffer, 0) }
+
+    /// XOR `buffer` with the obfuscation pattern phased to `offset`, the
+    /// buffer's absolute position in the mailbox file. This lets a frame
+    /// appended at the end be de-obfuscated as part of one continuous stream.
+    fn xor_buffer_at(&self, buffer: &mut [u8], offset: usize) {
+        let period = self.xor.len();
+        for (i, byte) in buffer.iter_mut().enumerate() {
+            *byte ^= self.xor[(offset + i) % period];
         }
+    }
+
+    /// Append one frame to the end of an existing mailbox, in place.
+    /// The caller guarantees the mailbox exists, so a missing file surfaces as
+    /// an I/O error.
+    async fn append_frame(&self, id: &ShortId, frame: &[u8]) -> io::Result<()> {
+        let path = self.mailbox_path(id);
+        let offset = fs::metadata(&path).await?.len() as usize;
+
+        let mut buffer = frame.to_vec();
+        self.xor_buffer_at(&mut buffer, offset);
+
+        let mut file = fs::OpenOptions::new().append(true).open(&path).await?;
+        file.write_all(&buffer).await?;
+        file.sync_data().await?;
+
+        Ok(())
+    }
+
+    /// Read the frame at `index`. Frames are a uniform [`FRAME_SIZE`] bytes.
+    #[cfg(test)]
+    async fn read_frame(
+        &self,
+        id: &ShortId,
+        index: usize,
+    ) -> io::Result<Option<(SystemTime, Vec<u8>)>> {
+        let Some((created, data)) = self.get(id).await? else { return Ok(None) };
+        let start = index * FRAME_SIZE;
+        if start >= data.len() {
+            return Ok(None);
+        }
+        let end = (start + FRAME_SIZE).min(data.len());
+        Ok(Some((created, data[start..end].to_vec())))
     }
 
     async fn remove(&self, id: &ShortId) -> io::Result<Option<()>> {
@@ -205,11 +253,25 @@ impl Mailboxes {
 pub struct FilesDb {
     timeout: Duration,
     pub(crate) mailboxes: Arc<Mutex<Mailboxes>>,
+    /// When enabled, repeated v2 writes to the same mailbox append fixed-size
+    /// frames instead of being rejected. Off preserves single-payload BIP77
+    /// semantics. See [`Self::with_append_mailbox`].
+    append_mailbox: bool,
 }
 
 impl FilesDb {
     pub async fn init(timeout: Duration, path: PathBuf, ttl: Duration) -> io::Result<Self> {
-        Ok(Self { timeout, mailboxes: Arc::new(Mutex::new(Mailboxes::init(path, ttl).await?)) })
+        Ok(Self {
+            timeout,
+            mailboxes: Arc::new(Mutex::new(Mailboxes::init(path, ttl).await?)),
+            append_mailbox: false,
+        })
+    }
+
+    /// Enable append-only mailbox semantics for v2 writes (off by default).
+    pub fn with_append_mailbox(mut self) -> Self {
+        self.append_mailbox = true;
+        self
     }
 
     pub async fn prune(&self) -> io::Result<Duration> { self.mailboxes.lock().await.prune().await }
@@ -235,7 +297,7 @@ impl DbTrait for FilesDb {
         payload: Vec<u8>,
     ) -> Result<Option<()>, DbError<Self::OperationalError>> {
         let mut guard = self.mailboxes.lock().await;
-        Ok(guard.post_v2(id, payload).await?)
+        Ok(guard.post_v2(id, payload, self.append_mailbox).await?)
     }
 
     async fn wait_for_v2_payload(
@@ -367,16 +429,27 @@ impl Mailboxes {
         }
     }
 
-    async fn post_v2(&mut self, id: &ShortId, payload: Vec<u8>) -> Result<Option<()>, Error> {
+    async fn post_v2(
+        &mut self,
+        id: &ShortId,
+        payload: Vec<u8>,
+        append: bool,
+    ) -> Result<Option<()>, Error> {
         if !self.has_capacity().await? {
             return Err(Error::OverCapacity);
         }
 
-        let Some(created) = self.persistent_storage.try_insert(id, &payload).await? else {
-            return Ok(None);
-        };
-
-        self.insert_order.push_back((created, *id));
+        // Append mode: a write to an already-created mailbox concatenates one
+        // more fixed-size frame instead of being rejected. Appends extend an
+        // existing entry, so they don't consume a new capacity/prune slot.
+        if append && self.persistent_storage.contains_key(id).await? {
+            self.persistent_storage.append_frame(id, &payload).await?;
+        } else {
+            let Some(created) = self.persistent_storage.try_insert(id, &payload).await? else {
+                return Ok(None);
+            };
+            self.insert_order.push_back((created, *id));
+        }
 
         // If there are pending readers, satisfy them
         if let Some(pending) = self.pending_v2.remove(id) {
@@ -554,7 +627,7 @@ mod tests {
     use payjoin::directory::ShortId;
     use tokio::fs;
 
-    use crate::db::files::DiskStorage;
+    use crate::db::files::{DiskStorage, FRAME_SIZE};
     use crate::db::{Db as DbTrait, Error as DbError, FilesDb};
 
     #[tokio::test]
@@ -597,6 +670,68 @@ mod tests {
         assert_eq!(storage.xor, xor_pattern, "xor pattern loaded from file");
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_append_fixed_frames() -> std::io::Result<()> {
+        // Frames are a uniform FRAME_SIZE; appended verbatim, read back by index.
+        let dir = tempfile::tempdir()?;
+        let storage = DiskStorage::init(dir.path().to_owned()).await?;
+        let id = ShortId([1u8; 8]);
+
+        let frame = |b: u8| vec![b; FRAME_SIZE];
+        let (frame0, frame1, frame2) = (frame(0xA0), frame(0xB1), frame(0xC2));
+
+        // try_insert creates the mailbox with the first frame; append_frame
+        // concatenates subsequent frames in place.
+        storage.try_insert(&id, &frame0).await?.expect("first write should succeed");
+        storage.append_frame(&id, &frame1).await?;
+        storage.append_frame(&id, &frame2).await?;
+
+        // Each frame is retrievable by index, in order.
+        let (_, f0) = storage.read_frame(&id, 0).await?.expect("frame 0 exists");
+        let (_, f1) = storage.read_frame(&id, 1).await?.expect("frame 1 exists");
+        let (_, f2) = storage.read_frame(&id, 2).await?.expect("frame 2 exists");
+        assert_eq!(f0, frame0);
+        assert_eq!(f1, frame1);
+        assert_eq!(f2, frame2);
+
+        // Reading past the last frame yields None (the stream terminator).
+        assert!(storage.read_frame(&id, 3).await?.is_none(), "no frame past the end");
+
+        // The whole mailbox is the frames concatenated verbatim, no framing.
+        let (_, all) = storage.get(&id).await?.expect("mailbox exists");
+        assert_eq!(all, [frame0, frame1, frame2].concat());
+
+        // The creation time is preserved across appends (in-place, no rewrite).
+        let (created_a, _) = storage.read_frame(&id, 0).await?.expect("frame 0 exists");
+        let (created_b, _) = storage.read_frame(&id, 2).await?.expect("frame 2 exists");
+        assert_eq!(created_a, created_b, "creation time stable across appends");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_filesdb_append_counts_one_capacity_slot() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            FilesDb::init(Duration::from_secs(10), dir.path().to_owned(), Duration::from_secs(60))
+                .await
+                .unwrap()
+                .with_append_mailbox();
+
+        let id = ShortId([2u8; 8]);
+
+        // Three POSTs to the same id: one create + two appends.
+        assert!(db.post_v2_payload(&id, b"frame_AA".to_vec()).await.unwrap().is_some());
+        assert!(db.post_v2_payload(&id, b"frame_BB".to_vec()).await.unwrap().is_some());
+        assert!(db.post_v2_payload(&id, b"frame_CC".to_vec()).await.unwrap().is_some());
+
+        // Appends must not inflate the capacity/prune accounting: one mailbox,
+        // one insert_order entry, regardless of how many frames it holds.
+        assert_eq!(db.mailboxes.lock().await.insert_order.len(), 1, "appends share one slot");
     }
 
     #[tokio::test]

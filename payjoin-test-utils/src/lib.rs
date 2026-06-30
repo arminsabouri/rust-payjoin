@@ -50,6 +50,17 @@ pub struct TestServices {
 
 impl TestServices {
     pub async fn initialize() -> Result<Self, BoxSendSyncError> {
+        Self::initialize_inner(false).await
+    }
+
+    /// Like [`Self::initialize`], but the directory runs with append-only
+    /// mailbox semantics: repeated v2 writes to the same mailbox concatenate
+    /// fixed-size frames instead of being rejected.
+    pub async fn initialize_with_append() -> Result<Self, BoxSendSyncError> {
+        Self::initialize_inner(true).await
+    }
+
+    async fn initialize_inner(append_mailbox: bool) -> Result<Self, BoxSendSyncError> {
         // TODO add a UUID, and cleanup guard to delete after on successful run
         let cert = local_cert_key();
         let cert_der = cert.cert.der().to_vec();
@@ -59,7 +70,7 @@ impl TestServices {
         let mut root_store = RootCertStore::empty();
         root_store.add(CertificateDer::from(cert.cert.der().to_vec())).unwrap();
 
-        let directory = init_directory(cert_key, root_store.clone()).await?;
+        let directory = init_directory(cert_key, root_store.clone(), append_mailbox).await?;
         let ohttp_relay = init_ohttp_relay(root_store, None).await?;
 
         let http_agent: Arc<Client> = Arc::new(http_agent(cert_der)?);
@@ -111,17 +122,19 @@ impl TestServices {
 pub async fn init_directory(
     local_cert_key: (Vec<u8>, Vec<u8>),
     root_store: RootCertStore,
+    append_mailbox: bool,
 ) -> std::result::Result<
     (u16, tokio::task::JoinHandle<std::result::Result<(), BoxSendSyncError>>),
     BoxSendSyncError,
 > {
     let tempdir = tempdir()?;
-    let config = payjoin_mailroom::config::Config::new(
+    let mut config = payjoin_mailroom::config::Config::new(
         "[::]:0".parse().expect("valid listener address"),
         tempdir.path().to_path_buf(),
         Duration::from_secs(2),
         Some(payjoin_mailroom::config::V1Config::default()),
     );
+    config.append_mailbox = append_mailbox;
 
     let tls_config = RustlsConfig::from_der(vec![local_cert_key.0], local_cert_key.1).await?;
 
@@ -185,15 +198,22 @@ pub fn init_bitcoind_sender_receiver(
     sender_address_type: Option<AddressType>,
     receiver_address_type: Option<AddressType>,
 ) -> Result<(corepc_node::Node, corepc_node::Client, corepc_node::Client), BoxError> {
-    let bitcoind = init_bitcoind()?;
-    let mut wallets = create_and_fund_wallets(
-        &bitcoind,
-        vec![("receiver", receiver_address_type), ("sender", sender_address_type)],
-    )?;
+    let (bitcoind, mut wallets) = init_bitcoind_funded_wallets(vec![
+        ("receiver", receiver_address_type),
+        ("sender", sender_address_type),
+    ])?;
     let receiver = wallets.pop().expect("receiver to exist");
     let sender = wallets.pop().expect("sender to exist");
 
     Ok((bitcoind, receiver, sender))
+}
+
+pub fn init_bitcoind_funded_wallets<W: AsRef<str>>(
+    wallets: Vec<(W, Option<AddressType>)>,
+) -> Result<(corepc_node::Node, Vec<corepc_node::Client>), BoxError> {
+    let bitcoind = init_bitcoind()?;
+    let funded_wallets = create_and_fund_wallets(&bitcoind, wallets)?;
+    Ok((bitcoind, funded_wallets))
 }
 
 fn create_and_fund_wallets<W: AsRef<str>>(
@@ -233,10 +253,10 @@ pub fn http_agent(cert_der: Vec<u8>) -> Result<Client, BoxSendSyncError> {
 pub fn init_bitcoind_multi_sender_single_reciever(
     number_of_senders: usize,
 ) -> Result<(corepc_node::Node, Vec<corepc_node::Client>, corepc_node::Client), BoxError> {
-    let bitcoind = init_bitcoind()?;
-    let wallets_to_create =
-        (0..number_of_senders + 1).map(|i| (format!("sender_{i}"), None)).collect::<Vec<_>>();
-    let mut wallets = create_and_fund_wallets(&bitcoind, wallets_to_create)?;
+    let mut wallets_to_create =
+        (0..number_of_senders).map(|i| (format!("sender_{i}"), None)).collect::<Vec<_>>();
+    wallets_to_create.push(("receiver".to_string(), None));
+    let (bitcoind, mut wallets) = init_bitcoind_funded_wallets(wallets_to_create)?;
     let receiver = wallets.pop().expect("receiver to exist");
     let senders = wallets;
 
@@ -272,6 +292,12 @@ pub async fn wait_for_service_ready(
 
     Err("Timeout waiting for service to be ready")
 }
+
+mod ohttp_directory;
+
+pub use ohttp_directory::{
+    simulate_directory_response, test_ohttp_key_config, EncapsulatedDirectoryMessage, OHTTP_RELAY,
+};
 
 pub static EXAMPLE_URL: &str = "https://example.com";
 

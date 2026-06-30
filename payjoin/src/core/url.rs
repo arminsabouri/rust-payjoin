@@ -177,6 +177,19 @@ impl FromStr for Url {
 }
 
 impl Url {
+    /// Payjoin Directory origin: `scheme://host[:port]` with no path, query, or fragment.
+    ///
+    /// Domain hosts are lower-cased so comparisons match across BIP-321 display casing.
+    pub(crate) fn payjoin_directory_origin(&self) -> Url {
+        let port = self.port().map(|p| format!(":{p}")).unwrap_or_default();
+        let host = match self.domain() {
+            Some(domain) => domain.to_lowercase(),
+            None => self.host_str(),
+        };
+        let url_str = format!("{}://{}{}", self.scheme(), host, port);
+        Self::parse(&url_str).expect("valid payjoin directory base URL")
+    }
+
     /// Parse an absolute URL.
     ///
     /// The input must be of the form `scheme://host[:port][/path][?query][#fragment]`.
@@ -605,6 +618,13 @@ mod tests {
     fn test_host_str() {
         let url = Url::parse("http://example.com/").unwrap();
         assert_eq!(url.host_str(), "example.com".to_string());
+    }
+
+    #[test]
+    fn test_payjoin_directory_origin_strips_path_and_normalizes_host() {
+        let mailbox = Url::parse("https://LOCALHOST:1234/abc123#RK1=00").unwrap();
+        let base = Url::parse("https://localhost:1234/").unwrap();
+        assert_eq!(mailbox.payjoin_directory_origin(), base.payjoin_directory_origin());
     }
 
     #[test]

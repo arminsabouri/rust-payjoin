@@ -140,6 +140,8 @@ impl PjParam {
 
     pub(crate) fn expiration(&self) -> Time { self.expiration }
 
+    pub(crate) fn directory(&self) -> &Url { &self.directory }
+
     pub(crate) fn endpoint(&self) -> Url {
         let mut endpoint = self.directory.clone().join(&self.id.to_string()).unwrap();
         set_receiver_pubkey(&mut endpoint, &self.receiver_pubkey);

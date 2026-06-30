@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bitcoin::hashes::{sha256, Hash, HashEngine};
 use futures::{stream, Stream};
 
-use crate::directory::{ShortId, ENCAPSULATED_MESSAGE_BYTES};
+use crate::directory::{ShortId, ENCAPSULATED_RESPONSE_BYTES};
 use crate::ohttp::{ohttp_decapsulate, ohttp_encapsulate};
 use crate::OhttpKeys;
 
@@ -42,7 +42,7 @@ async fn raw_write(
         .await?
         .bytes()
         .await?;
-    let body_arr: &[u8; ENCAPSULATED_MESSAGE_BYTES] = body
+    let body_arr: &[u8; ENCAPSULATED_RESPONSE_BYTES] = body
         .as_ref()
         .try_into()
         .map_err(|_| std::io::Error::other("unexpected relay response size"))?;
@@ -69,7 +69,7 @@ async fn raw_read(
         .await?
         .bytes()
         .await?;
-    let body_arr: &[u8; ENCAPSULATED_MESSAGE_BYTES] = body
+    let body_arr: &[u8; ENCAPSULATED_RESPONSE_BYTES] = body
         .as_ref()
         .try_into()
         .map_err(|_| std::io::Error::other("unexpected relay response size"))?;

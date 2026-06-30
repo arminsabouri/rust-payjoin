@@ -188,16 +188,444 @@ mod integration {
         }
     }
 
+    #[cfg(feature = "multiparty")]
+    mod multiparty {
+        use payjoin::append_mailbox::{
+            append_request, process_append_response, process_read_response, read_request,
+        };
+        use payjoin::multiparty::{
+            replay_event_log, InMemoryMultipartyRegistry, InitiatorBuilder, InputScriptType,
+            MultipartyPjUri, MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
+            MultipartySessionRegistry, ParametersDelivery, PlanExecution, ResponderBuilder,
+            SessionCreatorBuilder, SessionParameters,
+        };
+        use payjoin::persist::OptionalTransitionOutcome;
+        use payjoin::{HpkeKeyPair, Request, Url};
+        use payjoin_test_utils::{
+            corepc_node, init_bitcoind_funded_wallets, init_tracing, BoxSendSyncError,
+            InMemoryPersister, TestServices,
+        };
+        use reqwest::Client;
+
+        use super::{input_pair_from_list_unspent, Amount, InputPair, TxOut};
+
+        fn sample_session_parameters() -> SessionParameters {
+            SessionParameters::new(
+                bitcoin::transaction::Version::TWO,
+                bitcoin::absolute::LockTime::ZERO,
+                bitcoin::FeeRate::from_sat_per_vb(1).expect("valid feerate"),
+                bitcoin::Sequence::MAX,
+                vec![InputScriptType::P2wpkh],
+                None,
+            )
+        }
+
+        struct FundedParticipantWallet {
+            name: &'static str,
+            client: corepc_node::Client,
+        }
+
+        impl FundedParticipantWallet {
+            fn new(name: &'static str, client: corepc_node::Client) -> Self {
+                Self { name, client }
+            }
+
+            fn candidate_inputs(&self) -> Result<Vec<InputPair>, BoxSendSyncError> {
+                let utxos = self.client.list_unspent().map_err(|e| -> BoxSendSyncError {
+                    format!("{} list unspent failed: {e}", self.name).into()
+                })?;
+                Ok(utxos.0.into_iter().map(input_pair_from_list_unspent).collect())
+            }
+
+            fn payment_obligations(&self) -> Result<Vec<TxOut>, BoxSendSyncError> {
+                let address = self.client.new_address().map_err(|e| -> BoxSendSyncError {
+                    format!("{} new address failed: {e}", self.name).into()
+                })?;
+                Ok(vec![TxOut {
+                    value: Amount::from_sat(50_000),
+                    script_pubkey: address.script_pubkey(),
+                }])
+            }
+        }
+
+        async fn send_ohttp_request(
+            agent: &Client,
+            req: Request,
+        ) -> Result<Vec<u8>, BoxSendSyncError> {
+            let response = agent
+                .post(req.url)
+                .header("Content-Type", req.content_type)
+                .body(req.body)
+                .send()
+                .await?;
+            assert!(
+                response.status().is_success(),
+                "directory request failed: {}",
+                response.status()
+            );
+            Ok(response.bytes().await?.to_vec())
+        }
+
+        async fn responder_post_reply(
+            agent: &Client,
+            persister: &InMemoryPersister<MultipartySessionEvent>,
+            multiparty_uri: &MultipartyPjUri,
+            ohttp_relay: &str,
+        ) -> Result<(), BoxSendSyncError> {
+            let responder = ResponderBuilder::from_uri(multiparty_uri.clone())?.save(persister)?;
+            let (req, ctx) = responder.create_post_reply_request(ohttp_relay)?;
+            let body = send_ohttp_request(agent, req).await?;
+            responder.process_post_reply_response(&body, ctx).save(persister)?;
+            Ok(())
+        }
+
+        async fn initiator_poll_reply_key(
+            agent: &Client,
+            persister: &InMemoryPersister<MultipartySessionEvent>,
+            ohttp_relay: &str,
+        ) -> Result<(), BoxSendSyncError> {
+            let (initiator, _) = replay_event_log(persister)?;
+            let initiator = match initiator {
+                MultipartySession::InitiatorInitialized(state) => state,
+                _ => panic!("initiator must be initialized before poll"),
+            };
+
+            let (req, ctx) = initiator.create_poll_request(ohttp_relay)?;
+            let body = send_ohttp_request(agent, req).await?;
+            match initiator.process_poll_request(&body, ctx).save(persister)? {
+                OptionalTransitionOutcome::Progress(_) => Ok(()),
+                OptionalTransitionOutcome::Stasis(_) => panic!(
+                    "initiator poll should retrieve reply key immediately after responder post"
+                ),
+            }
+        }
+
+        async fn participant_poll_session_parameters(
+            agent: &Client,
+            registry: &mut InMemoryMultipartyRegistry,
+            persister: &InMemoryPersister<MultipartySessionEvent>,
+            ohttp_relay: &str,
+            expected: &SessionParameters,
+        ) -> Result<InMemoryPersister<MultipartySessionEvent>, BoxSendSyncError> {
+            let (participant_state, _) = replay_event_log(persister)?;
+            let participant = match participant_state {
+                MultipartySession::ParticipantAwaitingSessionParameters(state) => state,
+                _ => panic!("participant must await session parameters"),
+            };
+
+            let (req, ctx) = participant.create_session_parameters_poll_request(ohttp_relay)?;
+            let body = send_ohttp_request(agent, req).await?;
+            match participant.process_session_parameters_poll_response(&body, ctx) {
+                Ok(transition) => match transition.save(registry, persister)? {
+                    OptionalTransitionOutcome::Progress(adopted_persister) => {
+                        let (session_state, _) = replay_event_log(&adopted_persister)?;
+                        let MultipartySession::ParticipantHasSessionParameters(participant) =
+                            session_state
+                        else {
+                            panic!("graduated log must replay to participant with parameters");
+                        };
+                        assert_eq!(participant.session_parameters(), expected);
+                        Ok(adopted_persister)
+                    }
+                    OptionalTransitionOutcome::Stasis(_) => panic!(
+                        "participant poll should retrieve session parameters immediately after creator distribution"
+                    ),
+                },
+                _ => panic!("unexpected session-parameters poll response"),
+            }
+        }
+
+        fn participant_generate_plan(
+            persister: &InMemoryPersister<MultipartySessionEvent>,
+            funded_wallet: &FundedParticipantWallet,
+        ) -> Result<(), BoxSendSyncError> {
+            let (participant_state, _) = replay_event_log(persister)?;
+            let participant = match participant_state {
+                MultipartySession::ParticipantHasSessionParameters(state) => state,
+                _ => panic!("participant must have session parameters before generating a plan"),
+            };
+
+            participant
+                .generate_plan(
+                    funded_wallet.candidate_inputs()?,
+                    funded_wallet.payment_obligations()?,
+                )
+                .save(persister)?;
+
+            Ok(())
+        }
+
+        async fn participant_execute_plan(
+            agent: &Client,
+            persister: &InMemoryPersister<MultipartySessionEvent>,
+            ohttp_relay: &str,
+        ) -> Result<(), BoxSendSyncError> {
+            let (participant_state, _) = replay_event_log(persister)?;
+            let mut participant = match participant_state {
+                MultipartySession::ParticipantHasPlan(state) => state,
+                _ => panic!("participant must have a plan before executing it"),
+            };
+
+            loop {
+                let (req, ctx) = participant.execute_action_from_plan(ohttp_relay)?;
+                let body = send_ohttp_request(agent, req).await?;
+                match participant.process_action_response(&body, ctx).save(persister)? {
+                    PlanExecution::Executing(next) => participant = next,
+                    PlanExecution::Executed(_) => break,
+                }
+            }
+
+            Ok(())
+        }
+
+        async fn do_three_participants_initiator_session_creator(
+            services: &TestServices,
+        ) -> Result<(), BoxSendSyncError> {
+            let agent = services.http_agent();
+            services.wait_for_services_ready().await?;
+            let ohttp_keys = services.fetch_ohttp_keys().await?;
+            let directory_url = services.directory_url();
+            let ohttp_relay = services.ohttp_relay_url();
+
+            let expected_params = sample_session_parameters();
+            let (_bitcoind, wallets) = init_bitcoind_funded_wallets(vec![
+                ("responder_a", Some(corepc_node::AddressType::Bech32)),
+                ("responder_b", Some(corepc_node::AddressType::Bech32)),
+            ])
+            .map_err(|e| -> BoxSendSyncError { e.to_string().into() })?;
+            let mut wallets = wallets.into_iter();
+            let responder_a_wallet = FundedParticipantWallet::new(
+                "responder_a",
+                wallets.next().expect("responder_a wallet must exist"),
+            );
+            let responder_b_wallet = FundedParticipantWallet::new(
+                "responder_b",
+                wallets.next().expect("responder_b wallet must exist"),
+            );
+
+            // Coordinator registry: one initiator wallet indexes every session log it orchestrates.
+            let mut registry = InMemoryMultipartyRegistry::new();
+            let initiator_a_persister = registry.new_session().expect("new session");
+            let initiator_b_persister = registry.new_session().expect("new session");
+
+            let mut responder_a_registry = InMemoryMultipartyRegistry::new();
+            let mut responder_b_registry = InMemoryMultipartyRegistry::new();
+            let responder_a_persister = responder_a_registry.new_session()?;
+            let responder_b_persister = responder_b_registry.new_session()?;
+
+            let initiator_a = InitiatorBuilder::new(directory_url.as_str(), ohttp_keys.clone())?
+                .build()
+                .save(&initiator_a_persister)?;
+            let multiparty_uri_a =
+                MultipartyPjUri::parse(initiator_a.pj_uri().as_str()).expect("multiparty uri");
+
+            // A second initiator mailbox / BIP-321 URI so responder B does not POST into A's slot.
+            let initiator_b = InitiatorBuilder::new(directory_url.as_str(), ohttp_keys)?
+                .build()
+                .save(&initiator_b_persister)?;
+            let multiparty_uri_b =
+                MultipartyPjUri::parse(initiator_b.pj_uri().as_str()).expect("multiparty uri");
+            assert_ne!(
+                multiparty_uri_a.as_str(),
+                multiparty_uri_b.as_str(),
+                "responders must accept different BIP-321 URIs"
+            );
+
+            // Responders to post their reply keys to the initiators
+            responder_post_reply(&agent, &responder_a_persister, &multiparty_uri_a, &ohttp_relay)
+                .await?;
+            responder_post_reply(&agent, &responder_b_persister, &multiparty_uri_b, &ohttp_relay)
+                .await?;
+
+            // For each initiator, poll until we get the reply keys
+            initiator_poll_reply_key(&agent, &initiator_a_persister, &ohttp_relay).await?;
+            initiator_poll_reply_key(&agent, &initiator_b_persister, &ohttp_relay).await?;
+
+            let (creator_persister, mut creator) =
+                SessionCreatorBuilder::build_and_promote(&registry, expected_params.clone())?
+                    .save(&mut registry)?;
+
+            // Distribute session parameters to responders
+            loop {
+                let Some((message, req, ctx)) =
+                    creator.next_session_parameters_distribution_message(&ohttp_relay)?
+                else {
+                    break;
+                };
+                let body = send_ohttp_request(&agent, req).await?;
+                let delivery = creator
+                    .process_session_parameters_distribution_response(message.recipient, &body, ctx)
+                    .save(&creator_persister)?;
+                match delivery {
+                    ParametersDelivery::Collecting(next) => creator = next,
+                    ParametersDelivery::Distributed(_) => break,
+                }
+            }
+
+            let participant_a_persister = participant_poll_session_parameters(
+                &agent,
+                &mut responder_a_registry,
+                &responder_a_persister,
+                &ohttp_relay,
+                &expected_params,
+            )
+            .await?;
+            let participant_b_persister = participant_poll_session_parameters(
+                &agent,
+                &mut responder_b_registry,
+                &responder_b_persister,
+                &ohttp_relay,
+                &expected_params,
+            )
+            .await?;
+
+            participant_generate_plan(&participant_a_persister, &responder_a_wallet)?;
+            participant_generate_plan(&participant_b_persister, &responder_b_wallet)?;
+            participant_execute_plan(&agent, &participant_a_persister, &ohttp_relay).await?;
+            participant_execute_plan(&agent, &participant_b_persister, &ohttp_relay).await?;
+
+            for (pre_graduation, post_graduation) in [
+                (responder_a_persister, participant_a_persister),
+                (responder_b_persister, participant_b_persister),
+            ] {
+                let (session_state, _) = replay_event_log(&post_graduation)?;
+                assert!(matches!(session_state, MultipartySession::ParticipantPlanExecuted(_)));
+
+                let (session_state, _) = replay_event_log(&pre_graduation)?;
+                assert!(matches!(
+                    session_state,
+                    MultipartySession::Closed(MultipartySessionOutcome::Graduated(_))
+                ));
+            }
+
+            let (session_state, _) = replay_event_log(&creator_persister)?;
+            assert!(matches!(
+                session_state,
+                MultipartySession::SessionCreatorParametersDistributed(_)
+            ));
+
+            let (session_state, _) = replay_event_log(&initiator_a_persister)?;
+            assert!(matches!(
+                session_state,
+                MultipartySession::Closed(MultipartySessionOutcome::Graduated(_))
+            ));
+            let (session_state, _) = replay_event_log(&initiator_b_persister)?;
+            assert!(matches!(
+                session_state,
+                MultipartySession::Closed(MultipartySessionOutcome::Graduated(_))
+            ));
+
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn three_participants_initiator_session_creator() -> Result<(), BoxSendSyncError> {
+            init_tracing();
+            let mut services = TestServices::initialize_with_append().await?;
+            let result = tokio::select!(
+                err = services.take_ohttp_relay_handle() =>
+                    panic!("OHTTP relay exited early: {err:?}"),
+                err = services.take_directory_handle() =>
+                    panic!("directory exited early: {err:?}"),
+                res = do_three_participants_initiator_session_creator(&services) => res,
+            );
+            result
+        }
+
+        /// Append several frames from different senders to one mailbox, then read
+        /// it back, exercising the directory's append-only mailbox semantics
+        /// end-to-end through OHTTP.
+        async fn do_append_mailbox_accumulates_frames(
+            services: &TestServices,
+        ) -> Result<(), BoxSendSyncError> {
+            let agent = services.http_agent();
+            services.wait_for_services_ready().await?;
+            let ohttp_keys = services.fetch_ohttp_keys().await?;
+            let directory = Url::parse(&services.directory_url())?;
+            let ohttp_relay = services.ohttp_relay_url();
+
+            // The mailbox owner reads; two senders append independently sealed frames.
+            let shared_secret_context = HpkeKeyPair::gen_keypair();
+            let sender_a = HpkeKeyPair::gen_keypair();
+            let sender_b = HpkeKeyPair::gen_keypair();
+            let mailbox = shared_secret_context.public_key().short_id();
+
+            // Each append seals one frame to the receiver. With append semantics
+            // the directory accepts every write to the same mailbox instead of
+            // rejecting the second as a conflict.
+            let appends: [(&HpkeKeyPair, &[u8]); 3] = [
+                (&sender_a, b"hello from A"),
+                (&sender_b, b"hello from B"),
+                (&sender_a, b"second from A"),
+            ];
+            for (_, message) in appends {
+                let (req, ctx) = append_request(
+                    &ohttp_keys,
+                    &directory,
+                    &ohttp_relay,
+                    message,
+                    shared_secret_context.public_key(),
+                )?;
+                let body = send_ohttp_request(&agent, req).await?;
+                process_append_response(&body, ctx)?;
+            }
+
+            // A single read returns every appended frame, decrypted in append
+            // order, each carrying its sender's reply key. Plaintexts are
+            // zero-padded to a fixed length on encryption, so trim the padding
+            // before comparing to the original messages.
+            let (req, ctx) = read_request(&ohttp_keys, &directory, &ohttp_relay, &mailbox)?;
+            let body = send_ohttp_request(&agent, req).await?;
+            let messages = process_read_response(&body, ctx, &shared_secret_context)?;
+
+            // TODO: triming shopuld be done in process_read_response
+            let trim = |bytes: &[u8]| -> Vec<u8> {
+                let end = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+                bytes[..end].to_vec()
+            };
+            let plaintexts: Vec<Vec<u8>> = messages.iter().map(|m| trim(&m)).collect();
+            assert_eq!(
+                plaintexts,
+                vec![b"hello from A".to_vec(), b"hello from B".to_vec(), b"second from A".to_vec(),],
+                "all appended frames returned in append order"
+            );
+
+            // A reader the frames were not sealed to recovers nothing from the
+            // same mailbox: frames stay confidential under append.
+            let stranger = HpkeKeyPair::gen_keypair();
+            let (req, ctx) = read_request(&ohttp_keys, &directory, &ohttp_relay, &mailbox)?;
+            let body = send_ohttp_request(&agent, req).await?;
+            assert!(
+                process_read_response(&body, ctx, &stranger)?.is_empty(),
+                "frames stay sealed to the intended receiver"
+            );
+
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn append_mailbox_accumulates_frames() -> Result<(), BoxSendSyncError> {
+            init_tracing();
+            let mut services = TestServices::initialize_with_append().await?;
+            let result = tokio::select!(
+                err = services.take_ohttp_relay_handle() =>
+                    panic!("OHTTP relay exited early: {err:?}"),
+                err = services.take_directory_handle() =>
+                    panic!("directory exited early: {err:?}"),
+                res = do_append_mailbox_accumulates_frames(&services) => res,
+            );
+            result
+        }
+    }
+
     // not all needs v1
     #[cfg(all(feature = "io", feature = "v2", feature = "v1", feature = "_manual-tls"))]
     mod v2 {
         use std::sync::Arc;
         use std::time::Duration;
 
-        use bitcoin::{secp256k1, Address, Transaction};
-        use hpke::rand_core::OsRng;
+        use bitcoin::{Address, Transaction};
         use http::StatusCode;
-        use payjoin::linked_mailbox::{CollaborativeMessageSet, DirectoryLinkedMailbox};
         use payjoin::persist::OptionalTransitionOutcome;
         use payjoin::receive::v2::{
             replay_event_log as replay_receiver_event_log, Monitor, PayjoinProposal,
@@ -221,86 +649,6 @@ mod integration {
         enum SenderFinalAction {
             SignAndBroadcastPayjoinProposal,
             BroadcastFallbackTransaction,
-        }
-
-        fn make_mailbox(
-            services: &TestServices,
-            ohttp_keys: &OhttpKeys,
-            shared_secret: [u8; 32],
-        ) -> DirectoryLinkedMailbox {
-            let gateway_url =
-                format!("{}/{}", services.ohttp_relay_url(), services.directory_url());
-            DirectoryLinkedMailbox::new(
-                (*services.http_agent()).clone(),
-                gateway_url,
-                services.directory_url(),
-                ohttp_keys.clone(),
-                shared_secret,
-            )
-        }
-
-        async fn do_linked_mailbox_test(services: &TestServices) -> Result<(), BoxSendSyncError> {
-            use futures::StreamExt;
-
-            services.wait_for_services_ready().await?;
-            let ohttp_keys = services.fetch_ohttp_keys().await?;
-            let shared_secret = secp256k1::SecretKey::new(&mut OsRng).secret_bytes();
-
-            // Each peer is independently initialized with only the shared secret.
-            let alice = make_mailbox(services, &ohttp_keys, shared_secret);
-            let bob = make_mailbox(services, &ohttp_keys, shared_secret);
-            let carol = make_mailbox(services, &ohttp_keys, shared_secret);
-
-            let alice_msg = b"Hello from Alice".to_vec();
-            let bob_msg = b"Hello from Bob".to_vec();
-            let carol_msg = b"Hello from Carol".to_vec();
-
-            let (ra, rb, rc) = tokio::join!(
-                alice.write(alice_msg.clone()),
-                bob.write(bob_msg.clone()),
-                carol.write(carol_msg.clone()),
-            );
-            ra?;
-            rb?;
-            rc?;
-
-            // Any peer (with the same secret) can iterate the full message
-            // set. Server-side ordering is opaque, so compare as a set.
-            let stream = alice.read();
-            tokio::pin!(stream);
-            let mut observed = Vec::new();
-            while let Some(item) = stream.next().await {
-                observed.push(item?);
-            }
-            assert_eq!(observed.len(), 3, "reader should see all three appended messages");
-
-            use std::collections::HashSet;
-            let expected: HashSet<Vec<u8>> = [alice_msg, bob_msg, carol_msg].into_iter().collect();
-            let observed_set: HashSet<Vec<u8>> = observed.into_iter().collect();
-            assert_eq!(observed_set, expected);
-
-            // A peer initialized with a different secret sees an empty message set.
-            let other_secret = secp256k1::SecretKey::new(&mut OsRng).secret_bytes();
-            let stranger = make_mailbox(services, &ohttp_keys, other_secret);
-            let stranger_stream = stranger.read();
-            tokio::pin!(stranger_stream);
-            assert!(stranger_stream.next().await.is_none(), "unrelated message set must be empty");
-
-            Ok(())
-        }
-
-        #[tokio::test]
-        async fn test_create_linked_mailbox() -> Result<(), BoxSendSyncError> {
-            init_tracing();
-            let mut services = TestServices::initialize().await?;
-            // Three peers each hold an independent CollaborativeMessageSet
-            // handle initialized only with the shared secret.
-            let result = tokio::select!(
-                err = services.take_ohttp_relay_handle() => panic!("Ohttp relay exited early: {:?}", err),
-                err = services.take_directory_handle() => panic!("Directory server exited early: {:?}", err),
-                res = do_linked_mailbox_test(&services) => res
-            );
-            result
         }
 
         #[tokio::test]

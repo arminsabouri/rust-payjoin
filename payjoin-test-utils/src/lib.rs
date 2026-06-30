@@ -198,15 +198,22 @@ pub fn init_bitcoind_sender_receiver(
     sender_address_type: Option<AddressType>,
     receiver_address_type: Option<AddressType>,
 ) -> Result<(corepc_node::Node, corepc_node::Client, corepc_node::Client), BoxError> {
-    let bitcoind = init_bitcoind()?;
-    let mut wallets = create_and_fund_wallets(
-        &bitcoind,
-        vec![("receiver", receiver_address_type), ("sender", sender_address_type)],
-    )?;
+    let (bitcoind, mut wallets) = init_bitcoind_funded_wallets(vec![
+        ("receiver", receiver_address_type),
+        ("sender", sender_address_type),
+    ])?;
     let receiver = wallets.pop().expect("receiver to exist");
     let sender = wallets.pop().expect("sender to exist");
 
     Ok((bitcoind, receiver, sender))
+}
+
+pub fn init_bitcoind_funded_wallets<W: AsRef<str>>(
+    wallets: Vec<(W, Option<AddressType>)>,
+) -> Result<(corepc_node::Node, Vec<corepc_node::Client>), BoxError> {
+    let bitcoind = init_bitcoind()?;
+    let funded_wallets = create_and_fund_wallets(&bitcoind, wallets)?;
+    Ok((bitcoind, funded_wallets))
 }
 
 fn create_and_fund_wallets<W: AsRef<str>>(
@@ -246,10 +253,10 @@ pub fn http_agent(cert_der: Vec<u8>) -> Result<Client, BoxSendSyncError> {
 pub fn init_bitcoind_multi_sender_single_reciever(
     number_of_senders: usize,
 ) -> Result<(corepc_node::Node, Vec<corepc_node::Client>, corepc_node::Client), BoxError> {
-    let bitcoind = init_bitcoind()?;
-    let wallets_to_create =
-        (0..number_of_senders + 1).map(|i| (format!("sender_{i}"), None)).collect::<Vec<_>>();
-    let mut wallets = create_and_fund_wallets(&bitcoind, wallets_to_create)?;
+    let mut wallets_to_create =
+        (0..number_of_senders).map(|i| (format!("sender_{i}"), None)).collect::<Vec<_>>();
+    wallets_to_create.push(("receiver".to_string(), None));
+    let (bitcoind, mut wallets) = init_bitcoind_funded_wallets(wallets_to_create)?;
     let receiver = wallets.pop().expect("receiver to exist");
     let senders = wallets;
 

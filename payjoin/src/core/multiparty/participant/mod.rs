@@ -24,38 +24,38 @@ use crate::receive::InputPair;
 use crate::uri::ShortId;
 use crate::{IntoUrl, OhttpKeys, Request, Url};
 
-/// Persistent context for a multiparty participant awaiting or holding session parameters.
+/// Persistent context for a multiparty participant awaiting session parameters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ParticipantContext {
+pub struct AwaitingParticipantContext {
     mailbox_key: HpkeKeyPair,
     pub(crate) directory: Url,
     pub ohttp_keys: OhttpKeys,
-    pub(crate) session_parameters: Option<SessionParameters>,
     /// The other party's HPKE public key (initiator for responders, responder for initiators).
     pub(crate) reply_key: HpkePublicKey,
 }
 
-impl ParticipantContext {
+impl AwaitingParticipantContext {
     pub(crate) fn new(
         mailbox_key: HpkeKeyPair,
         directory: Url,
         ohttp_keys: OhttpKeys,
         reply_key: HpkePublicKey,
     ) -> Self {
-        Self {
-            mailbox_key,
-            directory: directory.payjoin_directory_origin(),
-            ohttp_keys,
-            session_parameters: None,
-            reply_key,
-        }
+        Self { mailbox_key, directory: directory.payjoin_directory_origin(), ohttp_keys, reply_key }
     }
+}
 
+/// Persistent context for a multiparty participant after adopting session parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParticipantContext {
+    pub(crate) directory: Url,
+    pub ohttp_keys: OhttpKeys,
+    pub(crate) session_parameters: SessionParameters,
+}
+
+impl ParticipantContext {
     fn session_shared_keypair(&self) -> HpkeKeyPair {
-        self.session_parameters
-            .as_ref()
-            .expect("participant context must include session parameters")
-            .session_shared_keypair()
+        self.session_parameters.session_shared_keypair()
     }
 
     fn session_shared_mailbox_id(&self) -> ShortId {
@@ -93,19 +93,20 @@ impl<State> Participant<State> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AwaitingSessionParameters {
+pub struct ParticipantAwaitingSessionParameters {
     /// HPKE public key for the Payjoin Directory mailbox that receives session parameters.
     pub(crate) parameters_mailbox_public_key: HpkePublicKey,
+    pub(crate) context: AwaitingParticipantContext,
 }
 
-impl Participant<AwaitingSessionParameters> {
+impl ParticipantAwaitingSessionParameters {
     /// Mailbox where the session creator POSTs parameters and this participant polls.
     pub(crate) fn parameters_mailbox_public_key(&self) -> &HpkePublicKey {
-        &self.state.parameters_mailbox_public_key
+        &self.parameters_mailbox_public_key
     }
 
     fn parameters_mailbox_short_id(&self) -> ShortId {
-        sha256::Hash::hash(&self.state.parameters_mailbox_public_key.to_compressed_bytes()).into()
+        sha256::Hash::hash(&self.parameters_mailbox_public_key.to_compressed_bytes()).into()
     }
 
     fn session_parameters_poll_body(
@@ -197,19 +198,10 @@ pub struct HasSessionParameters {}
 
 impl Participant<HasSessionParameters> {
     pub(crate) fn from_adopted_context(context: ParticipantContext) -> Self {
-        debug_assert!(
-            context.session_parameters.is_some(),
-            "adopted participant context must include session parameters"
-        );
         Self { state: HasSessionParameters {}, context }
     }
 
-    pub fn session_parameters(&self) -> &SessionParameters {
-        self.context
-            .session_parameters
-            .as_ref()
-            .expect("HasSessionParameters state must have session_parameters in context")
-    }
+    pub fn session_parameters(&self) -> &SessionParameters { &self.context.session_parameters }
 
     pub(crate) fn apply_with_plan(self, plan: Plan) -> MultipartySession {
         MultipartySession::ParticipantHasPlan(Participant {

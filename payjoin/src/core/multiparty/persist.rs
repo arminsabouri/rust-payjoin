@@ -16,7 +16,8 @@ use std::error;
 
 use crate::error::ReplayError;
 use crate::multiparty::participant::{
-    AwaitingSessionParameters, HasSessionParameters, Participant, ParticipantContext,
+    AwaitingParticipantContext, HasSessionParameters, Participant,
+    ParticipantAwaitingSessionParameters, ParticipantContext,
 };
 use crate::multiparty::session::{
     MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
@@ -164,13 +165,13 @@ impl<P, S> MultipartyGraduationTransition<P, S> {
 /// Participant received session parameters; close the awaiting log and continue in a new log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParticipantParametersAdoption {
-    participant_context: ParticipantContext,
+    participant_context: AwaitingParticipantContext,
     session_parameters: SessionParameters,
 }
 
 impl ParticipantParametersAdoption {
     pub(crate) fn from_awaiting_participant(
-        participant: &Participant<AwaitingSessionParameters>,
+        participant: &ParticipantAwaitingSessionParameters,
         session_parameters: SessionParameters,
     ) -> Self {
         Self { participant_context: participant.context.clone(), session_parameters }
@@ -199,8 +200,11 @@ impl ParticipantParametersAdoption {
     fn successor_transition(
         self,
     ) -> NextStateTransition<MultipartySessionEvent, Participant<HasSessionParameters>> {
-        let mut context = self.participant_context;
-        context.session_parameters = Some(self.session_parameters);
+        let context = ParticipantContext {
+            directory: self.participant_context.directory,
+            ohttp_keys: self.participant_context.ohttp_keys,
+            session_parameters: self.session_parameters,
+        };
         NextStateTransition::success(
             MultipartySessionEvent::SessionParametersAdopted(context.clone()),
             Participant::from_adopted_context(context),
@@ -212,7 +216,7 @@ impl ParticipantParametersAdoption {
 #[derive(Debug)]
 pub enum SessionParametersPollTransition {
     /// Directory has nothing yet; resume from the returned participant.
-    Stasis(Participant<AwaitingSessionParameters>),
+    Stasis(ParticipantAwaitingSessionParameters),
     /// Parameters retrieved; persist via [`SessionParametersPollTransition::save`].
     Adoption(ParticipantParametersAdoption),
 }
@@ -227,7 +231,7 @@ impl SessionParametersPollTransition {
         registry: &mut R,
         from: &R::Persister,
     ) -> Result<
-        OptionalTransitionOutcome<R::Persister, Participant<AwaitingSessionParameters>>,
+        OptionalTransitionOutcome<R::Persister, ParticipantAwaitingSessionParameters>,
         GraduationError<R::Error, <R::Persister as SessionPersister>::InternalStorageError>,
     >
     where
@@ -251,7 +255,7 @@ pub enum SessionParametersPollFailure {
         MaybeFatalTransitionWithNoResults<
             MultipartySessionEvent,
             (),
-            Participant<AwaitingSessionParameters>,
+            ParticipantAwaitingSessionParameters,
             crate::multiparty::participant::ParticipantSessionError,
         >,
     ),

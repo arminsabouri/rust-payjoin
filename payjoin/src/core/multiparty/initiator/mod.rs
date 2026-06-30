@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use web_time::Duration;
 
 use crate::hpke::{decrypt_message_a, HpkeKeyPair, HpkePublicKey};
-use crate::multiparty::participant::{AwaitingSessionParameters, Participant, ParticipantContext};
+use crate::multiparty::participant::{
+    AwaitingParticipantContext, ParticipantAwaitingSessionParameters,
+};
 pub use crate::multiparty::session::replay_event_log;
 use crate::multiparty::session::{
     MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
@@ -37,11 +39,11 @@ impl InitiatorContext {
         sha256::Hash::hash(&self.initiator_key.public_key().to_compressed_bytes()).into()
     }
 
-    pub(crate) fn participant_context(
+    fn participant_context(
         &self,
         responder_public_key: HpkePublicKey,
-    ) -> ParticipantContext {
-        ParticipantContext::new(
+    ) -> AwaitingParticipantContext {
+        AwaitingParticipantContext::new(
             self.initiator_key.clone(),
             self.directory.clone(),
             self.ohttp_keys.clone(),
@@ -139,7 +141,7 @@ impl Initiator<Initialized> {
         context: ohttp::ClientResponse,
     ) -> MaybeFatalTransitionWithNoResults<
         MultipartySessionEvent,
-        Participant<AwaitingSessionParameters>,
+        ParticipantAwaitingSessionParameters,
         Initiator<Initialized>,
         InitiatorSessionError,
     > {
@@ -164,10 +166,8 @@ impl Initiator<Initialized> {
         if let Some(responder_public_key) = responder_public_key {
             MaybeFatalTransitionWithNoResults::success(
                 MultipartySessionEvent::InitiatorRetrievedReplyKey(responder_public_key.clone()),
-                Participant {
-                    state: AwaitingSessionParameters {
-                        parameters_mailbox_public_key: responder_public_key.clone(),
-                    },
+                ParticipantAwaitingSessionParameters {
+                    parameters_mailbox_public_key: responder_public_key.clone(),
                     context: current_state.context.participant_context(responder_public_key),
                 },
             )
@@ -197,12 +197,12 @@ impl Initiator<Initialized> {
         self,
         responder_public_key: HpkePublicKey,
     ) -> MultipartySession {
-        MultipartySession::ParticipantAwaitingSessionParameters(Participant {
-            state: AwaitingSessionParameters {
+        MultipartySession::ParticipantAwaitingSessionParameters(
+            ParticipantAwaitingSessionParameters {
                 parameters_mailbox_public_key: responder_public_key.clone(),
+                context: self.context.participant_context(responder_public_key),
             },
-            context: self.context.participant_context(responder_public_key),
-        })
+        )
     }
 }
 

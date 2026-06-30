@@ -9,8 +9,8 @@ use crate::multiparty::initiator::{
     Initialized as InitiatorInitialized, Initiator, InitiatorContext,
 };
 use crate::multiparty::participant::{
-    AwaitingSessionParameters, HasPlan, HasSessionParameters, Participant, ParticipantContext,
-    Plan, PlanExecuted,
+    HasPlan, HasSessionParameters, Participant, ParticipantAwaitingSessionParameters,
+    ParticipantContext, Plan, PlanExecuted,
 };
 use crate::multiparty::persist::MultipartySessionRegistry;
 use crate::multiparty::responder::{
@@ -63,7 +63,7 @@ impl MultipartySessionEvent {
 pub enum MultipartySession {
     InitiatorInitialized(Initiator<InitiatorInitialized>),
     ResponderInitialized(Responder<ResponderInitialized>),
-    ParticipantAwaitingSessionParameters(Participant<AwaitingSessionParameters>),
+    ParticipantAwaitingSessionParameters(ParticipantAwaitingSessionParameters),
     ParticipantHasSessionParameters(Participant<HasSessionParameters>),
     ParticipantHasPlan(Participant<HasPlan>),
     ParticipantPlanExecuted(Participant<PlanExecuted>),
@@ -255,7 +255,7 @@ where
 pub fn collect_open_sessions_awaiting_parameters_with_persisters<R>(
     registry: &R,
 ) -> Result<
-    Vec<(&R::Persister, Participant<AwaitingSessionParameters>)>,
+    Vec<(&R::Persister, ParticipantAwaitingSessionParameters)>,
     CollectAwaitingParametersError<R>,
 >
 where
@@ -281,7 +281,7 @@ where
 /// Like [`collect_open_sessions_awaiting_parameters_with_persisters`], without persister handles.
 pub fn collect_open_sessions_awaiting_parameters<R>(
     registry: &R,
-) -> Result<Vec<Participant<AwaitingSessionParameters>>, CollectAwaitingParametersError<R>>
+) -> Result<Vec<ParticipantAwaitingSessionParameters>, CollectAwaitingParametersError<R>>
 where
     R: MultipartySessionRegistry,
 {

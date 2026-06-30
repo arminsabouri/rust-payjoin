@@ -8,7 +8,7 @@ pub use error::SessionCreatorSessionError;
 use serde::{Deserialize, Serialize};
 
 use crate::hpke::{encrypt_message_a, HpkeKeyPair, HpkePublicKey};
-use crate::multiparty::participant::{AwaitingSessionParameters, Participant};
+use crate::multiparty::participant::ParticipantAwaitingSessionParameters;
 use crate::multiparty::persist::{
     EventfulTransition, GraduationError, MultipartyGraduationTransition, MultipartySessionRegistry,
 };
@@ -215,7 +215,7 @@ impl SessionCreatorBuilder {
 
 fn build_from_open_awaiting<P>(
     session_parameters: SessionParameters,
-    awaiting: &[(&P, Participant<AwaitingSessionParameters>)],
+    awaiting: &[(&P, ParticipantAwaitingSessionParameters)],
 ) -> Result<
     (NextStateTransition<MultipartySessionEvent, SessionCreator<CollectedSessions>>, Vec<P>),
     SessionCreatorError,

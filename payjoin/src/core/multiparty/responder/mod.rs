@@ -4,7 +4,9 @@ pub use error::{ResponderError, ResponderSessionError};
 use serde::{Deserialize, Serialize};
 
 use crate::hpke::{encrypt_message_a, HpkeKeyPair, HpkePublicKey};
-use crate::multiparty::participant::{AwaitingSessionParameters, Participant, ParticipantContext};
+use crate::multiparty::participant::{
+    AwaitingParticipantContext, ParticipantAwaitingSessionParameters,
+};
 pub use crate::multiparty::session::replay_event_log;
 use crate::multiparty::session::{
     MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
@@ -41,12 +43,12 @@ impl ResponderContext {
         Ok(())
     }
 
-    pub(crate) fn participant_context(&self) -> Result<ParticipantContext, ResponderError> {
+    pub(crate) fn participant_context(&self) -> Result<AwaitingParticipantContext, ResponderError> {
         self.ensure_not_expired()?;
         let PjParam::V2(v2) = &self.pj_param else {
             return Err(ResponderError::NotV2);
         };
-        Ok(ParticipantContext::new(
+        Ok(AwaitingParticipantContext::new(
             self.responder_key.clone(),
             v2.directory().clone(),
             v2.ohttp_keys().clone(),
@@ -146,7 +148,7 @@ impl Responder<Initialized> {
         context: ohttp::ClientResponse,
     ) -> MaybeFatalTransition<
         MultipartySessionEvent,
-        Participant<AwaitingSessionParameters>,
+        ParticipantAwaitingSessionParameters,
         ResponderSessionError,
     > {
         let current_state = self.clone();
@@ -174,23 +176,23 @@ impl Responder<Initialized> {
         };
         MaybeFatalTransition::success(
             MultipartySessionEvent::ResponderSentReplyKey,
-            Participant {
-                state: AwaitingSessionParameters { parameters_mailbox_public_key: sent_reply_key },
+            ParticipantAwaitingSessionParameters {
+                parameters_mailbox_public_key: sent_reply_key,
                 context: participant_context,
             },
         )
     }
 
     pub(crate) fn apply_sent_reply_key(self) -> MultipartySession {
-        MultipartySession::ParticipantAwaitingSessionParameters(Participant {
-            state: AwaitingSessionParameters {
+        MultipartySession::ParticipantAwaitingSessionParameters(
+            ParticipantAwaitingSessionParameters {
                 parameters_mailbox_public_key: self.context.responder_public_key().clone(),
+                context: self
+                    .context
+                    .participant_context()
+                    .expect("replay only applies after responder posted reply key"),
             },
-            context: self
-                .context
-                .participant_context()
-                .expect("replay only applies after responder posted reply key"),
-        })
+        )
     }
 }
 

@@ -395,6 +395,7 @@ mod integration {
             let (_bitcoind, wallets) = init_bitcoind_funded_wallets(vec![
                 ("responder_a", Some(corepc_node::AddressType::Bech32)),
                 ("responder_b", Some(corepc_node::AddressType::Bech32)),
+                ("creator", Some(corepc_node::AddressType::Bech32)),
             ])
             .map_err(|e| -> BoxSendSyncError { e.to_string().into() })?;
             let mut wallets = wallets.into_iter();
@@ -405,6 +406,10 @@ mod integration {
             let responder_b_wallet = FundedParticipantWallet::new(
                 "responder_b",
                 wallets.next().expect("responder_b wallet must exist"),
+            );
+            let creator_wallet = FundedParticipantWallet::new(
+                "creator_wallet",
+                wallets.next().expect("creator wallet must exist"),
             );
 
             // Coordinator registry: one initiator wallet indexes every session log it orchestrates.
@@ -485,16 +490,14 @@ mod integration {
 
             participant_generate_plan(&participant_a_persister, &responder_a_wallet)?;
             participant_generate_plan(&participant_b_persister, &responder_b_wallet)?;
+            participant_generate_plan(&creator_persister, &creator_wallet)?;
+            participant_execute_plan(&agent, &creator_persister, &ohttp_relay).await?;
             participant_execute_plan(&agent, &participant_a_persister, &ohttp_relay).await?;
             participant_execute_plan(&agent, &participant_b_persister, &ohttp_relay).await?;
             let (_, participant_b_history) = replay_event_log(&participant_b_persister)?;
             println!(
                 "participant B directory PSBT: {:#?}",
                 participant_b_history.accumulated_psbt()
-            );
-            println!(
-                "participant B sent PSBT fragments: {:#?}",
-                participant_b_history.sent_psbt_fragments()
             );
 
             for (pre_graduation, post_graduation) in [
@@ -512,10 +515,7 @@ mod integration {
             }
 
             let (session_state, _) = replay_event_log(&creator_persister)?;
-            assert!(matches!(
-                session_state,
-                MultipartySession::SessionCreatorParametersDistributed(_)
-            ));
+            assert!(matches!(session_state, MultipartySession::ParticipantPlanExecuted(_)));
 
             let (session_state, _) = replay_event_log(&initiator_a_persister)?;
             assert!(matches!(

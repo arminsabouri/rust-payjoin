@@ -8,7 +8,9 @@ pub use error::SessionCreatorSessionError;
 use serde::{Deserialize, Serialize};
 
 use crate::hpke::{encrypt_message_a, HpkeKeyPair, HpkePublicKey};
-use crate::multiparty::participant::ParticipantAwaitingSessionParameters;
+use crate::multiparty::participant::{
+    HasSessionParameters, Participant, ParticipantAwaitingSessionParameters, ParticipantContext,
+};
 use crate::multiparty::persist::{
     EventfulTransition, GraduationError, MultipartyGraduationTransition, MultipartySessionRegistry,
 };
@@ -54,6 +56,14 @@ impl SessionCreatorContext {
 
     pub(crate) fn all_parameters_delivered(&self) -> bool {
         !self.participants.is_empty() && self.participants.iter().all(|p| p.parameters_delivered)
+    }
+
+    fn into_participant_context(self) -> ParticipantContext {
+        ParticipantContext {
+            directory: self.directory,
+            ohttp_keys: self.ohttp_keys,
+            session_parameters: self.session_parameters,
+        }
     }
 
     pub(crate) fn mark_parameters_delivered(
@@ -266,17 +276,13 @@ where
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollectedSessions {}
 
-/// Session parameters were delivered to every participant.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ParametersDistributed {}
-
 /// Typed transition after session parameters are acknowledged by one participant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParametersDelivery {
     /// More participants still need parameters.
     Collecting(SessionCreator<CollectedSessions>),
     /// Every participant has acknowledged delivery.
-    Distributed(SessionCreator<ParametersDistributed>),
+    Distributed(Participant<HasSessionParameters>),
 }
 
 /// Persisted outcome of processing one session-parameters distribution response.
@@ -289,7 +295,7 @@ impl From<ParametersDelivery> for MultipartySession {
             ParametersDelivery::Collecting(state) =>
                 MultipartySession::SessionCreatorCollectedSessions(state),
             ParametersDelivery::Distributed(state) =>
-                MultipartySession::SessionCreatorParametersDistributed(state),
+                MultipartySession::ParticipantHasSessionParameters(state),
         }
     }
 }
@@ -371,10 +377,9 @@ impl SessionCreator<CollectedSessions> {
         let mut context = self.context;
         context.mark_parameters_delivered(&recipient)?;
         Ok(if context.all_parameters_delivered() {
-            ParametersDelivery::Distributed(SessionCreator {
-                state: ParametersDistributed {},
-                context,
-            })
+            ParametersDelivery::Distributed(Participant::from_adopted_context(
+                context.into_participant_context(),
+            ))
         } else {
             ParametersDelivery::Collecting(SessionCreator { state: CollectedSessions {}, context })
         })
@@ -416,15 +421,12 @@ impl SessionCreator<CollectedSessions> {
             self.context.all_parameters_delivered(),
             "AllParametersDelivered only replays after every committed participant acknowledged"
         );
-        MultipartySession::SessionCreatorParametersDistributed(SessionCreator {
-            state: ParametersDistributed {},
-            context: self.context,
-        })
+        MultipartySession::ParticipantHasSessionParameters(Participant::from_adopted_context(
+            self.context.into_participant_context(),
+        ))
     }
 }
 
-// TODO: session creator should just transition to being a participant not have a separate state
-impl SessionCreator<ParametersDistributed> {}
 impl SessionCreatorError {
     fn from_session(err: InternalSessionCreatorSessionError) -> Self {
         match err {

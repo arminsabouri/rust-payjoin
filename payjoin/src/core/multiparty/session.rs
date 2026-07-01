@@ -20,7 +20,7 @@ use crate::multiparty::responder::{
     Initialized as ResponderInitialized, Responder, ResponderContext,
 };
 use crate::multiparty::session_creator::{
-    CollectedSessions, ParametersDistributed, SessionCreator, SessionCreatorContext,
+    CollectedSessions, SessionCreator, SessionCreatorContext,
 };
 use crate::multiparty::SessionParameters;
 use crate::persist::SessionPersister;
@@ -74,7 +74,6 @@ pub enum MultipartySession {
     ParticipantReadyToExecutePlan(Participant<ReadyToExecutePlan>),
     ParticipantPlanExecuted(Participant<PlanExecuted>),
     SessionCreatorCollectedSessions(SessionCreator<CollectedSessions>),
-    SessionCreatorParametersDistributed(SessionCreator<ParametersDistributed>),
     Closed(MultipartySessionOutcome),
 }
 
@@ -311,7 +310,6 @@ pub enum SessionStatus {
     ParticipantReadyToExecutePlan,
     ParticipantPlanExecuted,
     SessionCreatorCollectingParameters,
-    SessionCreatorParametersDistributed,
     Closed(MultipartySessionOutcome),
 }
 

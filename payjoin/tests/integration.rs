@@ -487,6 +487,15 @@ mod integration {
             participant_generate_plan(&participant_b_persister, &responder_b_wallet)?;
             participant_execute_plan(&agent, &participant_a_persister, &ohttp_relay).await?;
             participant_execute_plan(&agent, &participant_b_persister, &ohttp_relay).await?;
+            let (_, participant_b_history) = replay_event_log(&participant_b_persister)?;
+            println!(
+                "participant B directory PSBT: {:#?}",
+                participant_b_history.accumulated_psbt()
+            );
+            println!(
+                "participant B sent PSBT fragments: {:#?}",
+                participant_b_history.sent_psbt_fragments()
+            );
 
             for (pre_graduation, post_graduation) in [
                 (responder_a_persister, participant_a_persister),

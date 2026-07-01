@@ -2,6 +2,9 @@
 
 use core::fmt;
 
+use concurrent_psbt::constructor::BothModifiable;
+use concurrent_psbt::sort::Unset;
+use psbt_v2::v2::Psbt;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{InternalReplayError, ReplayError};
@@ -315,7 +318,6 @@ pub enum SessionStatus {
 /// A collection of events from a multiparty session, from [`replay_event_log`].
 #[derive(Debug, Clone)]
 pub struct SessionHistory {
-    #[allow(unused)]
     events: Vec<MultipartySessionEvent>,
 }
 
@@ -323,5 +325,89 @@ impl SessionHistory {
     pub(crate) fn new(events: Vec<MultipartySessionEvent>) -> Self {
         debug_assert!(!events.is_empty(), "Session event log must contain at least one event");
         Self { events }
+    }
+
+    /// Directory messages read from the shared session mailbox.
+    pub fn directory_messages(&self) -> impl Iterator<Item = &[u8]> {
+        self.events.iter().filter_map(|event| match event {
+            MultipartySessionEvent::PlanDirectoryMessage(message) => Some(message.as_slice()),
+            _ => None,
+        })
+    }
+
+    /// PSBT fragments this participant sent to the shared session mailbox.
+    pub fn sent_psbt_fragments(&self) -> Vec<Psbt> {
+        let mut plan = None;
+        let mut sent_cursor = 0;
+        let mut fragments = Vec::new();
+
+        for event in &self.events {
+            match event {
+                MultipartySessionEvent::PlanGenerated(next_plan) => {
+                    plan = Some(next_plan);
+                    sent_cursor = 0;
+                }
+                MultipartySessionEvent::PlanExecuted(plan_cursor) =>
+                    if let Some(plan) = plan {
+                        let next_cursor = (*plan_cursor).min(plan.len());
+                        for index in sent_cursor..next_cursor {
+                            if let Some(action) = plan.action(index) {
+                                fragments.push(action.as_psbt_fragment());
+                            }
+                        }
+                        sent_cursor = next_cursor;
+                    },
+                _ => {}
+            }
+        }
+
+        fragments
+    }
+
+    pub fn accumulated_psbt(&self) -> Psbt {
+        let mut psbt = concurrent_psbt::constructor::Creator::new().build();
+        // First add our own psbt fragments
+        for fragment in self.sent_psbt_fragments() {
+            let parsed =
+                concurrent_psbt::constructor::Constructor::<BothModifiable, Unset>::try_from_psbt(
+                    fragment,
+                )
+                .unwrap();
+            // TODO: deal with error
+            psbt = psbt.try_join(parsed).try_unwrap().unwrap();
+        }
+
+        for message in self.directory_messages() {
+            let message = Psbt::deserialize(message).unwrap();
+            let parsed =
+                concurrent_psbt::constructor::Constructor::<BothModifiable, Unset>::try_from_psbt(
+                    message,
+                )
+                .unwrap();
+            // TODO: deal with error
+            psbt = psbt.try_join(parsed).try_unwrap().unwrap();
+        }
+
+        psbt.into_psbt()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MultipartySessionEvent, SessionHistory};
+
+    #[test]
+    fn session_history_returns_directory_messages_in_order() {
+        let history = SessionHistory {
+            events: vec![
+                MultipartySessionEvent::ResponderSentReplyKey,
+                MultipartySessionEvent::PlanDirectoryMessage(b"first".to_vec()),
+                MultipartySessionEvent::PlanDirectoryMessage(b"second".to_vec()),
+            ],
+        };
+
+        let messages = history.directory_messages().collect::<Vec<_>>();
+
+        assert_eq!(messages, vec![&b"first"[..], &b"second"[..]]);
     }
 }

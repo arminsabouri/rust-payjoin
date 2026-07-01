@@ -335,6 +335,14 @@ impl SessionHistory {
         })
     }
 
+    /// Number of directory messages already persisted from the shared session mailbox.
+    pub fn directory_message_count(&self) -> usize {
+        self.events
+            .iter()
+            .filter(|event| matches!(event, MultipartySessionEvent::PlanDirectoryMessage(_)))
+            .count()
+    }
+
     /// PSBT fragments this participant sent to the shared session mailbox.
     pub fn sent_psbt_fragments(&self) -> Vec<Psbt> {
         let mut plan = None;
@@ -409,5 +417,6 @@ mod tests {
         let messages = history.directory_messages().collect::<Vec<_>>();
 
         assert_eq!(messages, vec![&b"first"[..], &b"second"[..]]);
+        assert_eq!(history.directory_message_count(), 2);
     }
 }

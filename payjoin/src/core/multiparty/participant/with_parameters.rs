@@ -52,7 +52,7 @@ impl Participant<HasSessionParameters> {
 
     pub(crate) fn apply_with_plan(self, plan: Plan) -> MultipartySession {
         MultipartySession::ParticipantHasPlan(Participant {
-            state: HasPlan { plan, plan_cursor: 0 },
+            state: HasPlan { plan, plan_cursor: 0, directory_read_cursor: 0 },
             context: self.context,
         })
     }
@@ -78,7 +78,10 @@ impl Participant<HasSessionParameters> {
         let plan = plan.build();
         NextStateTransition::success(
             MultipartySessionEvent::PlanGenerated(plan.clone()),
-            Participant { state: HasPlan { plan, plan_cursor: 0 }, context: self.context.clone() },
+            Participant {
+                state: HasPlan { plan, plan_cursor: 0, directory_read_cursor: 0 },
+                context: self.context.clone(),
+            },
         )
     }
 }
@@ -87,17 +90,30 @@ impl Participant<HasSessionParameters> {
 pub struct HasPlan {
     pub(crate) plan: Plan,
     pub(crate) plan_cursor: usize,
+    /// Number of frames already consumed from the append-only shared mailbox.
+    ///
+    /// The mailbox is read in full on every round, so this marks how far we have
+    /// already processed and lets us skip re-reading frames we have seen. It is
+    /// derived from the log: [`Self::apply_directory_message`] advances it by one
+    /// per persisted [`MultipartySessionEvent::PlanDirectoryMessage`].
+    pub(crate) directory_read_cursor: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadyToExecutePlan {
     pub(crate) plan: Plan,
     pub(crate) plan_cursor: usize,
+    pub(crate) directory_read_cursor: usize,
+    /// Frames newly read this round (those past `directory_read_cursor`).
     pub(crate) directory_messages: Vec<Vec<u8>>,
 }
 
 impl Participant<HasPlan> {
-    pub(crate) fn apply_directory_message(self, _directory_message: Vec<u8>) -> MultipartySession {
+    pub(crate) fn apply_directory_message(
+        mut self,
+        _directory_message: Vec<u8>,
+    ) -> MultipartySession {
+        self.state.directory_read_cursor += 1;
         MultipartySession::ParticipantHasPlan(self)
     }
 
@@ -127,12 +143,17 @@ impl Participant<HasPlan> {
     }
 
     /// Process and persist the directory messages that may affect plan re-evaluation.
+    ///
+    /// The shared mailbox is append-only and returned in full, so frames before
+    /// [`HasPlan::directory_read_cursor`] have already been persisted on an
+    /// earlier round and are skipped; only the newly appended frames become
+    /// [`MultipartySessionEvent::PlanDirectoryMessage`] events.
     pub fn process_read_from_directory_response(
         &self,
         body: &[u8],
         context: ohttp::ClientResponse,
     ) -> PlanReadTransition {
-        let directory_messages =
+        let all_messages =
             match process_read_response(body, context, &self.context.session_shared_keypair()) {
                 Ok(messages) => messages,
                 Err(e) => {
@@ -147,17 +168,26 @@ impl Participant<HasPlan> {
                 }
             };
 
+        // TODO: future work for pagination. Should not have to read and decrypt all the frames again
+        // let already_read = self.state.directory_read_cursor;
+        // let new_messages: Vec<Vec<u8>> = all_messages.into_iter().skip(already_read).collect();
+        // let directory_read_cursor = already_read + new_messages.len();
+
+        let events: Vec<_> = all_messages
+            .iter()
+            .cloned()
+            .map(MultipartySessionEvent::PlanDirectoryMessage)
+            .collect();
+
         let ready = Participant {
             state: ReadyToExecutePlan {
                 plan: self.state.plan.clone(),
                 plan_cursor: self.state.plan_cursor,
-                directory_messages: directory_messages.clone(),
+                directory_read_cursor: events.len(),
+                directory_messages: all_messages,
             },
             context: self.context.clone(),
         };
-
-        let events =
-            directory_messages.into_iter().map(MultipartySessionEvent::PlanDirectoryMessage);
 
         PlanReadTransition::success(events, ready)
     }
@@ -210,7 +240,11 @@ impl Participant<ReadyToExecutePlan> {
             })
         } else {
             PlanExecution::NeedsDirectoryRead(Participant {
-                state: HasPlan { plan, plan_cursor },
+                state: HasPlan {
+                    plan,
+                    plan_cursor,
+                    directory_read_cursor: self.state.directory_read_cursor,
+                },
                 context: self.context.clone(),
             })
         };

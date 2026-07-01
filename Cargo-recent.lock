@@ -1030,6 +1030,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "concurrent-psbt"
+version = "0.1.0"
+dependencies = [
+ "bitcoin 0.32.8",
+ "psbt-v2",
+]
+
+[[package]]
 name = "config"
 version = "0.15.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2777,11 +2785,13 @@ dependencies = [
  "bitcoin-units",
  "bitcoin-uri-composer",
  "bitcoin_uri",
+ "concurrent-psbt",
  "futures",
  "http",
  "once_cell",
  "payjoin-test-utils",
  "percent-encoding-rfc3986",
+ "psbt-v2",
  "reqwest",
  "rustls 0.23.31",
  "serde",
@@ -2908,6 +2918,7 @@ name = "payjoin-test-utils"
 version = "0.0.1"
 dependencies = [
  "axum-server",
+ "bhttp",
  "bitcoin 0.32.8",
  "bitcoin-ohttp",
  "corepc-node",
@@ -3148,6 +3159,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.106",
+]
+
+[[package]]
+name = "psbt-v2"
+version = "0.2.0"
+source = "git+https://github.com/arminsabouri/rust-psbt?branch=update-consensus-decode-trait-bound#9647b0866b7822b0c8fa1b97915bcd2eeaa62f79"
+dependencies = [
+ "bitcoin 0.32.8",
+ "bitcoin-internals 0.3.0",
 ]
 
 [[package]]

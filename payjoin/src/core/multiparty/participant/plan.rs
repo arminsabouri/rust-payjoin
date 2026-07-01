@@ -1,3 +1,6 @@
+use bitcoin::key::rand::{thread_rng, RngCore};
+use concurrent_psbt::constructor::Creator;
+use concurrent_psbt::output::PSBT_OUT_UNIQUE_ID_SUBTYPE;
 use serde::{Deserialize, Serialize};
 
 use crate::receive::InputPair;
@@ -6,29 +9,46 @@ use crate::receive::InputPair;
 // TODO: add timestamp to when actions should be performed
 pub enum Action {
     RegisterInput(InputPair),
-    RegisterOutput(bitcoin::TxOut),
+    RegisterOutput { output: bitcoin::TxOut, unique_id: [u8; 32] },
 }
 
 impl Action {
-    // HACK: we really want to be using the concurrent psbt library here.
-    pub(crate) fn as_psbt_fragment(&self) -> bitcoin::Psbt {
-        let tx = match self {
-            Action::RegisterInput(input) => bitcoin::Transaction {
-                input: vec![input.txin.clone()],
-                version: bitcoin::transaction::Version(2),
-                lock_time: bitcoin::absolute::LockTime::ZERO,
-                output: vec![],
-            },
-            Action::RegisterOutput(output) => bitcoin::Transaction {
-                output: vec![output.clone()],
-                version: bitcoin::transaction::Version(2),
-                lock_time: bitcoin::absolute::LockTime::ZERO,
-                input: vec![],
-            },
-        };
-
-        bitcoin::Psbt::from_unsigned_tx(tx).unwrap()
+    pub(crate) fn as_psbt_fragment(&self) -> psbt_v2::v2::Psbt {
+        match self {
+            Action::RegisterInput(input) =>
+                Creator::new().build().input(psbt_v2_input(input)).into_psbt(),
+            Action::RegisterOutput { output, unique_id } => Creator::new()
+                .build()
+                .output(psbt_v2_output(output.clone(), *unique_id))
+                .into_psbt(),
+        }
     }
+}
+
+fn psbt_v2_input(input: &InputPair) -> psbt_v2::v2::Input {
+    let sequence = input.txin.sequence;
+    let mut psbt_input = psbt_v2::v2::Input::new(&input.txin.previous_output);
+    psbt_input.sequence = Some(sequence);
+    psbt_input
+}
+
+// TODO: adding the uninque id should be part of the output() method in the concurrent-psbt crate
+// Adding it externally here is a additional boilerplate.
+fn psbt_v2_output(output: bitcoin::TxOut, unique_id: [u8; 32]) -> psbt_v2::v2::Output {
+    let mut output = psbt_v2::v2::Output::new(output);
+    let key = psbt_v2::raw::ProprietaryKey {
+        prefix: b"concurrent-psbt".to_vec(),
+        subtype: PSBT_OUT_UNIQUE_ID_SUBTYPE,
+        key: vec![],
+    };
+    output.proprietaries.insert(key, unique_id.to_vec());
+    output
+}
+
+fn new_output_unique_id() -> [u8; 32] {
+    let mut unique_id = [0u8; 32];
+    thread_rng().fill_bytes(&mut unique_id);
+    unique_id
 }
 
 pub(crate) struct PlanBuilder(Vec<Action>);
@@ -42,7 +62,7 @@ impl PlanBuilder {
     }
 
     pub fn add_output(mut self, output: bitcoin::TxOut) -> Self {
-        self.0.push(Action::RegisterOutput(output));
+        self.0.push(Action::RegisterOutput { output, unique_id: new_output_unique_id() });
         self
     }
 

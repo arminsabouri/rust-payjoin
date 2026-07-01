@@ -40,28 +40,6 @@ pub struct Participant<State> {
     pub(crate) context: ParticipantContext,
 }
 
-impl<State> Participant<State> {
-    fn create_read_from_directory_request(
-        &self,
-        ohttp_relay: impl IntoUrl,
-    ) -> Result<(Request, ohttp::ClientResponse), MailboxError> {
-        read_request(
-            &self.context.ohttp_keys,
-            &self.context.directory,
-            ohttp_relay,
-            &self.context.session_shared_mailbox_id(),
-        )
-    }
-
-    fn process_read_from_directory_response(
-        &self,
-        body: &[u8],
-        context: ohttp::ClientResponse,
-    ) -> Result<Vec<Vec<u8>>, MailboxError> {
-        process_read_response(body, context, &self.context.session_shared_keypair())
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HasSessionParameters {}
 
@@ -111,12 +89,18 @@ pub struct HasPlan {
     pub(crate) plan_cursor: usize,
 }
 
-// Once you have a plan, we should read over the available actions and execute them.
-// we will also need to read existing messages from the directory and persist them
-// For now lets just execute the actions and then read other's. once we read a others
-// messages we will need to re-evaluate the plan and update our cursor. And potentially decide a better
-// branch in the plan
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadyToExecutePlan {
+    pub(crate) plan: Plan,
+    pub(crate) plan_cursor: usize,
+    pub(crate) directory_messages: Vec<Vec<u8>>,
+}
+
 impl Participant<HasPlan> {
+    pub(crate) fn apply_directory_message(self, _directory_message: Vec<u8>) -> MultipartySession {
+        MultipartySession::ParticipantHasPlan(self)
+    }
+
     pub(crate) fn apply_with_plan_cursor(mut self, plan_cursor: usize) -> MultipartySession {
         if plan_cursor >= self.state.plan.len() {
             return MultipartySession::ParticipantPlanExecuted(Participant {
@@ -127,6 +111,60 @@ impl Participant<HasPlan> {
         self.state.plan_cursor = plan_cursor;
         MultipartySession::ParticipantHasPlan(self)
     }
+
+    /// Create an OHTTP encapsulated request to read the shared session mailbox before executing the
+    /// next plan action.
+    pub fn create_read_from_directory_request(
+        &self,
+        ohttp_relay: impl IntoUrl,
+    ) -> Result<(Request, ohttp::ClientResponse), MailboxError> {
+        read_request(
+            &self.context.ohttp_keys,
+            &self.context.directory,
+            ohttp_relay,
+            &self.context.session_shared_mailbox_id(),
+        )
+    }
+
+    /// Process and persist the directory messages that may affect plan re-evaluation.
+    pub fn process_read_from_directory_response(
+        &self,
+        body: &[u8],
+        context: ohttp::ClientResponse,
+    ) -> PlanReadTransition {
+        let directory_messages =
+            match process_read_response(body, context, &self.context.session_shared_keypair()) {
+                Ok(messages) => messages,
+                Err(e) => {
+                    let err = ParticipantError::from(e);
+                    if matches!(&err, ParticipantError::DirectoryResponse(e) if !e.is_fatal()) {
+                        return PlanReadTransition::transient(err);
+                    }
+                    return PlanReadTransition::fatal(
+                        MultipartySessionEvent::Closed(MultipartySessionOutcome::Failure),
+                        err,
+                    );
+                }
+            };
+
+        let ready = Participant {
+            state: ReadyToExecutePlan {
+                plan: self.state.plan.clone(),
+                plan_cursor: self.state.plan_cursor,
+                directory_messages: directory_messages.clone(),
+            },
+            context: self.context.clone(),
+        };
+
+        let events =
+            directory_messages.into_iter().map(MultipartySessionEvent::PlanDirectoryMessage);
+
+        PlanReadTransition::success(events, ready)
+    }
+}
+
+impl Participant<ReadyToExecutePlan> {
+    pub fn directory_messages(&self) -> &[Vec<u8>] { &self.state.directory_messages }
 
     pub fn execute_action_from_plan(
         &self,
@@ -171,7 +209,7 @@ impl Participant<HasPlan> {
                 context: self.context.clone(),
             })
         } else {
-            PlanExecution::Executing(Participant {
+            PlanExecution::NeedsDirectoryRead(Participant {
                 state: HasPlan { plan, plan_cursor },
                 context: self.context.clone(),
             })
@@ -186,18 +224,22 @@ impl Participant<HasPlan> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanExecution {
-    Executing(Participant<HasPlan>),
+    NeedsDirectoryRead(Participant<HasPlan>),
     Executed(Participant<PlanExecuted>),
 }
 
 impl From<PlanExecution> for MultipartySession {
     fn from(execution: PlanExecution) -> Self {
         match execution {
-            PlanExecution::Executing(state) => MultipartySession::ParticipantHasPlan(state),
+            PlanExecution::NeedsDirectoryRead(state) =>
+                MultipartySession::ParticipantHasPlan(state),
             PlanExecution::Executed(state) => MultipartySession::ParticipantPlanExecuted(state),
         }
     }
 }
+
+pub type PlanReadTransition =
+    EventfulTransition<MultipartySessionEvent, Participant<ReadyToExecutePlan>, ParticipantError>;
 
 // TODO: evaluate if we want stronger state transition types than just PlanExecution. In the current use case we just have two states: current and next
 // And rn I cant think of any other states we would end up in from process a post res

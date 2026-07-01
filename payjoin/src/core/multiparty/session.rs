@@ -10,7 +10,7 @@ use crate::multiparty::initiator::{
 };
 use crate::multiparty::participant::{
     HasPlan, HasSessionParameters, Participant, ParticipantAwaitingSessionParameters,
-    ParticipantContext, Plan, PlanExecuted,
+    ParticipantContext, Plan, PlanExecuted, ReadyToExecutePlan,
 };
 use crate::multiparty::persist::MultipartySessionRegistry;
 use crate::multiparty::responder::{
@@ -35,6 +35,8 @@ pub enum MultipartySessionEvent {
     SessionParametersAdopted(ParticipantContext),
     /// Participant generated its initial plan from available inputs and payment obligations.
     PlanGenerated(Plan),
+    /// Participant read and persisted one shared directory message.
+    PlanDirectoryMessage(Vec<u8>),
     /// Participant executed a plan action and advanced to this cursor.
     PlanExecuted(usize),
     SessionCreatorCreated(SessionCreatorContext),
@@ -66,6 +68,7 @@ pub enum MultipartySession {
     ParticipantAwaitingSessionParameters(ParticipantAwaitingSessionParameters),
     ParticipantHasSessionParameters(Participant<HasSessionParameters>),
     ParticipantHasPlan(Participant<HasPlan>),
+    ParticipantReadyToExecutePlan(Participant<ReadyToExecutePlan>),
     ParticipantPlanExecuted(Participant<PlanExecuted>),
     SessionCreatorCollectedSessions(SessionCreator<CollectedSessions>),
     SessionCreatorParametersDistributed(SessionCreator<ParametersDistributed>),
@@ -108,6 +111,11 @@ impl MultipartySession {
                 MultipartySession::ParticipantHasSessionParameters(state),
                 MultipartySessionEvent::PlanGenerated(plan),
             ) => Ok(state.apply_with_plan(plan)),
+
+            (
+                MultipartySession::ParticipantHasPlan(state),
+                MultipartySessionEvent::PlanDirectoryMessage(directory_message),
+            ) => Ok(state.apply_directory_message(directory_message)),
 
             (
                 MultipartySession::ParticipantHasPlan(state),
@@ -297,6 +305,7 @@ pub enum SessionStatus {
     ParticipantAwaitingSessionParameters,
     ParticipantHasSessionParameters,
     ParticipantHasPlan,
+    ParticipantReadyToExecutePlan,
     ParticipantPlanExecuted,
     SessionCreatorCollectingParameters,
     SessionCreatorParametersDistributed,

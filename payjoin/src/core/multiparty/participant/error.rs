@@ -1,6 +1,7 @@
 use core::fmt;
 use std::error;
 
+use crate::append_mailbox::MailboxError;
 use crate::hpke::HpkeError;
 use crate::multiparty::SessionParametersError;
 use crate::ohttp::{DirectoryResponseError, OhttpEncapsulationError};
@@ -13,6 +14,7 @@ pub enum ParticipantError {
     OhttpEncapsulation(OhttpEncapsulationError),
     Hpke(HpkeError),
     DirectoryResponse(DirectoryResponseError),
+    Mailbox(MailboxError),
     SessionParameters(SessionParametersError),
 }
 
@@ -35,6 +37,15 @@ impl From<DirectoryResponseError> for ParticipantError {
     fn from(value: DirectoryResponseError) -> Self { Self::DirectoryResponse(value) }
 }
 
+impl From<MailboxError> for ParticipantError {
+    fn from(value: MailboxError) -> Self {
+        match value {
+            MailboxError::Response(e) => Self::DirectoryResponse(e),
+            e => Self::Mailbox(e),
+        }
+    }
+}
+
 impl From<SessionParametersError> for ParticipantError {
     fn from(value: SessionParametersError) -> Self { Self::SessionParameters(value) }
 }
@@ -46,6 +57,7 @@ impl fmt::Display for ParticipantError {
             Self::OhttpEncapsulation(e) => write!(f, "OHTTP encapsulation error: {e}"),
             Self::Hpke(e) => write!(f, "HPKE encryption failed: {e}"),
             Self::DirectoryResponse(e) => write!(f, "directory response error: {e}"),
+            Self::Mailbox(e) => write!(f, "mailbox error: {e}"),
             Self::SessionParameters(e) => write!(f, "session parameters error: {e}"),
         }
     }
@@ -58,6 +70,7 @@ impl error::Error for ParticipantError {
             Self::OhttpEncapsulation(e) => Some(e),
             Self::Hpke(e) => Some(e),
             Self::DirectoryResponse(e) => Some(e),
+            Self::Mailbox(e) => Some(e),
             Self::SessionParameters(e) => Some(e),
         }
     }

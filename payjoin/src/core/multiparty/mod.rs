@@ -21,6 +21,7 @@ pub use participant::{
     AwaitingParticipantContext, HasSessionParameters, Participant,
     ParticipantAwaitingSessionParameters, ParticipantContext, ParticipantError,
     ParticipantSessionError, PlanExecuted, PlanExecution, PlanExecutionTransition,
+    PlanReadTransition, ReadyToExecutePlan,
 };
 pub use persist::{
     EventfulTransition, GraduationError, InMemoryMultipartyRegistry,

@@ -367,10 +367,14 @@ mod integration {
             };
 
             loop {
-                let (req, ctx) = participant.execute_action_from_plan(ohttp_relay)?;
+                let (req, ctx) = participant.create_read_from_directory_request(ohttp_relay)?;
                 let body = send_ohttp_request(agent, req).await?;
-                match participant.process_action_response(&body, ctx).save(persister)? {
-                    PlanExecution::Executing(next) => participant = next,
+                let ready =
+                    participant.process_read_from_directory_response(&body, ctx).save(persister)?;
+                let (req, ctx) = ready.execute_action_from_plan(ohttp_relay)?;
+                let body = send_ohttp_request(agent, req).await?;
+                match ready.process_action_response(&body, ctx).save(persister)? {
+                    PlanExecution::NeedsDirectoryRead(next) => participant = next,
                     PlanExecution::Executed(_) => break,
                 }
             }

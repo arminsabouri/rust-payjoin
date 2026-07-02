@@ -196,8 +196,9 @@ mod integration {
         use payjoin::multiparty::{
             replay_event_log, InMemoryMultipartyRegistry, InitiatorBuilder, InputScriptType,
             MultipartyPjUri, MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
-            MultipartySessionRegistry, ParametersDelivery, PlanExecution, ResponderBuilder,
-            SessionCreatorBuilder, SessionParameters,
+            MultipartySessionRegistry, ParametersDelivery, ParticipantDriver,
+            ParticipantRequestSender, ResponderBuilder, SessionCreatorBuilder, SessionParameters,
+            TickOutcome,
         };
         use payjoin::persist::OptionalTransitionOutcome;
         use payjoin::{HpkeKeyPair, Request, Url};
@@ -264,6 +265,31 @@ mod integration {
                 response.status()
             );
             Ok(response.bytes().await?.to_vec())
+        }
+
+        struct TestRequestSender<'a> {
+            agent: &'a Client,
+        }
+
+        #[derive(Debug)]
+        struct TestRequestError(BoxSendSyncError);
+
+        impl std::fmt::Display for TestRequestError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+
+        impl std::error::Error for TestRequestError {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&*self.0) }
+        }
+
+        impl ParticipantRequestSender for TestRequestSender<'_> {
+            type Error = TestRequestError;
+
+            async fn send_request(&self, request: Request) -> Result<Vec<u8>, Self::Error> {
+                send_ohttp_request(self.agent, request).await.map_err(TestRequestError)
+            }
         }
 
         async fn responder_post_reply(
@@ -360,22 +386,18 @@ mod integration {
             persister: &InMemoryPersister<MultipartySessionEvent>,
             ohttp_relay: &str,
         ) -> Result<(), BoxSendSyncError> {
-            let (participant_state, _) = replay_event_log(persister)?;
-            let mut participant = match participant_state {
-                MultipartySession::ParticipantHasPlan(state) => state,
-                _ => panic!("participant must have a plan before executing it"),
-            };
+            let sender = TestRequestSender { agent };
+            let driver = ParticipantDriver::new(persister, &sender, ohttp_relay);
 
             loop {
-                let (req, ctx) = participant.create_read_from_directory_request(ohttp_relay)?;
-                let body = send_ohttp_request(agent, req).await?;
-                let ready =
-                    participant.process_read_from_directory_response(&body, ctx).save(persister)?;
-                let (req, ctx) = ready.execute_action_from_plan(ohttp_relay)?;
-                let body = send_ohttp_request(agent, req).await?;
-                match ready.process_action_response(&body, ctx).save(persister)? {
-                    PlanExecution::NeedsDirectoryRead(next) => participant = next,
-                    PlanExecution::Executed(_) => break,
+                match driver.tick().await? {
+                    TickOutcome::Idle => panic!("participant must have a plan before executing it"),
+                    TickOutcome::InboxProgress { .. } => {}
+                    TickOutcome::ActionAppended { plan_complete, .. } =>
+                        if plan_complete {
+                            break;
+                        },
+                    TickOutcome::Complete => break,
                 }
             }
 

@@ -19,9 +19,10 @@ pub use initiator::{
 };
 pub use participant::{
     AwaitingParticipantContext, HasSessionParameters, Participant,
-    ParticipantAwaitingSessionParameters, ParticipantContext, ParticipantError,
-    ParticipantSessionError, PlanExecuted, PlanExecution, PlanExecutionTransition,
-    PlanReadTransition, ReadyToExecutePlan,
+    ParticipantAwaitingSessionParameters, ParticipantContext, ParticipantDriver,
+    ParticipantDriverError, ParticipantError, ParticipantRequestSender, ParticipantSessionError,
+    PlanExecuted, PlanExecution, PlanExecutionTransition, PlanReadTransition, ReadyToExecutePlan,
+    TickOutcome,
 };
 pub use persist::{
     EventfulTransition, GraduationError, InMemoryMultipartyRegistry,

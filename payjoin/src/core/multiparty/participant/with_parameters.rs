@@ -169,11 +169,11 @@ impl Participant<HasPlan> {
             };
 
         // TODO: future work for pagination. Should not have to read and decrypt all the frames again
-        // let already_read = self.state.directory_read_cursor;
-        // let new_messages: Vec<Vec<u8>> = all_messages.into_iter().skip(already_read).collect();
-        // let directory_read_cursor = already_read + new_messages.len();
+        let already_read = self.state.directory_read_cursor;
+        let new_messages: Vec<Vec<u8>> = all_messages.into_iter().skip(already_read).collect();
+        let directory_read_cursor = already_read + new_messages.len();
 
-        let events: Vec<_> = all_messages
+        let events: Vec<_> = new_messages
             .iter()
             .cloned()
             .map(MultipartySessionEvent::PlanDirectoryMessage)
@@ -183,8 +183,8 @@ impl Participant<HasPlan> {
             state: ReadyToExecutePlan {
                 plan: self.state.plan.clone(),
                 plan_cursor: self.state.plan_cursor,
-                directory_read_cursor: events.len(),
-                directory_messages: all_messages,
+                directory_read_cursor,
+                directory_messages: new_messages,
             },
             context: self.context.clone(),
         };

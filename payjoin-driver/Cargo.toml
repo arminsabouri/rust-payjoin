@@ -1,0 +1,27 @@
+[package]
+name = "payjoin-driver"
+version = "0.1.0"
+authors = ["Dan Gould <d@ngould.dev>"]
+description = "Driver loops and transport adapters for driving payjoin session state machines."
+repository = "https://github.com/payjoin/rust-payjoin"
+readme = "../README.md"
+keywords = ["payjoin", "bitcoin"]
+categories = ["network-programming"]
+license = "MITNFA"
+resolver = "2"
+edition = "2021"
+rust-version = "1.85"
+
+[features]
+default = ["reqwest"]
+#[doc = "A reqwest-backed implementation of the Transport trait."]
+reqwest = ["dep:reqwest"]
+
+[dependencies]
+futures = { version = "0.3.31", default-features = false, features = ["std", "async-await"] }
+payjoin = { version = "0.25.0", features = ["multiparty"] }
+reqwest = { version = "0.12.23", default-features = false, features = ["rustls-tls"], optional = true }
+
+[dev-dependencies]
+payjoin-test-utils = { path = "../payjoin-test-utils" }
+tokio = { version = "1.47.1", features = ["full"] }

@@ -196,11 +196,13 @@ mod integration {
         use payjoin::multiparty::{
             replay_event_log, InMemoryMultipartyRegistry, InitiatorBuilder, InputScriptType,
             MultipartyPjUri, MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
-            MultipartySessionRegistry, ParametersDelivery, PlanExecution, ResponderBuilder,
-            SessionCreatorBuilder, SessionParameters,
+            MultipartySessionRegistry, ParametersDelivery, ResponderBuilder, SessionCreatorBuilder,
+            SessionParameters,
         };
         use payjoin::persist::OptionalTransitionOutcome;
         use payjoin::{HpkeKeyPair, Request, Url};
+        use payjoin_driver::adapters::DirectoryMailbox;
+        use payjoin_driver::participant::execute_plan;
         use payjoin_test_utils::{
             corepc_node, init_bitcoind_funded_wallets, init_tracing, BoxSendSyncError,
             InMemoryPersister, TestServices,
@@ -360,25 +362,14 @@ mod integration {
             persister: &InMemoryPersister<MultipartySessionEvent>,
             ohttp_relay: &str,
         ) -> Result<(), BoxSendSyncError> {
-            let (participant_state, _) = replay_event_log(persister)?;
-            let mut participant = match participant_state {
-                MultipartySession::ParticipantHasPlan(state) => state,
+            let (session, _) = replay_event_log(persister)?;
+            let coords = match session {
+                MultipartySession::ParticipantHasPlan(participant) =>
+                    participant.shared_mailbox_coordinates(),
                 _ => panic!("participant must have a plan before executing it"),
             };
-
-            loop {
-                let (req, ctx) = participant.create_read_from_directory_request(ohttp_relay)?;
-                let body = send_ohttp_request(agent, req).await?;
-                let ready =
-                    participant.process_read_from_directory_response(&body, ctx).save(persister)?;
-                let (req, ctx) = ready.execute_action_from_plan(ohttp_relay)?;
-                let body = send_ohttp_request(agent, req).await?;
-                match ready.process_action_response(&body, ctx).save(persister)? {
-                    PlanExecution::NeedsDirectoryRead(next) => participant = next,
-                    PlanExecution::Executed(_) => break,
-                }
-            }
-
+            let mailbox = DirectoryMailbox::new(agent.clone(), ohttp_relay, coords)?;
+            execute_plan(&mailbox, persister).await?;
             Ok(())
         }
 

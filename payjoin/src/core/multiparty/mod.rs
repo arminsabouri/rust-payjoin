@@ -2,8 +2,6 @@
 mod test_helpers;
 
 pub mod initiator;
-#[cfg_attr(docsrs, doc(cfg(feature = "multiparty")))]
-pub mod linked_mailbox;
 pub mod participant;
 pub mod persist;
 pub mod responder;
@@ -18,16 +16,18 @@ pub use initiator::{
     InitiatorError, InitiatorSessionError,
 };
 pub use participant::{
-    AwaitingParticipantContext, HasSessionParameters, Participant,
-    ParticipantAwaitingSessionParameters, ParticipantContext, ParticipantError,
+    parse_mailbox_psbt_fragment, AwaitingParticipantContext, HasPlan, HasSessionParameters,
+    Participant, ParticipantAwaitingSessionParameters, ParticipantContext, ParticipantError,
     ParticipantSessionError, PlanExecuted, PlanExecution, PlanExecutionTransition,
-    PlanReadTransition, ReadyToExecutePlan,
+    PlanReadTransition, PsbtFragmentError, SharedMailboxCoordinates,
 };
 pub use persist::{
     EventfulTransition, GraduationError, InMemoryMultipartyRegistry,
     MultipartyGraduationTransition, MultipartySessionRegistry, ParticipantParametersAdoption,
     RegistryError, SessionParametersPollFailure, SessionParametersPollTransition,
 };
+/// The validated concurrent-PSBT fragment type exchanged over the shared mailbox.
+pub use psbt_v2::v2::Psbt;
 pub use responder::{
     Initialized as ResponderInitialized, Responder, ResponderBuilder, ResponderContext,
     ResponderError, ResponderSessionError,

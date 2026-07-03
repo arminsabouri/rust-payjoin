@@ -35,9 +35,10 @@ impl std::error::Error for PsbtFragmentError {
 }
 
 /// Parse one HPKE-decrypted mailbox payload into a validated PSBT fragment.
-pub(crate) fn parse_mailbox_psbt_fragment(
-    padded_message: &[u8],
-) -> Result<Psbt, PsbtFragmentError> {
+///
+/// The mailbox transport calls this so parsing and validation live alongside
+/// decryption, not in the participant state machine.
+pub fn parse_mailbox_psbt_fragment(padded_message: &[u8]) -> Result<Psbt, PsbtFragmentError> {
     let bytes = trim_trailing_zeros(padded_message);
     let psbt = Psbt::deserialize(bytes).map_err(PsbtFragmentError::Deserialize)?;
     Constructor::<BothModifiable, Unset>::try_from_psbt(psbt.clone())

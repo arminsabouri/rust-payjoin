@@ -677,6 +677,10 @@ where
             _ => None,
         }
     }
+
+    pub fn is_transient(&self) -> bool {
+        matches!(&self.0, InternalPersistedError::Api(ApiError::Transient(_)))
+    }
 }
 
 impl<ApiError: std::error::Error, StorageError: std::error::Error, ErrorState: fmt::Debug>

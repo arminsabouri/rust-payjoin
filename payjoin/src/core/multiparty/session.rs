@@ -2,7 +2,7 @@
 
 use core::fmt;
 
-use concurrent_psbt::constructor::BothModifiable;
+use concurrent_psbt::constructor::{BothModifiable, Constructor};
 use concurrent_psbt::sort::Unset;
 use psbt_v2::v2::Psbt;
 use serde::{Deserialize, Serialize};
@@ -13,7 +13,7 @@ use crate::multiparty::initiator::{
 };
 use crate::multiparty::participant::{
     HasPlan, HasSessionParameters, Participant, ParticipantAwaitingSessionParameters,
-    ParticipantContext, Plan, PlanExecuted, ReadyToExecutePlan,
+    ParticipantContext, Plan, PlanExecuted,
 };
 use crate::multiparty::persist::MultipartySessionRegistry;
 use crate::multiparty::responder::{
@@ -71,7 +71,6 @@ pub enum MultipartySession {
     ParticipantAwaitingSessionParameters(ParticipantAwaitingSessionParameters),
     ParticipantHasSessionParameters(Participant<HasSessionParameters>),
     ParticipantHasPlan(Participant<HasPlan>),
-    ParticipantReadyToExecutePlan(Participant<ReadyToExecutePlan>),
     ParticipantPlanExecuted(Participant<PlanExecuted>),
     SessionCreatorCollectedSessions(SessionCreator<CollectedSessions>),
     Closed(MultipartySessionOutcome),
@@ -375,7 +374,7 @@ impl SessionHistory {
         // First add our own psbt fragments
         for fragment in self.sent_psbt_fragments() {
             let parsed =
-                concurrent_psbt::constructor::Constructor::<BothModifiable, Unset>::try_from_psbt(
+                Constructor::<BothModifiable, Unset>::try_from_psbt(
                     fragment,
                 )
                 .unwrap();
@@ -385,7 +384,7 @@ impl SessionHistory {
 
         for fragment in self.directory_psbt_fragments() {
             let parsed =
-                concurrent_psbt::constructor::Constructor::<BothModifiable, Unset>::try_from_psbt(
+                Constructor::<BothModifiable, Unset>::try_from_psbt(
                     fragment.clone(),
                 )
                 .expect("persisted directory PSBT fragments are validated at intake");

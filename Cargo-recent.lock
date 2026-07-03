@@ -2789,6 +2789,7 @@ dependencies = [
  "futures",
  "http",
  "once_cell",
+ "payjoin-driver",
  "payjoin-test-utils",
  "percent-encoding-rfc3986",
  "psbt-v2",
@@ -2828,6 +2829,17 @@ dependencies = [
  "tokio-rustls 0.26.2",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "payjoin-driver"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "payjoin",
+ "payjoin-test-utils",
+ "reqwest",
+ "tokio",
 ]
 
 [[package]]
@@ -3168,6 +3180,7 @@ source = "git+https://github.com/arminsabouri/rust-psbt?branch=update-consensus-
 dependencies = [
  "bitcoin 0.32.8",
  "bitcoin-internals 0.3.0",
+ "serde",
 ]
 
 [[package]]

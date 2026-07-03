@@ -3,6 +3,7 @@ members = [
   "fuzz",
   "payjoin",
   "payjoin-cli",
+  "payjoin-driver",
   "payjoin-test-utils",
   "payjoin-ffi",
   "payjoin-mailroom",

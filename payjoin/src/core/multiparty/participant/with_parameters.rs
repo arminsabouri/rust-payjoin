@@ -1,6 +1,7 @@
+use psbt_v2::v2::Psbt;
 use serde::{Deserialize, Serialize};
 
-use super::plan::PlanBuilder;
+use super::plan::{parse_mailbox_psbt_fragment, PlanBuilder};
 use super::{ParticipantError, Plan};
 use crate::append_mailbox::{append_request, process_read_response, read_request, MailboxError};
 use crate::hpke::HpkeKeyPair;
@@ -94,8 +95,9 @@ pub struct HasPlan {
     ///
     /// The mailbox is read in full on every round, so this marks how far we have
     /// already processed and lets us skip re-reading frames we have seen. It is
-    /// derived from the log: [`Self::apply_directory_message`] advances it by one
-    /// per persisted [`MultipartySessionEvent::PlanDirectoryMessage`].
+    /// derived from the log: [`Self::apply_directory_psbt_fragment`] advances it by one
+    /// per persisted [`MultipartySessionEvent::PlanDirectoryPsbtFragment`]. Invalid
+    /// mailbox frames are skipped without an event and advance this cursor only at runtime.
     pub(crate) directory_read_cursor: usize,
 }
 
@@ -104,14 +106,14 @@ pub struct ReadyToExecutePlan {
     pub(crate) plan: Plan,
     pub(crate) plan_cursor: usize,
     pub(crate) directory_read_cursor: usize,
-    /// Frames newly read this round (those past `directory_read_cursor`).
-    pub(crate) directory_messages: Vec<Vec<u8>>,
+    /// Validated PSBT fragments newly read this round (those past `directory_read_cursor`).
+    pub(crate) directory_psbt_fragments: Vec<Psbt>,
 }
 
 impl Participant<HasPlan> {
-    pub(crate) fn apply_directory_message(
+    pub(crate) fn apply_directory_psbt_fragment(
         mut self,
-        _directory_message: Vec<u8>,
+        _directory_psbt_fragment: Psbt,
     ) -> MultipartySession {
         self.state.directory_read_cursor += 1;
         MultipartySession::ParticipantHasPlan(self)
@@ -142,12 +144,13 @@ impl Participant<HasPlan> {
         )
     }
 
-    /// Process and persist the directory messages that may affect plan re-evaluation.
+    /// Process and persist validated PSBT fragments that may affect plan re-evaluation.
     ///
     /// The shared mailbox is append-only and returned in full, so frames before
-    /// [`HasPlan::directory_read_cursor`] have already been persisted on an
-    /// earlier round and are skipped; only the newly appended frames become
-    /// [`MultipartySessionEvent::PlanDirectoryMessage`] events.
+    /// [`HasPlan::directory_read_cursor`] have already been processed on an
+    /// earlier round and are skipped. Newly appended frames that parse as valid
+    /// PSBT fragments become [`MultipartySessionEvent::PlanDirectoryPsbtFragment`]
+    /// events; invalid frames are skipped without closing the session.
     pub fn process_read_from_directory_response(
         &self,
         body: &[u8],
@@ -168,23 +171,26 @@ impl Participant<HasPlan> {
                 }
             };
 
-        // TODO: future work for pagination. Should not have to read and decrypt all the frames again
-        // let already_read = self.state.directory_read_cursor;
-        // let new_messages: Vec<Vec<u8>> = all_messages.into_iter().skip(already_read).collect();
-        // let directory_read_cursor = already_read + new_messages.len();
+        let already_read = self.state.directory_read_cursor;
+        let mut new_fragments = Vec::new();
+        let mut events = Vec::new();
+        let mut new_frame_count = 0;
 
-        let events: Vec<_> = all_messages
-            .iter()
-            .cloned()
-            .map(MultipartySessionEvent::PlanDirectoryMessage)
-            .collect();
+        for message in all_messages.into_iter().skip(already_read) {
+            new_frame_count += 1;
+            let Ok(fragment) = parse_mailbox_psbt_fragment(&message) else {
+                continue;
+            };
+            events.push(MultipartySessionEvent::PlanDirectoryPsbtFragment(fragment.clone()));
+            new_fragments.push(fragment);
+        }
 
         let ready = Participant {
             state: ReadyToExecutePlan {
                 plan: self.state.plan.clone(),
                 plan_cursor: self.state.plan_cursor,
-                directory_read_cursor: events.len(),
-                directory_messages: all_messages,
+                directory_read_cursor: already_read + new_frame_count,
+                directory_psbt_fragments: new_fragments,
             },
             context: self.context.clone(),
         };
@@ -194,7 +200,7 @@ impl Participant<HasPlan> {
 }
 
 impl Participant<ReadyToExecutePlan> {
-    pub fn directory_messages(&self) -> &[Vec<u8>] { &self.state.directory_messages }
+    pub fn directory_psbt_fragments(&self) -> &[Psbt] { &self.state.directory_psbt_fragments }
 
     pub fn execute_action_from_plan(
         &self,

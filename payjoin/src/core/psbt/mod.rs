@@ -3,8 +3,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-pub(crate) mod merge;
-
 use bitcoin::address::FromScriptError;
 use bitcoin::psbt::Psbt;
 use bitcoin::transaction::InputWeightPrediction;

@@ -52,6 +52,7 @@ where
         // forward only the ones past what the actor has persisted.
         let all: Vec<Psbt> =
             mailbox.read().try_collect().await.map_err(|e| DriverError::Mailbox(Box::new(e)))?;
+        // TODO: the directory really should be the one who does the skipping
         let new: Vec<Psbt> = all.into_iter().skip(persisted).collect();
 
         match send_batch(&batches, new).await {

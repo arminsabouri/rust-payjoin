@@ -50,6 +50,7 @@ where
         if batches.is_closed() {
             return Ok(());
         }
+        // TODO: is there an issue here where malformed fragments are getting re-read again? Should test for this.
         // The adapter (and the directory behind it) already skips to
         // `persisted`, long-polling server-side if nothing new has landed
         // yet, so every fragment returned here is new.

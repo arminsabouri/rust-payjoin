@@ -953,6 +953,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_skip_within_range_returns_immediately_without_waiting() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+
+        // A short timeout: if a skip already covered by stored frames fell
+        // through to wait_v2 instead of returning immediately, this would
+        // time out, since nothing further is ever posted.
+        let db = FilesDb::init(
+            Duration::from_millis(50),
+            dir.path().to_owned(),
+            Duration::from_secs(60 * 60 * 24 * 7),
+        )
+        .await
+        .expect("initializing mailbox database should succeed")
+        .with_append_mailbox();
+
+        let id = ShortId([0u8; 8]);
+        let frame = |b: u8| vec![b; FRAME_SIZE];
+        db.post_v2_payload(&id, frame(0xA0)).await.expect("post").expect("first frame accepted");
+        db.post_v2_payload(&id, frame(0xB1)).await.expect("post").expect("append accepted");
+
+        let res = db.wait_for_v2_payload(&id, 1).await.expect("frame past skip already exists");
+        assert_eq!(&res[..], &frame(0xB1)[..], "only the frame past skip is returned");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_skip_at_frame_count_long_polls_until_append() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+
+        let db = Arc::new(
+            FilesDb::init(
+                Duration::from_secs(5),
+                dir.path().to_owned(),
+                Duration::from_secs(60 * 60 * 24 * 7),
+            )
+            .await
+            .expect("initializing mailbox database should succeed")
+            .with_append_mailbox(),
+        );
+
+        let id = ShortId([0u8; 8]);
+        let frame = |b: u8| vec![b; FRAME_SIZE];
+        db.post_v2_payload(&id, frame(0xA0)).await.expect("post").expect("first frame accepted");
+
+        // skip equals the current frame count: nothing new exists yet, so
+        // this should hold the request open (long-poll) rather than return
+        // the already-seen first frame.
+        let waiter = tokio::spawn({
+            let db = db.clone();
+            async move { db.wait_for_v2_payload(&id, 1).await }
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished(), "should still be long-polling with nothing past skip");
+
+        db.post_v2_payload(&id, frame(0xB1)).await.expect("post").expect("append accepted");
+
+        let res = waiter
+            .await
+            .expect("joining task should succeed")
+            .expect("the append should wake the waiter");
+        assert_eq!(&res[..], &frame(0xB1)[..], "only the newly appended frame is returned");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_v1_wait() -> std::io::Result<()> {
         let dir = tempfile::tempdir()?;
 

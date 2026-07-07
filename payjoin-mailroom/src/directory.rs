@@ -669,6 +669,33 @@ mod tests {
         assert_eq!(bytes.as_ref(), expected.as_slice(), "frames concatenated in append order");
     }
 
+    #[tokio::test]
+    async fn get_mailbox_skip_query_param_pages_past_seen_frames() {
+        let svc = append_test_service().await;
+        let id = valid_short_id_path();
+
+        let frame = |b: u8| vec![b; FRAME_SIZE];
+        for b in [b'A', b'B', b'C'] {
+            svc.post_mailbox(&id, Body::from(frame(b))).await.expect("post");
+        }
+
+        // skip=1 returns only the frames past the first one.
+        let res = svc.get_mailbox(&id, "skip=1").await.expect("get");
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let expected: Vec<u8> =
+            [b'B', b'C'].into_iter().flat_map(|b| vec![b; FRAME_SIZE]).collect();
+        assert_eq!(bytes.as_ref(), expected.as_slice(), "only frames past skip are returned");
+    }
+
+    #[test]
+    fn parse_skip_reads_the_query_param() {
+        assert_eq!(parse_skip("skip=3"), 3);
+        assert_eq!(parse_skip("foo=bar&skip=7"), 7, "finds skip among other params");
+        assert_eq!(parse_skip(""), 0, "missing param defaults to 0");
+        assert_eq!(parse_skip("skip=not-a-number"), 0, "unparsable value defaults to 0");
+    }
+
     // V1 routing
 
     #[tokio::test]

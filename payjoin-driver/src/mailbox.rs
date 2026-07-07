@@ -15,6 +15,6 @@ pub trait CollaborativeMessageSet {
     /// Append one complete message.
     async fn write(&self, message: Self::Message) -> Result<(), Self::Error>;
 
-    /// Read all messages from the beginning in server-determined order.
-    fn read(&self) -> Self::Messages<'_>;
+    /// Read messages past `skip`, in server-determined order.
+    fn read(&self, skip: usize) -> Self::Messages<'_>;
 }

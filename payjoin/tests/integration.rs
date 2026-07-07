@@ -578,7 +578,7 @@ mod integration {
             // order, each carrying its sender's reply key. Plaintexts are
             // zero-padded to a fixed length on encryption, so trim the padding
             // before comparing to the original messages.
-            let (req, ctx) = read_request(&ohttp_keys, &directory, &ohttp_relay, &mailbox)?;
+            let (req, ctx) = read_request(&ohttp_keys, &directory, &ohttp_relay, &mailbox, 0)?;
             let body = send_ohttp_request(&agent, req).await?;
             let messages = process_read_response(&body, ctx, &shared_secret_context)?;
 
@@ -597,7 +597,7 @@ mod integration {
             // A reader the frames were not sealed to recovers nothing from the
             // same mailbox: frames stay confidential under append.
             let stranger = HpkeKeyPair::gen_keypair();
-            let (req, ctx) = read_request(&ohttp_keys, &directory, &ohttp_relay, &mailbox)?;
+            let (req, ctx) = read_request(&ohttp_keys, &directory, &ohttp_relay, &mailbox, 0)?;
             let body = send_ohttp_request(&agent, req).await?;
             assert!(
                 process_read_response(&body, ctx, &stranger)?.is_empty(),

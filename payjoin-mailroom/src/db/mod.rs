@@ -66,10 +66,12 @@ pub trait Db: Clone + Send + Sync + 'static {
         data: Vec<u8>,
     ) -> impl Future<Output = Result<Option<()>, Error<Self::OperationalError>>> + Send;
 
-    /// Read a stored v1 request or v2 payload, waiting if not yet posted.
+    /// Read a stored v1 request or v2 payload past `skip` frames, waiting if
+    /// nothing new has been posted yet.
     fn wait_for_v2_payload(
         &self,
         mailbox_id: &ShortId,
+        skip: usize,
     ) -> impl Future<Output = Result<Arc<Vec<u8>>, Error<Self::OperationalError>>> + Send;
 
     /// Write a v1 response payload.
@@ -90,7 +92,7 @@ pub trait Db: Clone + Send + Sync + 'static {
 #[derive(Clone, Debug)]
 pub enum DbRequest {
     PostV2Payload { mailbox_id: ShortId, payload: Vec<u8> },
-    WaitForV2Payload { mailbox_id: ShortId },
+    WaitForV2Payload { mailbox_id: ShortId, skip: usize },
     PostV1Response { mailbox_id: ShortId, payload: Vec<u8> },
     PostV1RequestAndWaitForResponse { mailbox_id: ShortId, payload: Vec<u8> },
 }
@@ -132,8 +134,9 @@ impl Service<DbRequest> for FilesDbService {
             match request {
                 DbRequest::PostV2Payload { mailbox_id, payload } =>
                     Ok(DbResponse::PostV2Payload(db.post_v2_payload(&mailbox_id, payload).await?)),
-                DbRequest::WaitForV2Payload { mailbox_id } =>
-                    Ok(DbResponse::WaitForV2Payload(db.wait_for_v2_payload(&mailbox_id).await?)),
+                DbRequest::WaitForV2Payload { mailbox_id, skip } => Ok(
+                    DbResponse::WaitForV2Payload(db.wait_for_v2_payload(&mailbox_id, skip).await?),
+                ),
                 DbRequest::PostV1Response { mailbox_id, payload } => {
                     db.post_v1_response(&mailbox_id, payload).await?;
                     Ok(DbResponse::PostV1Response(()))
@@ -187,11 +190,12 @@ impl Db for DbServiceAdapter {
     async fn wait_for_v2_payload(
         &self,
         mailbox_id: &ShortId,
+        skip: usize,
     ) -> Result<Arc<Vec<u8>>, Error<Self::OperationalError>> {
         let response = self
             .inner
             .clone()
-            .oneshot(DbRequest::WaitForV2Payload { mailbox_id: *mailbox_id })
+            .oneshot(DbRequest::WaitForV2Payload { mailbox_id: *mailbox_id, skip })
             .await?;
         match response {
             DbResponse::WaitForV2Payload(result) => Ok(result),
@@ -267,9 +271,10 @@ impl<D: Db> Db for MetricsDb<D> {
     async fn wait_for_v2_payload(
         &self,
         mailbox_id: &ShortId,
+        skip: usize,
     ) -> Result<Arc<Vec<u8>>, Error<Self::OperationalError>> {
         self.metrics.record_short_id(mailbox_id);
-        self.inner.wait_for_v2_payload(mailbox_id).await
+        self.inner.wait_for_v2_payload(mailbox_id, skip).await
     }
 
     async fn post_v1_response(

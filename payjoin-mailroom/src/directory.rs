@@ -259,12 +259,13 @@ impl<D: Db> Service<D> {
         req: Request<Body>,
     ) -> Result<Response<Body>, HandlerError> {
         let path = req.uri().path().to_string();
+        let query = req.uri().query().unwrap_or_default().to_string();
         let (parts, body) = req.into_parts();
         let path_segments: Vec<&str> = path.split('/').collect();
         debug!("handle_v2: {:?}", &path_segments);
         match (parts.method, path_segments.as_slice()) {
             (Method::POST, &["", id]) => self.post_mailbox(id, body).await,
-            (Method::GET, &["", id]) => self.get_mailbox(id).await,
+            (Method::GET, &["", id]) => self.get_mailbox(id, &query).await,
             (Method::PUT, &["", id]) if self.v1.is_some() => self.put_payjoin_v1(id, body).await,
             _ => Ok(not_found()),
         }
@@ -290,12 +291,13 @@ impl<D: Db> Service<D> {
         }
     }
 
-    /// Read the entire mailbox
-    async fn get_mailbox(&self, id: &str) -> Result<Response<Body>, HandlerError> {
+    /// Read the mailbox past the `skip` frames the caller already has.
+    async fn get_mailbox(&self, id: &str, query: &str) -> Result<Response<Body>, HandlerError> {
         trace!("get_mailbox");
         let id = ShortId::from_str(id)?;
+        let skip = parse_skip(query);
         let timeout_response = Response::builder().status(StatusCode::ACCEPTED).body(empty())?;
-        handle_peek(self.db.wait_for_v2_payload(&id).await, timeout_response)
+        handle_peek(self.db.wait_for_v2_payload(&id, skip).await, timeout_response)
     }
 
     /// Screen a V1 PSBT body against the address blocklist.
@@ -531,6 +533,16 @@ fn not_found() -> Response<Body> {
     res
 }
 
+/// Parse the `skip` frame count from a raw query string, defaulting to 0 for
+/// a missing or unparsable value.
+fn parse_skip(query: &str) -> usize {
+    query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("skip="))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
 fn empty() -> Body { Body::empty() }
 
 fn full<T: Into<Bytes>>(chunk: T) -> Body { Body::from(chunk.into()) }
@@ -647,7 +659,7 @@ mod tests {
         }
 
         // A single GET returns every appended frame, concatenated in order.
-        let res = svc.get_mailbox(&id).await.expect("get");
+        let res = svc.get_mailbox(&id, "").await.expect("get");
         assert_eq!(res.status(), StatusCode::OK);
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(bytes.len(), 3 * FRAME_SIZE, "all three frames returned in one response");

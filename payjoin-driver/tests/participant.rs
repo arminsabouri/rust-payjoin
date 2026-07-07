@@ -40,7 +40,7 @@ impl CollaborativeMessageSet for CountingMailbox {
         Err(NeverError)
     }
 
-    fn read(&self) -> Self::Messages<'_> {
+    fn read(&self, _skip: usize) -> Self::Messages<'_> {
         self.reads.set(self.reads.get() + 1);
         Box::pin(stream::empty())
     }

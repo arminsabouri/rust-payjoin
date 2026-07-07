@@ -314,19 +314,40 @@ impl DbTrait for FilesDb {
     async fn wait_for_v2_payload(
         &self,
         id: &ShortId,
+        skip: usize,
     ) -> Result<Arc<Vec<u8>>, DbError<Self::OperationalError>> {
         let receiver = {
             let mut guard = self.mailboxes.lock().await;
 
-            if let Some(payload) = guard.read_from(id, 0).await? {
+            if let Some(payload) = guard.read_from(id, skip).await? {
                 return Ok(payload);
             } else {
                 guard.wait_v2(id).await?
             }
         };
 
+        // For a V2 append, the oneshot only carries the newly appended frame,
+        // which isn't necessarily the slice this caller's `skip` wants (and
+        // other callers may share this same receiver with a different
+        // `skip`), so re-read from disk once woken. V1 has no framing/skip
+        // concept and its payload is take()n once for data minimization, so
+        // trust the oneshot directly there instead of re-reading a payload
+        // that's already gone. `wait_v2` only registers a waiter when no V1
+        // entry exists for `id`, so a V1 entry present on wake means this
+        // wait was satisfied by the V1 path.
         let ret = match tokio::time::timeout(self.timeout, receiver).await {
-            Ok(payload) => Ok((payload.expect("receiver must not fail")).clone()),
+            Ok(woken) => {
+                let woken = woken.expect("receiver must not fail");
+                let mut guard = self.mailboxes.lock().await;
+                if guard.pending_v1.contains_key(id) {
+                    Ok(woken)
+                } else {
+                    match guard.read_from(id, skip).await? {
+                        Some(payload) => Ok(payload),
+                        None => Ok(woken),
+                    }
+                }
+            }
             Err(elapsed) => Err(DbError::Timeout(elapsed)),
         };
 
@@ -865,7 +886,7 @@ mod tests {
             .expect("posting payload should succeed")
             .expect("contents should be accepted");
 
-        let res = db.wait_for_v2_payload(&id).await.expect("waiting for payload should succeed");
+        let res = db.wait_for_v2_payload(&id, 0).await.expect("waiting for payload should succeed");
         assert_eq!(&res[..], contents, "posted payload should be retrievable");
 
         Ok(())
@@ -886,18 +907,18 @@ mod tests {
         let id = ShortId([0u8; 8]);
         let contents = b"foo bar";
 
-        match db.wait_for_v2_payload(&id).await {
+        match db.wait_for_v2_payload(&id, 0).await {
             Err(DbError::Timeout(_)) => {}
             res => panic!("expected timeout, got {res:?}"),
         }
 
         let read_task1 = tokio::spawn({
             let db = db.clone();
-            async move { db.wait_for_v2_payload(&id).await }
+            async move { db.wait_for_v2_payload(&id, 0).await }
         });
         let read_task2 = tokio::spawn({
             let db = db.clone();
-            async move { db.wait_for_v2_payload(&id).await }
+            async move { db.wait_for_v2_payload(&id, 0).await }
         });
 
         db.post_v2_payload(&id, contents.to_vec())
@@ -925,7 +946,7 @@ mod tests {
             "duplicate POST should be rejected"
         );
 
-        let res = db.wait_for_v2_payload(&id).await.expect("reading payload should succeed");
+        let res = db.wait_for_v2_payload(&id, 0).await.expect("reading payload should succeed");
         assert_eq!(&res[..], contents, "posted payload should be retrievable");
 
         Ok(())
@@ -952,7 +973,7 @@ mod tests {
             async move { db.post_v1_request_and_wait_for_response(&id, b"request".to_vec()).await }
         });
 
-        let res = db.wait_for_v2_payload(&id).await.expect("reading payload should succeed");
+        let res = db.wait_for_v2_payload(&id, 0).await.expect("reading payload should succeed");
         assert_eq!(&res[..], b"request", "in flight v1 request should be retrievable");
 
         assert!(
@@ -1010,12 +1031,12 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         // First read should return the payload
-        let res = db.wait_for_v2_payload(&id).await.expect("first read should succeed");
+        let res = db.wait_for_v2_payload(&id, 0).await.expect("first read should succeed");
         assert_eq!(&res[..], b"request", "first read should return the payload");
 
         // Subsequent reads should not return the plaintext payload again.
         assert!(
-            matches!(db.wait_for_v2_payload(&id).await, Err(DbError::AlreadyRead)),
+            matches!(db.wait_for_v2_payload(&id, 0).await, Err(DbError::AlreadyRead)),
             "subsequent reads should indicate the payload was already consumed"
         );
 
@@ -1076,7 +1097,7 @@ mod tests {
         // Pending v2 waiter that times out should be cleaned up by prune
         let read_task1 = tokio::spawn({
             let db = db.clone();
-            async move { db.wait_for_v2_payload(&id).await }
+            async move { db.wait_for_v2_payload(&id, 0).await }
         });
 
         tokio::time::sleep(Duration::from_millis(1)).await;
@@ -1132,7 +1153,7 @@ mod tests {
             Err(DbError::OverCapacity)
         ));
 
-        assert!(matches!(db.wait_for_v2_payload(&id).await, Err(DbError::OverCapacity)));
+        assert!(matches!(db.wait_for_v2_payload(&id, 0).await, Err(DbError::OverCapacity)));
     }
 
     #[tokio::test]
@@ -1205,7 +1226,7 @@ mod tests {
         for i in 1..=3 {
             let db = db.clone();
             tokio::spawn(async move {
-                let _ = db.wait_for_v2_payload(&ShortId([i; 8])).await;
+                let _ = db.wait_for_v2_payload(&ShortId([i; 8]), 0).await;
             });
         }
 

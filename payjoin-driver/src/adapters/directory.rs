@@ -70,11 +70,12 @@ impl CollaborativeMessageSet for DirectoryMailbox {
         Ok(())
     }
 
-    fn read(&self) -> Self::Messages<'_> {
-        // Clone into the stream so it is self-contained (the directory returns
-        // the whole append-only mailbox in one GET; we decrypt, parse, and yield
-        // each valid fragment — invalid frames are dropped here, not by the
-        // state machine).
+    fn read(&self, skip: usize) -> Self::Messages<'_> {
+        // Clone into the stream so it is self-contained (the directory
+        // returns only the frames past `skip` in one GET, long-polling
+        // server-side if there's nothing new yet; we decrypt, parse, and
+        // yield each valid fragment — invalid frames are dropped here, not by
+        // the state machine).
         let this = self.clone();
         let fetch = async move {
             let (request, ohttp_ctx) = read_request(
@@ -82,6 +83,7 @@ impl CollaborativeMessageSet for DirectoryMailbox {
                 &this.coords.directory,
                 this.ohttp_relay.as_str(),
                 &this.coords.mailbox_id,
+                skip,
             )?;
             let body = this.post(request).await?;
             let frames = process_read_response(&body, ohttp_ctx, &this.coords.shared_keypair)?;

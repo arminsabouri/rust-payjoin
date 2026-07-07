@@ -2,10 +2,11 @@
 //!
 //! A mailbox is addressed by a [`ShortId`] and holds a sequence of fixed-size
 //! HPKE-encrypted frames. [`append_request`] encrypts a message and builds the
-//! request to append it; [`read_request`] reads the whole mailbox and
-//! [`process_read_response`] decrypts the frames addressed to the reader. The
-//! caller supplies the [`ShortId`] and the HPKE keys, and sends each returned
-//! [`Request`] with its own HTTP client.
+//! request to append it; [`read_request`] reads the mailbox past a frame
+//! count the caller already has (the directory long-polls if there's nothing
+//! new yet) and [`process_read_response`] decrypts the frames addressed to
+//! the reader. The caller supplies the [`ShortId`] and the HPKE keys, and
+//! sends each returned [`Request`] with its own HTTP client.
 
 use crate::directory::{ShortId, PADDED_MESSAGE_BYTES};
 use crate::hpke::{decrypt_message_a, encrypt_message_a, HpkeError};
@@ -44,14 +45,17 @@ pub fn process_append_response(res: &[u8], ctx: ohttp::ClientResponse) -> Result
     process_post_res(res, ctx).map_err(MailboxError::from)
 }
 
-/// Build the request that reads the entire `mailbox`.
+/// Build the request that reads `mailbox` past the `skip` frames the caller
+/// already has.
 pub fn read_request(
     ohttp_keys: &OhttpKeys,
     directory: &Url,
     ohttp_relay: impl IntoUrl,
     mailbox: &ShortId,
+    skip: usize,
 ) -> Result<(Request, ohttp::ClientResponse), MailboxError> {
-    let target = mailbox_endpoint(directory, mailbox);
+    let mut target = mailbox_endpoint(directory, mailbox);
+    target.query_pairs_mut().append_pair("skip", &skip.to_string());
     let (body, ctx) = ohttp_encapsulate(&ohttp_keys.0, "GET", target.as_str(), None)?;
     let request = Request::new_v2(&relay_url(ohttp_relay, directory)?, &body);
     Ok((request, ctx))

@@ -1,14 +1,16 @@
 //! The participant network task: a dumb reader of the shared mailbox.
 //!
 //! It has no state machine and no persister. It reads the mailbox (the adapter
-//! decrypts *and parses* frames into [`Psbt`] fragments), then forwards only the
-//! fragments the actor has not yet persisted. To know that boundary it asks the
-//! actor over a per-batch oneshot: the actor replies with the number of
-//! fragments now persisted, which the network task uses to slice the next read.
+//! decrypts *and parses* frames into [`Psbt`] fragments) past the actor's
+//! persisted count, so it only ever forwards fragments the actor has not yet
+//! seen. To know that boundary it asks the actor over a per-batch oneshot: the
+//! actor replies with the number of fragments now persisted, which the
+//! network task uses as the cursor for the next read.
 //!
-//! Each read is one network round-trip, so the loop is naturally paced without a
-//! timer and stays portable (FFI, WASM). It stops when the actor drops the
-//! channel (plan complete) or a read fails.
+//! The read blocks server-side (a long poll) until a fragment past the cursor
+//! exists, so the loop is naturally paced without a client-side timer and
+//! stays portable (FFI, WASM). It stops when the actor drops the channel
+//! (plan complete) or a read fails.
 
 use futures::channel::mpsc::UnboundedSender;
 use futures::channel::oneshot;
@@ -48,12 +50,14 @@ where
         if batches.is_closed() {
             return Ok(());
         }
-        // The adapter returns the whole append-only mailbox as parsed fragments;
-        // forward only the ones past what the actor has persisted.
-        let all: Vec<Psbt> =
-            mailbox.read().try_collect().await.map_err(|e| DriverError::Mailbox(Box::new(e)))?;
-        // TODO: the directory really should be the one who does the skipping
-        let new: Vec<Psbt> = all.into_iter().skip(persisted).collect();
+        // The adapter (and the directory behind it) already skips to
+        // `persisted`, long-polling server-side if nothing new has landed
+        // yet, so every fragment returned here is new.
+        let new: Vec<Psbt> = mailbox
+            .read(persisted)
+            .try_collect()
+            .await
+            .map_err(|e| DriverError::Mailbox(Box::new(e)))?;
 
         match send_batch(&batches, new).await {
             Some(count) => persisted = count,

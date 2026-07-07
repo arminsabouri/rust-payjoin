@@ -23,11 +23,22 @@ const DEFAULT_CAPACITY: usize = 1 << (1 + 12 + 8);
 
 /// Size in bytes of one v2 mailbox frame: the HPKE-padded ciphertext length.
 ///
-/// The directory stores append-only mailboxes as opaque concatenated frames and
-/// doesn't slice them, so this is currently only needed by tests. It stays tied
-/// to the directory's `PADDED_MESSAGE_BYTES` as the single source of truth.
-#[cfg(test)]
+/// The directory stores append-only mailboxes as opaque concatenated frames.
+/// It stays tied to the directory's `PADDED_MESSAGE_BYTES` as the single
+/// source of truth.
 pub(crate) const FRAME_SIZE: usize = payjoin::directory::PADDED_MESSAGE_BYTES;
+
+/// Slice `data` to the frames past `skip`, or `None` if there are none yet.
+///
+/// `skip` is a frame count, not a byte offset — the caller has already seen
+/// the first `skip` frames and wants only what was appended after them.
+fn frames_from(data: &[u8], skip: usize) -> Option<Vec<u8>> {
+    let offset = skip * FRAME_SIZE;
+    if offset >= data.len() {
+        return None;
+    }
+    Some(data[offset..].to_vec())
+}
 
 #[derive(Debug)]
 struct V2WaitMapEntry {
@@ -307,7 +318,7 @@ impl DbTrait for FilesDb {
         let receiver = {
             let mut guard = self.mailboxes.lock().await;
 
-            if let Some(payload) = guard.read(id).await? {
+            if let Some(payload) = guard.read_from(id, 0).await? {
                 return Ok(payload);
             } else {
                 guard.wait_v2(id).await?
@@ -369,7 +380,9 @@ impl DbTrait for FilesDb {
 // number of requests per second is only 25, holding the mutex while waiting for
 // disk and thereby serializing all writes should be fine even without an SSD.
 impl Mailboxes {
-    async fn read(&mut self, id: &ShortId) -> io::Result<Option<Arc<Vec<u8>>>> {
+    /// Read frames past `skip`. V1 requests aren't framed, so `skip` only
+    /// applies to the V2 on-disk path.
+    async fn read_from(&mut self, id: &ShortId, skip: usize) -> io::Result<Option<Arc<Vec<u8>>>> {
         // V1 POST requests are only stored in memory since they are
         // unencrypted. Check this hash table first. Use take() for data
         // minimization — clear the plaintext payload after first read.
@@ -381,7 +394,7 @@ impl Mailboxes {
 
         // V2 requests are stored on disk
         if let Some((_created, payload)) = self.persistent_storage.get(id).await? {
-            return Ok(Some(Arc::new(payload)));
+            return Ok(frames_from(&payload, skip).map(Arc::new));
         }
 
         Ok(None)

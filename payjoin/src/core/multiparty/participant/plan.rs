@@ -91,6 +91,7 @@ fn psbt_v2_output(output: bitcoin::TxOut, unique_id: [u8; 32]) -> psbt_v2::v2::O
     output
 }
 
+// TODO: do we need a diff version of this for WASM target?
 fn new_output_unique_id() -> [u8; 32] {
     let mut unique_id = [0u8; 32];
     thread_rng().fill_bytes(&mut unique_id);

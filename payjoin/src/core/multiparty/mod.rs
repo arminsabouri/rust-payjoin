@@ -19,7 +19,7 @@ pub use participant::{
     parse_mailbox_psbt_fragment, AwaitingParticipantContext, HasPlan, HasSessionParameters,
     Participant, ParticipantAwaitingSessionParameters, ParticipantContext, ParticipantError,
     ParticipantSessionError, PlanExecuted, PlanExecution, PlanExecutionTransition,
-    PlanReadTransition, PsbtFragmentError, SharedMailboxCoordinates,
+    PlanPsbtAccumulator, PlanReadTransition, PsbtFragmentError, SharedMailboxCoordinates,
 };
 pub use persist::{
     EventfulTransition, GraduationError, InMemoryMultipartyRegistry,

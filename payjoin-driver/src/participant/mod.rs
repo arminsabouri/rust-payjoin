@@ -64,30 +64,30 @@ where
     P: SessionPersister<SessionEvent = MultipartySessionEvent>,
 {
     while let Some(batch) = batches.next().await {
-        let (session, history) = replay_event_log(persister)?;
-        let has_plan = match session {
-            MultipartySession::ParticipantHasPlan(participant) => participant,
-            MultipartySession::ParticipantPlanExecuted(_) => {
-                let _ = batch.ack.send(history.directory_psbt_fragment_count());
+        let (session, _) = replay_event_log(persister)?;
+        match session {
+            MultipartySession::ParticipantHasPlan(has_plan) => {
+                let persisted_before = has_plan.directory_psbt_fragment_count();
+                if !batch.fragments.is_empty() {
+                    has_plan
+                        .record_fragments(&batch.fragments)
+                        .save(persister)
+                        .map_err(|e| DriverError::Persist(e.to_string()))?;
+                }
+                // Reply with the authoritative persisted count so the network task only
+                // forwards genuinely new fragments next time.
+                let _ = batch.ack.send(persisted_before + batch.fragments.len());
+                re_evaluate_plan(&has_plan, &batch.fragments);
+
+                if post_next_action(mailbox, persister, &has_plan).await? {
+                    return Ok(());
+                }
+            }
+            MultipartySession::ParticipantPlanExecuted(participant) => {
+                let _ = batch.ack.send(participant.directory_psbt_fragment_count());
                 return Ok(());
             }
             _ => return Err(DriverError::UnexpectedState),
-        };
-
-        let persisted_before = history.directory_psbt_fragment_count();
-        if !batch.fragments.is_empty() {
-            has_plan
-                .record_fragments(&batch.fragments)
-                .save(persister)
-                .map_err(|e| DriverError::Persist(e.to_string()))?;
-        }
-        // Reply with the authoritative persisted count so the network task only
-        // forwards genuinely new fragments next time.
-        let _ = batch.ack.send(persisted_before + batch.fragments.len());
-        re_evaluate_plan(&has_plan, &batch.fragments);
-
-        if post_next_action(mailbox, persister, &has_plan).await? {
-            return Ok(());
         }
     }
 

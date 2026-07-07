@@ -1,3 +1,6 @@
+use concurrent_psbt::constructor::{BothModifiable, Constructor, OutputsModifiable};
+use concurrent_psbt::global::GlobalSortExt;
+use concurrent_psbt::sort::{Deterministic, Sorter, Unset};
 use psbt_v2::v2::Psbt;
 use serde::{Deserialize, Serialize};
 
@@ -67,7 +70,7 @@ impl Participant<HasSessionParameters> {
 
     pub(crate) fn apply_with_plan(self, plan: Plan) -> MultipartySession {
         MultipartySession::ParticipantHasPlan(Participant {
-            state: HasPlan { plan, plan_cursor: 0 },
+            state: HasPlan(PlanPsbtAccumulator::new(plan)),
             context: self.context,
         })
     }
@@ -93,32 +96,108 @@ impl Participant<HasSessionParameters> {
         let plan = plan.build();
         NextStateTransition::success(
             MultipartySessionEvent::PlanGenerated(plan.clone()),
-            Participant { state: HasPlan { plan, plan_cursor: 0 }, context: self.context.clone() },
+            Participant {
+                state: HasPlan(PlanPsbtAccumulator::new(plan)),
+                context: self.context.clone(),
+            },
         )
     }
 }
 
+/// PSBT fragments collected while executing a participant plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HasPlan {
+pub struct PlanPsbtAccumulator {
     pub(crate) plan: Plan,
     pub(crate) plan_cursor: usize,
+    pub(crate) directory_psbt_fragments: Vec<Psbt>,
+}
+
+impl PlanPsbtAccumulator {
+    pub(crate) fn new(plan: Plan) -> Self {
+        Self { plan, plan_cursor: 0, directory_psbt_fragments: vec![] }
+    }
+
+    pub(crate) fn into_executed(mut self) -> Self {
+        self.plan_cursor = self.plan.len();
+        self
+    }
+
+    /// PSBT fragments this participant sent to the shared session mailbox.
+    pub fn sent_psbt_fragments(&self) -> impl Iterator<Item = Psbt> + '_ {
+        (0..self.plan_cursor.min(self.plan.len()))
+            .filter_map(|index| self.plan.action(index).map(|action| action.as_psbt_fragment()))
+    }
+
+    /// Validated PSBT fragments read from the shared session mailbox.
+    pub fn directory_psbt_fragments(&self) -> impl Iterator<Item = &Psbt> + '_ {
+        self.directory_psbt_fragments.iter()
+    }
+
+    /// Number of validated PSBT fragments already persisted from the shared session mailbox.
+    pub fn directory_psbt_fragment_count(&self) -> usize { self.directory_psbt_fragments.len() }
+
+    pub fn accumulated_psbt(&self) -> Psbt {
+        let mut psbt = concurrent_psbt::constructor::Creator::new().build();
+        for fragment in self.sent_psbt_fragments() {
+            let parsed = Constructor::<BothModifiable, Unset>::try_from_psbt(fragment).unwrap();
+            // TODO: deal with error
+            psbt = psbt.try_join(parsed).try_unwrap().unwrap();
+        }
+
+        for fragment in self.directory_psbt_fragments() {
+            let parsed = Constructor::<BothModifiable, Unset>::try_from_psbt(fragment.clone())
+                .expect("persisted directory PSBT fragments are validated at intake");
+            // TODO: deal with error
+            psbt = psbt.try_join(parsed).try_unwrap().expect("joining validated PSBT fragments");
+        }
+
+        psbt.into_psbt()
+    }
+
+    pub fn ready_to_sign_psbt(&self) -> Psbt {
+        let mut psbt =
+            Constructor::<OutputsModifiable, Unset>::try_from_psbt(self.accumulated_psbt())
+                .unwrap()
+                .into_inner();
+        // TODO: Update to use actual sort seed.
+        psbt.global.set_sort_seed(vec![0; 32]);
+        let sorter: Sorter<Deterministic> = Sorter::from_unordered_psbt(psbt);
+        sorter.into_ordered_psbt().expect("sort seed to be set")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HasPlan(pub(crate) PlanPsbtAccumulator);
+
+impl std::ops::Deref for HasPlan {
+    type Target = PlanPsbtAccumulator;
+
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+impl std::ops::DerefMut for HasPlan {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+}
+
+impl std::ops::Deref for Participant<HasPlan> {
+    type Target = PlanPsbtAccumulator;
+
+    fn deref(&self) -> &Self::Target { &self.state.0 }
 }
 
 impl Participant<HasPlan> {
     pub(crate) fn apply_directory_psbt_fragment(
-        self,
-        _directory_psbt_fragment: Psbt,
+        mut self,
+        directory_psbt_fragment: Psbt,
     ) -> MultipartySession {
-        // The fragment lives in the event log; its running count is derived from
-        // the log via `SessionHistory::directory_psbt_fragment_count`, so the
-        // state itself carries no read cursor.
+        self.state.directory_psbt_fragments.push(directory_psbt_fragment);
         MultipartySession::ParticipantHasPlan(self)
     }
 
     pub(crate) fn apply_with_plan_cursor(mut self, plan_cursor: usize) -> MultipartySession {
         if plan_cursor >= self.state.plan.len() {
             return MultipartySession::ParticipantPlanExecuted(Participant {
-                state: PlanExecuted {},
+                state: PlanExecuted(self.state.0.clone().into_executed()),
                 context: self.context,
             });
         }
@@ -141,9 +220,6 @@ impl Participant<HasPlan> {
 
     /// The plaintext PSBT fragment to post for the current plan action, or `None`
     /// once every action has been posted.
-    ///
-    /// Pure plan logic — no crypto. The adapter seals and posts the returned
-    /// fragment.
     pub fn next_action_fragment(&self) -> Option<Psbt> {
         self.state.plan.action(self.state.plan_cursor).map(|action| action.as_psbt_fragment())
     }
@@ -154,17 +230,18 @@ impl Participant<HasPlan> {
     /// The mailbox adapter confirms the write, so this only advances the cursor
     /// and emits the [`MultipartySessionEvent::PlanExecuted`] event.
     pub fn record_action_posted(&self) -> PlanExecutionTransition {
-        let plan = self.state.plan.clone();
-        let plan_cursor = self.state.plan_cursor + 1;
+        let mut psbt_accumulator = self.state.0.clone();
+        let plan_cursor = psbt_accumulator.plan_cursor + 1;
+        psbt_accumulator.plan_cursor = plan_cursor;
 
-        let execution = if plan_cursor >= plan.len() {
+        let execution = if plan_cursor >= psbt_accumulator.plan.len() {
             PlanExecution::Executed(Participant {
-                state: PlanExecuted {},
+                state: PlanExecuted(psbt_accumulator.into_executed()),
                 context: self.context.clone(),
             })
         } else {
             PlanExecution::NeedsDirectoryRead(Participant {
-                state: HasPlan { plan, plan_cursor },
+                state: HasPlan(psbt_accumulator),
                 context: self.context.clone(),
             })
         };
@@ -179,7 +256,7 @@ impl Participant<HasPlan> {
     ///
     /// The mailbox adapter has already decrypted *and parsed* these fragments,
     /// and the network task forwards only the ones past the persisted count
-    /// (which it learns from [`crate::multiparty::SessionHistory::directory_psbt_fragment_count`]).
+    /// (which it learns from [`HasPlan::directory_psbt_fragment_count`]).
     /// So this simply appends one [`MultipartySessionEvent::PlanDirectoryPsbtFragment`]
     /// per fragment — no positional dedup of raw frames, which is what previously
     /// let an invalid frame cause a valid fragment to be re-recorded.
@@ -218,4 +295,37 @@ pub type PlanExecutionTransition =
     EventfulTransition<MultipartySessionEvent, PlanExecution, ParticipantError>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlanExecuted {}
+pub struct PlanExecuted(pub(crate) PlanPsbtAccumulator);
+
+impl std::ops::Deref for PlanExecuted {
+    type Target = PlanPsbtAccumulator;
+
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+impl std::ops::Deref for Participant<PlanExecuted> {
+    type Target = PlanPsbtAccumulator;
+
+    fn deref(&self) -> &Self::Target { &self.state.0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use concurrent_psbt::constructor::Creator;
+
+    use super::PlanPsbtAccumulator;
+    use crate::multiparty::participant::plan::PlanBuilder;
+
+    #[test]
+    fn plan_psbt_accumulator_returns_directory_psbt_fragments_in_order() {
+        let first = Creator::new().build().into_psbt();
+        let second = Creator::new().build().into_psbt();
+        let mut accumulator = PlanPsbtAccumulator::new(PlanBuilder::new().build());
+        accumulator.directory_psbt_fragments = vec![first.clone(), second.clone()];
+
+        let fragments: Vec<_> = accumulator.directory_psbt_fragments().cloned().collect();
+
+        assert_eq!(fragments, vec![first, second]);
+        assert_eq!(accumulator.directory_psbt_fragment_count(), 2);
+    }
+}

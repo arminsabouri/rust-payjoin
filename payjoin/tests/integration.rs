@@ -485,11 +485,11 @@ mod integration {
             participant_execute_plan(&agent, &creator_persister, &ohttp_relay).await?;
             participant_execute_plan(&agent, &participant_a_persister, &ohttp_relay).await?;
             participant_execute_plan(&agent, &participant_b_persister, &ohttp_relay).await?;
-            let (_, participant_b_history) = replay_event_log(&participant_b_persister)?;
-            println!(
-                "participant B directory PSBT: {:#?}",
-                participant_b_history.accumulated_psbt()
-            );
+            let (session, _) = replay_event_log(&participant_b_persister)?;
+            let _ = match session {
+                MultipartySession::ParticipantPlanExecuted(participant) => participant,
+                _ => panic!("participant B should have finished executing its plan"),
+            };
 
             for (pre_graduation, post_graduation) in [
                 (responder_a_persister, participant_a_persister),

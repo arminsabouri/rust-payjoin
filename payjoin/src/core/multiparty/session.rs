@@ -1,9 +1,7 @@
-//! Multiparty session events, state, replay, and history.
+//! Multiparty session events, state, and replay.
 
 use core::fmt;
 
-use concurrent_psbt::constructor::{BothModifiable, Constructor};
-use concurrent_psbt::sort::Unset;
 use psbt_v2::v2::Psbt;
 use serde::{Deserialize, Serialize};
 
@@ -315,6 +313,7 @@ pub enum SessionStatus {
 /// A collection of events from a multiparty session, from [`replay_event_log`].
 #[derive(Debug, Clone)]
 pub struct SessionHistory {
+    #[allow(dead_code)]
     events: Vec<MultipartySessionEvent>,
 }
 
@@ -322,102 +321,5 @@ impl SessionHistory {
     pub(crate) fn new(events: Vec<MultipartySessionEvent>) -> Self {
         debug_assert!(!events.is_empty(), "Session event log must contain at least one event");
         Self { events }
-    }
-
-    /// Validated PSBT fragments read from the shared session mailbox.
-    pub fn directory_psbt_fragments(&self) -> impl Iterator<Item = &Psbt> {
-        self.events.iter().filter_map(|event| match event {
-            MultipartySessionEvent::PlanDirectoryPsbtFragment(fragment) => Some(fragment),
-            _ => None,
-        })
-    }
-
-    /// Number of validated PSBT fragments already persisted from the shared session mailbox.
-    pub fn directory_psbt_fragment_count(&self) -> usize {
-        self.events
-            .iter()
-            .filter(|event| matches!(event, MultipartySessionEvent::PlanDirectoryPsbtFragment(_)))
-            .count()
-    }
-
-    /// PSBT fragments this participant sent to the shared session mailbox.
-    pub fn sent_psbt_fragments(&self) -> Vec<Psbt> {
-        let mut plan = None;
-        let mut sent_cursor = 0;
-        let mut fragments = Vec::new();
-
-        for event in &self.events {
-            match event {
-                MultipartySessionEvent::PlanGenerated(next_plan) => {
-                    plan = Some(next_plan);
-                    sent_cursor = 0;
-                }
-                MultipartySessionEvent::PlanExecuted(plan_cursor) =>
-                    if let Some(plan) = plan {
-                        let next_cursor = (*plan_cursor).min(plan.len());
-                        for index in sent_cursor..next_cursor {
-                            if let Some(action) = plan.action(index) {
-                                fragments.push(action.as_psbt_fragment());
-                            }
-                        }
-                        sent_cursor = next_cursor;
-                    },
-                _ => {}
-            }
-        }
-
-        fragments
-    }
-
-    pub fn accumulated_psbt(&self) -> Psbt {
-        let mut psbt = concurrent_psbt::constructor::Creator::new().build();
-        // First add our own psbt fragments
-        for fragment in self.sent_psbt_fragments() {
-            let parsed =
-                Constructor::<BothModifiable, Unset>::try_from_psbt(
-                    fragment,
-                )
-                .unwrap();
-            // TODO: deal with error
-            psbt = psbt.try_join(parsed).try_unwrap().unwrap();
-        }
-
-        for fragment in self.directory_psbt_fragments() {
-            let parsed =
-                Constructor::<BothModifiable, Unset>::try_from_psbt(
-                    fragment.clone(),
-                )
-                .expect("persisted directory PSBT fragments are validated at intake");
-            // TODO: deal with error
-            psbt = psbt.try_join(parsed).try_unwrap().expect("joining validated PSBT fragments");
-        }
-
-        psbt.into_psbt()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use concurrent_psbt::constructor::Creator;
-    use psbt_v2::v2::Psbt;
-
-    use super::{MultipartySessionEvent, SessionHistory};
-
-    #[test]
-    fn session_history_returns_directory_psbt_fragments_in_order() {
-        let first = Creator::new().build().into_psbt();
-        let second = Creator::new().build().into_psbt();
-        let history = SessionHistory {
-            events: vec![
-                MultipartySessionEvent::ResponderSentReplyKey,
-                MultipartySessionEvent::PlanDirectoryPsbtFragment(first.clone()),
-                MultipartySessionEvent::PlanDirectoryPsbtFragment(second.clone()),
-            ],
-        };
-
-        let fragments: Vec<Psbt> = history.directory_psbt_fragments().cloned().collect();
-
-        assert_eq!(fragments, vec![first, second]);
-        assert_eq!(history.directory_psbt_fragment_count(), 2);
     }
 }

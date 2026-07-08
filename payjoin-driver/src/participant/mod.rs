@@ -1,98 +1,95 @@
-//! Drivers for a multiparty payjoin participant.
+//! Driver for a multiparty payjoin participant.
 //!
-//! Two entities run concurrently over the same [`CollaborativeMessageSet`],
-//! wired by an mpsc channel — but only one of them touches the state machine:
+//! A single task owns the state machine and is the *sole* writer to the
+//! persister. It is expressed as a stream of driver steps
+//! ([`stream::try_unfold`]) rather than an inner loop: each step replays the
+//! log, persists the fragments read by the previous step, re-evaluates the plan
+//! in their light, posts the next action, then long-polls the mailbox for the
+//! fragments the *next* step will persist. The stream ends when the plan is
+//! fully executed.
 //!
-//! - [`network::run_network_task`] — a **dumb reader**: it reads the shared
-//!   mailbox (the adapter decrypts and parses frames into fragments) and forwards
-//!   the new ones. No persister, no protocol state.
-//! - [`run_actor`] — the **actor**: the *sole* owner of the state machine and the
-//!   *sole* writer to the persister. It persists the forwarded fragments, replies
-//!   with the authoritative persisted count, (stub) re-evaluates the plan, and
-//!   posts its own actions.
-//!
-//! [`execute_plan`] wires the channel and runs both to completion.
+//! Reading and processing happen in the same step, so there is one writer, no
+//! channel, and no cross-task cursor to keep in sync. The read blocks
+//! server-side (a long poll) until a fragment past the persisted cursor exists,
+//! so the driver is naturally paced without a client-side timer and stays
+//! portable (FFI, WASM).
 
-pub mod network;
-
-use futures::channel::mpsc::{self, UnboundedReceiver};
-use futures::StreamExt;
+use futures::{future, stream, TryStreamExt};
 use payjoin::multiparty::{
     replay_event_log, HasPlan, MultipartySession, MultipartySessionEvent, Participant,
     PlanExecution, Psbt,
 };
 use payjoin::persist::SessionPersister;
 
-use self::network::{run_network_task, FragmentBatch};
 use crate::error::DriverError;
 use crate::mailbox::CollaborativeMessageSet;
 
-/// Drive a participant's plan to completion: run the dumb
-/// [`network::run_network_task`] reader and the [`run_actor`] state-machine
-/// driver concurrently over `mailbox`, persisting to `persister`.
+/// Drive a participant's plan to completion.
+///
+/// Runs the participant driver as a stream of steps over `mailbox`, persisting
+/// to `persister`, until the plan is fully executed.
 pub async fn execute_plan<M, P>(mailbox: &M, persister: &P) -> Result<(), DriverError>
 where
     M: CollaborativeMessageSet<Message = Psbt>,
     P: SessionPersister<SessionEvent = MultipartySessionEvent>,
 {
-    let (batches_tx, batches_rx) = mpsc::unbounded();
-
-    let (actor_result, network_result) = futures::future::join(
-        run_actor(mailbox, persister, batches_rx),
-        run_network_task(mailbox, batches_tx),
-    )
-    .await;
-
-    actor_result?;
-    network_result?;
-    Ok(())
+    // Each step carries the fragments read by the previous step. The seed is
+    // empty, so the first action posts without a spurious initial read.
+    let steps = stream::try_unfold(Vec::<Psbt>::new(), move |pending| async move {
+        drive_step(mailbox, persister, pending).await
+    });
+    steps.try_for_each(|()| future::ready(Ok(()))).await
 }
 
-/// Run the actor: the sole state-machine driver and persister writer.
+/// Run one step of the participant driver.
 ///
-/// For each batch from the network task it replays the log, persists the new
-/// fragments, replies with the authoritative persisted count, (stub)
-/// re-evaluates, then posts its next action. When the network task ends it posts
-/// any remaining actions without waiting.
-pub async fn run_actor<M, P>(
+/// Persists `pending` (the fragments the previous step read), re-evaluates the
+/// plan, and posts the next action. Returns `None` once the plan is fully
+/// executed; otherwise `Some(((), next))` where `next` are the fragments the
+/// following step will persist, long-polled past the persisted cursor.
+async fn drive_step<M, P>(
     mailbox: &M,
     persister: &P,
-    mut batches: UnboundedReceiver<FragmentBatch>,
-) -> Result<(), DriverError>
+    pending: Vec<Psbt>,
+) -> Result<Option<((), Vec<Psbt>)>, DriverError>
 where
     M: CollaborativeMessageSet<Message = Psbt>,
     P: SessionPersister<SessionEvent = MultipartySessionEvent>,
 {
-    while let Some(batch) = batches.next().await {
-        let (session, _) = replay_event_log(persister)?;
-        match session {
-            MultipartySession::ParticipantHasPlan(has_plan) => {
-                let persisted_before = has_plan.directory_psbt_fragment_count();
-                if !batch.fragments.is_empty() {
-                    has_plan
-                        .record_fragments(&batch.fragments)
-                        .save(persister)
-                        .map_err(|e| DriverError::Persist(e.to_string()))?;
-                }
-                // Reply with the authoritative persisted count so the network task only
-                // forwards genuinely new fragments next time.
-                let _ = batch.ack.send(persisted_before + batch.fragments.len());
-                re_evaluate_plan(&has_plan, &batch.fragments);
+    let (session, _) = replay_event_log(persister)?;
+    let has_plan = match session {
+        MultipartySession::ParticipantHasPlan(has_plan) => has_plan,
+        MultipartySession::ParticipantPlanExecuted(_) => return Ok(None),
+        _ => return Err(DriverError::UnexpectedState),
+    };
 
-                if post_next_action(mailbox, persister, &has_plan).await? {
-                    return Ok(());
-                }
-            }
-            MultipartySession::ParticipantPlanExecuted(participant) => {
-                let _ = batch.ack.send(participant.directory_psbt_fragment_count());
-                return Ok(());
-            }
-            _ => return Err(DriverError::UnexpectedState),
-        }
+    // Persist the fragments read by the previous step, then re-evaluate the plan
+    // in their light. The persisted cursor for the next read advances by exactly
+    // the fragments we just recorded.
+    let persisted_before = has_plan.directory_psbt_fragment_count();
+    if !pending.is_empty() {
+        has_plan
+            .record_fragments(&pending)
+            .save(persister)
+            .map_err(|e| DriverError::Persist(e.to_string()))?;
+    }
+    let persisted = persisted_before + pending.len();
+    re_evaluate_plan(&has_plan, &pending);
+
+    // Post the next action. If that completes the plan, the stream ends.
+    if post_next_action(mailbox, persister, &has_plan).await? {
+        return Ok(None);
     }
 
-    // Network task ended: finish posting any remaining actions.
-    post_remaining_actions(mailbox, persister).await
+    // The plan needs more fragments from the directory. Long-poll past what we
+    // have persisted; the read blocks server-side until something new lands.
+    let next: Vec<Psbt> = mailbox
+        .read(persisted)
+        .try_collect()
+        .await
+        .map_err(|e| DriverError::Mailbox(Box::new(e)))?;
+
+    Ok(Some(((), next)))
 }
 
 /// Post the current plan action, if any. Returns `true` once the plan is fully
@@ -120,29 +117,10 @@ where
     }
 }
 
-/// Post remaining actions to completion without waiting on the network task.
-async fn post_remaining_actions<M, P>(mailbox: &M, persister: &P) -> Result<(), DriverError>
-where
-    M: CollaborativeMessageSet<Message = Psbt>,
-    P: SessionPersister<SessionEvent = MultipartySessionEvent>,
-{
-    loop {
-        let (session, _) = replay_event_log(persister)?;
-        let has_plan = match session {
-            MultipartySession::ParticipantHasPlan(participant) => participant,
-            MultipartySession::ParticipantPlanExecuted(_) => return Ok(()),
-            _ => return Err(DriverError::UnexpectedState),
-        };
-        if post_next_action(mailbox, persister, &has_plan).await? {
-            return Ok(());
-        }
-    }
-}
-
 /// Re-evaluate (prune / re-choose) the plan in light of newly read fragments.
 ///
 /// STUB: currently a no-op. When plan re-evaluation lands, this is where the
-/// actor will inspect the fragments and decide whether to switch to a cheaper /
+/// driver will inspect the fragments and decide whether to switch to a cheaper /
 /// more private branch of its plan.
 fn re_evaluate_plan(_has_plan: &Participant<HasPlan>, _fragments: &[Psbt]) {
     // Intentionally empty. See the doc comment above.

@@ -233,7 +233,7 @@ impl Participant<HasPlan> {
     /// same batch as a [`ParticipantCommand::Persist`] is computed from the
     /// *pre-persist* `self`. That is sound only for [`ParticipantEvent::FragmentsRead`],
     /// because recording directory fragments does not touch `plan_cursor`
-    /// (see [`apply_directory_psbt_fragment`](Self::apply_directory_psbt_fragment)),
+    /// (see `apply_directory_psbt_fragment`),
     /// so [`next_action_fragment`](Self::next_action_fragment) reads the same
     /// value before and after the save. [`ParticipantEvent::ActionPosted`] is
     /// therefore persist-only: it advances the cursor, so re-broadcasting from
@@ -306,9 +306,11 @@ impl Participant<HasPlan> {
     /// Record that the current action's fragment was posted to the shared
     /// mailbox, advancing the plan.
     ///
-    /// The mailbox adapter confirms the write, so this only advances the cursor
-    /// and emits the [`MultipartySessionEvent::PlanExecuted`] event.
-    pub fn record_action_posted(&self) -> PlanExecutionTransition {
+    /// Internal helper behind [`step`](Self::step)'s handling of
+    /// [`ParticipantEvent::ActionPosted`]: the driver has confirmed the write, so
+    /// this only advances the cursor and emits the
+    /// [`MultipartySessionEvent::PlanExecuted`] event.
+    pub(crate) fn record_action_posted(&self) -> PlanExecutionTransition {
         let mut psbt_accumulator = self.state.0.clone();
         let plan_cursor = psbt_accumulator.plan_cursor + 1;
         psbt_accumulator.plan_cursor = plan_cursor;
@@ -333,13 +335,16 @@ impl Participant<HasPlan> {
 
     /// Persist validated PSBT fragments read from the shared mailbox.
     ///
-    /// The mailbox adapter has already decrypted *and parsed* these fragments,
-    /// and the network task forwards only the ones past the persisted count
-    /// (which it learns from [`HasPlan::directory_psbt_fragment_count`]).
-    /// So this simply appends one [`MultipartySessionEvent::PlanDirectoryPsbtFragment`]
-    /// per fragment — no positional dedup of raw frames, which is what previously
-    /// let an invalid frame cause a valid fragment to be re-recorded.
-    pub fn record_fragments(&self, fragments: &[Psbt]) -> PlanReadTransition {
+    /// Internal helper behind [`step`](Self::step)'s handling of
+    /// [`ParticipantEvent::FragmentsRead`]: the mailbox adapter has already
+    /// decrypted *and parsed* these fragments, and the driver reads only the ones
+    /// past the persisted count (which it learns from
+    /// [`directory_psbt_fragment_count`](PlanPsbtAccumulator::directory_psbt_fragment_count)).
+    /// So this simply appends one
+    /// [`MultipartySessionEvent::PlanDirectoryPsbtFragment`] per fragment — no
+    /// positional dedup of raw frames, which is what previously let an invalid
+    /// frame cause a valid fragment to be re-recorded.
+    pub(crate) fn record_fragments(&self, fragments: &[Psbt]) -> PlanReadTransition {
         let events = fragments
             .iter()
             .cloned()

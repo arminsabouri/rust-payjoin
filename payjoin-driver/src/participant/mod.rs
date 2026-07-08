@@ -61,8 +61,11 @@ where
         // driver is paced without a client-side timer. `skip` is a parsed-fragment
         // count; the mailbox skips whole frames, so a dropped invalid frame makes
         // the two drift. That is a pre-existing bug, preserved here on purpose.
-        let fragments: Vec<Psbt> =
-            mailbox.read(skip).try_collect().await.map_err(|e| DriverError::Mailbox(Box::new(e)))?;
+        let fragments: Vec<Psbt> = mailbox
+            .read(skip)
+            .try_collect()
+            .await
+            .map_err(|e| DriverError::Mailbox(Box::new(e)))?;
         run_commands(mailbox, persister, has_plan, ParticipantEvent::FragmentsRead(fragments))
             .await?;
         Ok(Some(((), ())))
@@ -109,10 +112,7 @@ where
     while let Some(command) = queue.pop_front() {
         match command {
             ParticipantCommand::Persist(transition) => {
-                match transition
-                    .save(persister)
-                    .map_err(|e| DriverError::Persist(e.to_string()))?
-                {
+                match transition.save(persister).map_err(|e| DriverError::Persist(e.to_string()))? {
                     MultipartySession::ParticipantHasPlan(has_plan) => current = Some(has_plan),
                     MultipartySession::ParticipantPlanExecuted(_) => current = None,
                     _ => return Err(DriverError::UnexpectedState),

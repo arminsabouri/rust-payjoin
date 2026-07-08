@@ -158,14 +158,10 @@ impl std::ops::Deref for Participant<HasPlan> {
 /// An input to the participant plan state machine.
 ///
 /// The state machine is sans-io: it never performs transport itself, so an event
-/// only ever reports either that the driver has started, or that some I/O the
-/// driver performed on the machine's behalf has completed.
+/// only ever reports that some I/O the driver performed on the machine's behalf
+/// has completed.
 #[derive(Debug, Clone)]
 pub enum ParticipantEvent {
-    /// The driver began executing this plan. Kicks off the first action; there is
-    /// no I/O and nothing to persist before it, so this is the one event the
-    /// driver raises on its own rather than in response to a completed action.
-    Started,
     /// The fragment we last broadcast was durably written to the shared mailbox.
     ActionPosted,
     /// The validated PSBT fragments read from the shared mailbox this round, past
@@ -208,17 +204,8 @@ impl Participant<HasPlan> {
     /// value before and after the save. [`ParticipantEvent::ActionPosted`] is
     /// therefore persist-only: it advances the cursor, so re-broadcasting from
     /// pre-persist state would post a stale action.
-    /// [`ParticipantEvent::Started`] is broadcast-only: it persists nothing, it
-    /// just posts the action at the current cursor.
     pub fn step(&self, event: ParticipantEvent) -> ParticipantStep {
         match event {
-            ParticipantEvent::Started => {
-                let mut commands = vec![];
-                if let Some(next) = self.next_action_fragment() {
-                    commands.push(ParticipantCommand::Broadcast(next));
-                }
-                ParticipantStep { commands }
-            }
             ParticipantEvent::ActionPosted => {
                 let persist = self.record_action_posted().map_outcome(MultipartySession::from);
                 ParticipantStep { commands: vec![ParticipantCommand::Persist(persist)] }
@@ -475,15 +462,19 @@ mod tests {
     }
 
     #[test]
-    fn step_started_broadcasts_the_first_action_and_persists_nothing() {
+    fn step_empty_fragments_read_broadcasts_the_first_action() {
         let (_persister, has_plan) = seeded(2, 0);
         let expected_broadcast = has_plan.next_action_fragment().expect("action at cursor 0");
 
-        let step = has_plan.step(ParticipantEvent::Started);
+        let step = has_plan.step(ParticipantEvent::FragmentsRead(vec![]));
 
-        // Started is broadcast-only: post the current action, persist nothing.
-        assert_eq!(step.commands.len(), 1);
-        match step.commands.into_iter().next() {
+        assert_eq!(step.commands.len(), 2);
+        let mut commands = step.commands.into_iter();
+        match commands.next() {
+            Some(ParticipantCommand::Persist(_)) => {}
+            other => panic!("expected Persist first, got {}", describe(other.as_ref())),
+        }
+        match commands.next() {
             Some(ParticipantCommand::Broadcast(fragment)) =>
                 assert_eq!(fragment, expected_broadcast),
             other => panic!("expected Broadcast, got {}", describe(other.as_ref())),

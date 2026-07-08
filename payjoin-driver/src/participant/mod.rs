@@ -10,9 +10,7 @@
 //! Every mailbox write originates from a [`ParticipantCommand::Broadcast`], and
 //! the driver processes the write's completion back through the state machine as
 //! a [`ParticipantEvent::ActionPosted`], which hands back the state transition to
-//! persist. Nothing bypasses `step`: even the first action is a
-//! [`ParticipantEvent::Started`] command, so the driver never writes on its own
-//! initiative.
+//! persist. Nothing bypasses `step`.
 //!
 //! The loop consumes [`CollaborativeMessageSet::read`] as a stream of read rounds:
 //! each poll long-polls when nothing is in flight yet, returning pending while
@@ -34,20 +32,16 @@ use crate::mailbox::CollaborativeMessageSet;
 
 /// Drive a participant's plan to completion.
 ///
-/// Bootstraps by posting the first action, then runs read rounds over `mailbox`,
-/// persisting to `persister`, until the plan is fully executed.
+/// Runs read rounds over `mailbox`, persisting to `persister`, until the plan is
+/// fully executed. An empty read round still feeds `step`, which may broadcast
+/// the next action.
 pub async fn execute_plan<M, P>(mailbox: &M, persister: &P) -> Result<(), DriverError>
 where
     M: CollaborativeMessageSet<Message = Psbt>,
     P: SessionPersister<SessionEvent = MultipartySessionEvent>,
 {
-    // Bootstrap: post the first action. Replaying first means an already-executed
-    // or undriveable session resolves without touching the mailbox. `Started` is
-    // the state machine's kickoff, so even this first write goes through `step`.
-    match load_has_plan(persister)? {
-        None => return Ok(()),
-        Some(has_plan) =>
-            run_commands(mailbox, persister, has_plan, ParticipantEvent::Started).await?,
+    if load_has_plan(persister)?.is_none() {
+        return Ok(());
     }
 
     let mut messages = mailbox.read();

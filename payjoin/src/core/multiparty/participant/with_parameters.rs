@@ -6,13 +6,11 @@ use serde::{Deserialize, Serialize};
 
 use super::plan::PlanBuilder;
 use super::{ParticipantError, Plan};
-use crate::hpke::HpkeKeyPair;
 use crate::multiparty::persist::EventfulTransition;
 use crate::multiparty::session::{MultipartySession, MultipartySessionEvent};
 use crate::multiparty::session_parameters::SessionParameters;
 use crate::persist::NextStateTransition;
 use crate::receive::InputPair;
-use crate::uri::ShortId;
 use crate::{OhttpKeys, Url};
 
 /// Persistent context for a multiparty participant after adopting session parameters.
@@ -21,34 +19,6 @@ pub struct ParticipantContext {
     pub(crate) directory: Url,
     pub ohttp_keys: OhttpKeys,
     pub(crate) session_parameters: SessionParameters,
-}
-
-impl ParticipantContext {
-    fn session_shared_keypair(&self) -> HpkeKeyPair {
-        self.session_parameters.session_shared_keypair()
-    }
-
-    fn session_shared_mailbox_id(&self) -> ShortId {
-        self.session_shared_keypair().public_key().short_id()
-    }
-}
-
-/// Session keys a mailbox adapter needs to reach the shared mailbox.
-///
-/// Handed out by [`Participant::shared_mailbox_coordinates`] so the adapter can
-/// own OHTTP encapsulation and HPKE — no transport or crypto lives in the state
-/// machine.
-#[derive(Debug, Clone)]
-pub struct SharedMailboxCoordinates {
-    /// Base URL of the Payjoin Directory.
-    pub directory: Url,
-    /// OHTTP key configuration for the directory.
-    pub ohttp_keys: OhttpKeys,
-    /// Shared HPKE keypair every session participant holds; used to seal writes
-    /// and decrypt reads.
-    pub shared_keypair: HpkeKeyPair,
-    /// Short id addressing the session's shared mailbox.
-    pub mailbox_id: ShortId,
 }
 
 /// Multiparty participant state machine (post role bootstrap).
@@ -282,19 +252,6 @@ impl Participant<HasPlan> {
         }
         self.state.plan_cursor = plan_cursor;
         MultipartySession::ParticipantHasPlan(self)
-    }
-
-    /// Coordinates a mailbox adapter needs to reach this session's shared mailbox.
-    ///
-    /// The state machine holds no transport and no crypto; it hands these session
-    /// keys to the adapter, which owns OHTTP encapsulation and HPKE.
-    pub fn shared_mailbox_coordinates(&self) -> SharedMailboxCoordinates {
-        SharedMailboxCoordinates {
-            directory: self.context.directory.clone(),
-            ohttp_keys: self.context.ohttp_keys.clone(),
-            shared_keypair: self.context.session_shared_keypair(),
-            mailbox_id: self.context.session_shared_mailbox_id(),
-        }
     }
 
     /// The plaintext PSBT fragment to post for the current plan action, or `None`

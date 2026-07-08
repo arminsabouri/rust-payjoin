@@ -200,7 +200,7 @@ mod integration {
             SessionParameters,
         };
         use payjoin::persist::OptionalTransitionOutcome;
-        use payjoin::{HpkeKeyPair, Request, Url};
+        use payjoin::{HpkeKeyPair, OhttpKeys, Request, Url};
         use payjoin_driver::adapters::DirectoryMailbox;
         use payjoin_driver::participant::execute_plan;
         use payjoin_test_utils::{
@@ -360,15 +360,23 @@ mod integration {
         async fn participant_execute_plan(
             agent: &Client,
             persister: &InMemoryPersister<MultipartySessionEvent>,
+            directory_url: &str,
+            ohttp_keys: &OhttpKeys,
+            session_parameters: &SessionParameters,
             ohttp_relay: &str,
         ) -> Result<(), BoxSendSyncError> {
             let (session, _) = replay_event_log(persister)?;
-            let coords = match session {
-                MultipartySession::ParticipantHasPlan(participant) =>
-                    participant.shared_mailbox_coordinates(),
+            match session {
+                MultipartySession::ParticipantHasPlan(_) => {}
                 _ => panic!("participant must have a plan before executing it"),
             };
-            let mailbox = DirectoryMailbox::new(agent.clone(), ohttp_relay, coords)?;
+            let mailbox = DirectoryMailbox::new(
+                agent.clone(),
+                ohttp_relay,
+                directory_url,
+                ohttp_keys.clone(),
+                session_parameters,
+            )?;
             execute_plan(&mailbox, persister).await?;
             Ok(())
         }
@@ -482,9 +490,33 @@ mod integration {
             participant_generate_plan(&participant_a_persister, &responder_a_wallet)?;
             participant_generate_plan(&participant_b_persister, &responder_b_wallet)?;
             participant_generate_plan(&creator_persister, &creator_wallet)?;
-            participant_execute_plan(&agent, &creator_persister, &ohttp_relay).await?;
-            participant_execute_plan(&agent, &participant_a_persister, &ohttp_relay).await?;
-            participant_execute_plan(&agent, &participant_b_persister, &ohttp_relay).await?;
+            participant_execute_plan(
+                &agent,
+                &creator_persister,
+                &directory_url,
+                &ohttp_keys,
+                &expected_params,
+                &ohttp_relay,
+            )
+            .await?;
+            participant_execute_plan(
+                &agent,
+                &participant_a_persister,
+                &directory_url,
+                &ohttp_keys,
+                &expected_params,
+                &ohttp_relay,
+            )
+            .await?;
+            participant_execute_plan(
+                &agent,
+                &participant_b_persister,
+                &directory_url,
+                &ohttp_keys,
+                &expected_params,
+                &ohttp_relay,
+            )
+            .await?;
             let (session, _) = replay_event_log(&participant_b_persister)?;
             let _ = match session {
                 MultipartySession::ParticipantPlanExecuted(participant) => participant,

@@ -6,18 +6,24 @@ use futures::{stream, Stream, TryStreamExt};
 use payjoin::append_mailbox::{
     append_request, process_append_response, process_read_response, read_request, MailboxError,
 };
-use payjoin::multiparty::{parse_mailbox_psbt_fragment, Psbt, SharedMailboxCoordinates};
-use payjoin::{IntoUrl, IntoUrlError, Request, Url};
+use payjoin::multiparty::{parse_mailbox_psbt_fragment, Psbt, SessionParameters};
+use payjoin::{HpkeKeyPair, IntoUrl, IntoUrlError, OhttpKeys, Request, Url};
 use reqwest::Client;
 
 use crate::mailbox::CollaborativeMessageSet;
 
+/// Session keys needed to reach one shared mailbox on the Payjoin Directory.
+#[derive(Debug, Clone)]
+struct SharedMailboxCoordinates {
+    directory: Url,
+    ohttp_keys: OhttpKeys,
+    shared_keypair: HpkeKeyPair,
+}
+
 /// A [`CollaborativeMessageSet`] over a Payjoin Directory mailbox, backed by `reqwest`.
 ///
 /// This adapter owns everything the state machine does not: OHTTP encapsulation,
-/// HPKE sealing/decryption, directory addressing, and HTTP. It is built from the
-/// session keys the participant hands out via
-/// [`Participant::shared_mailbox_coordinates`](payjoin::multiparty::Participant).
+/// HPKE sealing/decryption, directory addressing, and HTTP.
 #[derive(Clone)]
 pub struct DirectoryMailbox {
     client: Client,
@@ -26,13 +32,23 @@ pub struct DirectoryMailbox {
 }
 
 impl DirectoryMailbox {
-    /// Build a mailbox for one session from its coordinates and an OHTTP relay.
+    /// Build a mailbox for one session and an OHTTP relay.
     pub fn new(
         client: Client,
         ohttp_relay: impl IntoUrl,
-        coords: SharedMailboxCoordinates,
+        directory: impl IntoUrl,
+        ohttp_keys: OhttpKeys,
+        session_parameters: &SessionParameters,
     ) -> Result<Self, DirectoryMailboxError> {
-        Ok(Self { client, ohttp_relay: ohttp_relay.into_url()?, coords })
+        Ok(Self {
+            client,
+            ohttp_relay: ohttp_relay.into_url()?,
+            coords: SharedMailboxCoordinates {
+                directory: directory.into_url()?,
+                ohttp_keys,
+                shared_keypair: session_parameters.session_shared_keypair(),
+            },
+        })
     }
 
     async fn post(&self, request: Request) -> Result<Vec<u8>, DirectoryMailboxError> {
@@ -82,7 +98,7 @@ impl CollaborativeMessageSet for DirectoryMailbox {
                 &this.coords.ohttp_keys,
                 &this.coords.directory,
                 this.ohttp_relay.as_str(),
-                &this.coords.mailbox_id,
+                &this.coords.shared_keypair.public_key().short_id(),
                 skip,
             )?;
             let body = this.post(request).await?;

@@ -20,7 +20,7 @@ pub use participant::{
     Participant, ParticipantAwaitingSessionParameters, ParticipantCommand, ParticipantContext,
     ParticipantError, ParticipantEvent, ParticipantSessionError, ParticipantStep,
     ParticipantStepTransition, PlanExecuted, PlanExecution, PlanExecutionTransition,
-    PlanPsbtAccumulator, PlanReadTransition, PsbtFragmentError, SharedMailboxCoordinates,
+    PlanPsbtAccumulator, PlanReadTransition, PsbtFragmentError,
 };
 pub use persist::{
     EventfulTransition, GraduationError, InMemoryMultipartyRegistry,

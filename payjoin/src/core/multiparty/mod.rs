@@ -17,8 +17,9 @@ pub use initiator::{
 };
 pub use participant::{
     parse_mailbox_psbt_fragment, AwaitingParticipantContext, HasPlan, HasSessionParameters,
-    Participant, ParticipantAwaitingSessionParameters, ParticipantContext, ParticipantError,
-    ParticipantSessionError, PlanExecuted, PlanExecution, PlanExecutionTransition,
+    Participant, ParticipantAwaitingSessionParameters, ParticipantCommand, ParticipantContext,
+    ParticipantError, ParticipantEvent, ParticipantSessionError, ParticipantStep,
+    ParticipantStepTransition, PlanExecuted, PlanExecution, PlanExecutionTransition,
     PlanPsbtAccumulator, PlanReadTransition, PsbtFragmentError, SharedMailboxCoordinates,
 };
 pub use persist::{

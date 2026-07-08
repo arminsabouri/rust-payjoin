@@ -83,6 +83,24 @@ where
         Self(Err(EventfulError::Fatal(event, error)))
     }
 
+    /// Map the success outcome, leaving the persisted events and the error arm
+    /// untouched.
+    ///
+    /// Lets transitions with different outcome types be unified behind a single
+    /// type-erased outcome (e.g. mapping both `Participant<HasPlan>` and
+    /// `PlanExecution` to [`MultipartySession`]) without losing the
+    /// save-vs-save-and-close semantics of the underlying transition.
+    pub(crate) fn map_outcome<U>(
+        self,
+        f: impl FnOnce(Outcome) -> U,
+    ) -> EventfulTransition<Event, U, Err> {
+        EventfulTransition(match self.0 {
+            Ok(EventfulSuccess { events, outcome }) =>
+                Ok(EventfulSuccess { events, outcome: f(outcome) }),
+            Err(error) => Err(error),
+        })
+    }
+
     fn deconstruct(self) -> (EventfulPersistActions<Event>, Result<Outcome, ApiError<Err>>) {
         match self.0 {
             Ok(EventfulSuccess { events, outcome }) =>

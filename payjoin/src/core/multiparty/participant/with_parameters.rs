@@ -185,7 +185,70 @@ impl std::ops::Deref for Participant<HasPlan> {
     fn deref(&self) -> &Self::Target { &self.state.0 }
 }
 
+/// An input to the participant plan state machine.
+///
+/// The state machine is sans-io: it never performs transport itself, so an event
+/// only ever reports that some I/O the driver performed has completed.
+#[derive(Debug, Clone)]
+pub enum ParticipantEvent {
+    /// The fragment we last broadcast was durably written to the shared mailbox.
+    ActionPosted,
+    /// One validated PSBT fragment was read from a peer via the shared mailbox.
+    PeerFragment(Psbt),
+}
+
+/// A single thing the driver must do on the state machine's behalf.
+///
+/// Either persists a protocol state transition or broadcasts a network message;
+/// never both. A [`ParticipantStep`] may carry several, and the driver performs
+/// all of them, in order, before reading from the mailbox again.
+pub enum ParticipantCommand {
+    /// Persist a state transition via `.save(persister)`.
+    Persist(ParticipantStepTransition),
+    /// Broadcast this plaintext PSBT fragment to the shared mailbox.
+    Broadcast(Psbt),
+}
+
+/// The ordered batch of commands produced by [`Participant::<HasPlan>::step`].
+pub struct ParticipantStep {
+    /// Commands to perform, in order, before the next mailbox read.
+    pub commands: Vec<ParticipantCommand>,
+}
+
 impl Participant<HasPlan> {
+    /// Advance the plan state machine in response to one [`ParticipantEvent`].
+    ///
+    /// This is the single entry point for state transitions: it subsumes the
+    /// lower-level `record_*` methods and decides, purely from protocol state,
+    /// what to persist and what to broadcast next.
+    ///
+    /// Correctness invariant: a [`ParticipantCommand::Broadcast`] returned in the
+    /// same batch as a [`ParticipantCommand::Persist`] is computed from the
+    /// *pre-persist* `self`. That is sound only for [`ParticipantEvent::PeerFragment`],
+    /// because recording a directory fragment does not touch `plan_cursor`
+    /// (see [`apply_directory_psbt_fragment`](Self::apply_directory_psbt_fragment)),
+    /// so [`next_action_fragment`](Self::next_action_fragment) reads the same
+    /// value before and after the save. [`ParticipantEvent::ActionPosted`] is
+    /// therefore persist-only: it advances the cursor, so re-broadcasting from
+    /// pre-persist state would post a stale action.
+    pub fn step(&self, event: ParticipantEvent) -> ParticipantStep {
+        match event {
+            ParticipantEvent::ActionPosted => {
+                let persist = self.record_action_posted().map_outcome(MultipartySession::from);
+                ParticipantStep { commands: vec![ParticipantCommand::Persist(persist)] }
+            }
+            ParticipantEvent::PeerFragment(fragment) => {
+                let persist =
+                    self.record_fragments(&[fragment]).map_outcome(MultipartySession::from);
+                let mut commands = vec![ParticipantCommand::Persist(persist)];
+                if let Some(next) = self.next_action_fragment() {
+                    commands.push(ParticipantCommand::Broadcast(next));
+                }
+                ParticipantStep { commands }
+            }
+        }
+    }
+
     pub(crate) fn apply_directory_psbt_fragment(
         mut self,
         directory_psbt_fragment: Psbt,
@@ -289,6 +352,12 @@ impl From<PlanExecution> for MultipartySession {
 pub type PlanReadTransition =
     EventfulTransition<MultipartySessionEvent, Participant<HasPlan>, ParticipantError>;
 
+/// A persist transition whose outcome is type-erased to [`MultipartySession`],
+/// so a single persist command can carry any of the plan transitions regardless
+/// of their concrete next-state type.
+pub type ParticipantStepTransition =
+    EventfulTransition<MultipartySessionEvent, MultipartySession, ParticipantError>;
+
 // TODO: evaluate if we want stronger state transition types than just PlanExecution. In the current use case we just have two states: current and next
 // And rn I can't think of any other states we would end up in from process a post res
 pub type PlanExecutionTransition =
@@ -311,10 +380,20 @@ impl std::ops::Deref for Participant<PlanExecuted> {
 
 #[cfg(test)]
 mod tests {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::transaction::Version;
+    use bitcoin::{Amount, FeeRate, Sequence, TxOut};
     use concurrent_psbt::constructor::Creator;
 
-    use super::PlanPsbtAccumulator;
+    use super::{
+        HasPlan, Participant, ParticipantCommand, ParticipantContext, ParticipantEvent,
+        PlanPsbtAccumulator,
+    };
     use crate::multiparty::participant::plan::PlanBuilder;
+    use crate::multiparty::session::{MultipartySession, MultipartySessionEvent};
+    use crate::multiparty::session_parameters::{InputScriptType, SessionParameters};
+    use crate::multiparty::{replay_event_log, test_helpers};
+    use crate::persist::{InMemoryPersister, SessionPersister};
 
     #[test]
     fn plan_psbt_accumulator_returns_directory_psbt_fragments_in_order() {
@@ -327,5 +406,136 @@ mod tests {
 
         assert_eq!(fragments, vec![first, second]);
         assert_eq!(accumulator.directory_psbt_fragment_count(), 2);
+    }
+
+    fn sample_context() -> ParticipantContext {
+        ParticipantContext {
+            directory: crate::Url::parse("https://example.com").expect("valid url"),
+            ohttp_keys: test_helpers::test_ohttp_keys(),
+            session_parameters: SessionParameters::new(
+                Version::TWO,
+                LockTime::ZERO,
+                FeeRate::from_sat_per_vb(1).expect("valid feerate"),
+                Sequence::ENABLE_RBF_NO_LOCKTIME,
+                vec![InputScriptType::P2wpkh],
+                None,
+            ),
+        }
+    }
+
+    fn sample_txout() -> TxOut {
+        TxOut { value: Amount::from_sat(10_000), script_pubkey: bitcoin::ScriptBuf::new() }
+    }
+
+    /// Seed a persister with a `plan_len`-action plan advanced to `cursor`, then
+    /// replay it into a live `Participant<HasPlan>`.
+    fn seeded(
+        plan_len: usize,
+        cursor: usize,
+    ) -> (InMemoryPersister<MultipartySessionEvent>, Participant<HasPlan>) {
+        let mut builder = PlanBuilder::new();
+        for _ in 0..plan_len {
+            builder = builder.add_output(sample_txout());
+        }
+        let persister = InMemoryPersister::default();
+        persister
+            .save_event(MultipartySessionEvent::SessionParametersAdopted(sample_context()))
+            .expect("save adopted");
+        persister
+            .save_event(MultipartySessionEvent::PlanGenerated(builder.build()))
+            .expect("save plan");
+        if cursor > 0 {
+            persister
+                .save_event(MultipartySessionEvent::PlanExecuted(cursor))
+                .expect("save cursor");
+        }
+        match replay_event_log(&persister).expect("replay").0 {
+            MultipartySession::ParticipantHasPlan(participant) => (persister, participant),
+            other => panic!("expected HasPlan, got {other:?}"),
+        }
+    }
+
+    fn describe(command: Option<&ParticipantCommand>) -> &'static str {
+        match command {
+            None => "nothing",
+            Some(ParticipantCommand::Persist(_)) => "Persist",
+            Some(ParticipantCommand::Broadcast(_)) => "Broadcast",
+        }
+    }
+
+    #[test]
+    fn step_peer_fragment_persists_the_read_and_broadcasts_the_next_action() {
+        let (persister, has_plan) = seeded(2, 0);
+        let expected_broadcast = has_plan.next_action_fragment().expect("action at cursor 0");
+
+        let step =
+            has_plan.step(ParticipantEvent::PeerFragment(Creator::new().build().into_psbt()));
+
+        // Ordered batch: persist the read, then broadcast the next action.
+        assert_eq!(step.commands.len(), 2);
+        let mut commands = step.commands.into_iter();
+        let persist = match commands.next() {
+            Some(ParticipantCommand::Persist(persist)) => persist,
+            other => panic!("expected Persist first, got {}", describe(other.as_ref())),
+        };
+        match commands.next() {
+            Some(ParticipantCommand::Broadcast(fragment)) =>
+                assert_eq!(fragment, expected_broadcast),
+            other => panic!("expected Broadcast second, got {}", describe(other.as_ref())),
+        }
+
+        // Saving the persist appends one directory fragment and stays HasPlan.
+        assert!(matches!(
+            persist.save(&persister).expect("save"),
+            MultipartySession::ParticipantHasPlan(_)
+        ));
+        match replay_event_log(&persister).expect("replay").0 {
+            MultipartySession::ParticipantHasPlan(p) =>
+                assert_eq!(p.directory_psbt_fragment_count(), 1),
+            other => panic!("expected HasPlan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_action_posted_advances_the_cursor_and_stays_has_plan() {
+        let (persister, has_plan) = seeded(2, 0);
+
+        let step = has_plan.step(ParticipantEvent::ActionPosted);
+
+        // ActionPosted mutates the cursor, so it is persist-only (no Broadcast).
+        assert_eq!(step.commands.len(), 1);
+        let persist = match step.commands.into_iter().next() {
+            Some(ParticipantCommand::Persist(persist)) => persist,
+            other => panic!("expected Persist, got {}", describe(other.as_ref())),
+        };
+        assert!(matches!(
+            persist.save(&persister).expect("save"),
+            MultipartySession::ParticipantHasPlan(_)
+        ));
+        match replay_event_log(&persister).expect("replay").0 {
+            MultipartySession::ParticipantHasPlan(p) => assert_eq!(p.plan_cursor, 1),
+            other => panic!("expected HasPlan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_action_posted_on_last_action_reaches_terminal() {
+        let (persister, has_plan) = seeded(2, 1);
+
+        let step = has_plan.step(ParticipantEvent::ActionPosted);
+
+        let persist = match step.commands.into_iter().next() {
+            Some(ParticipantCommand::Persist(persist)) => persist,
+            other => panic!("expected Persist, got {}", describe(other.as_ref())),
+        };
+        // Posting the final action graduates to the terminal executed state.
+        assert!(matches!(
+            persist.save(&persister).expect("save"),
+            MultipartySession::ParticipantPlanExecuted(_)
+        ));
+        assert!(matches!(
+            replay_event_log(&persister).expect("replay").0,
+            MultipartySession::ParticipantPlanExecuted(_)
+        ));
     }
 }

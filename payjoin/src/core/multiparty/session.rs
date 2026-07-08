@@ -80,6 +80,12 @@ impl MultipartySession {
     }
 }
 
+impl From<Participant<HasPlan>> for MultipartySession {
+    fn from(participant: Participant<HasPlan>) -> Self {
+        MultipartySession::ParticipantHasPlan(participant)
+    }
+}
+
 impl MultipartySession {
     fn process_event(
         self,

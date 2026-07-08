@@ -8,13 +8,18 @@ pub trait CollaborativeMessageSet {
     /// Transport/crypto failure from the underlying implementation.
     type Error: std::error::Error + Send + Sync + 'static;
     /// The stream returned by [`read`](Self::read).
-    type Messages<'a>: Stream<Item = Result<Self::Message, Self::Error>> + 'a
+    type Messages<'a>: Stream<Item = Result<Vec<Self::Message>, Self::Error>> + Unpin + 'a
     where
         Self: 'a;
 
     /// Append one complete message.
     async fn write(&self, message: Self::Message) -> Result<(), Self::Error>;
 
-    /// Read messages past `skip`, in server-determined order.
-    fn read(&self, skip: usize) -> Self::Messages<'_>;
+    /// Stream of read rounds over the mailbox.
+    ///
+    /// Each item is every message returned by one long-poll. An empty vector
+    /// means nothing new yet; the driver should keep going and poll again. While
+    /// a round is in flight the stream returns
+    /// [`futures::task::Poll::Pending`], so other work can run between polls.
+    fn read(&self) -> Self::Messages<'_>;
 }

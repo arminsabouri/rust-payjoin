@@ -1,8 +1,12 @@
+use std::cell::Cell;
 use std::error::Error as StdError;
 use std::fmt;
+use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use futures::{stream, Stream, TryStreamExt};
+use futures::Stream;
 use payjoin::append_mailbox::{
     append_request, process_append_response, process_read_response, read_request, MailboxError,
 };
@@ -29,16 +33,30 @@ pub struct DirectoryMailbox {
     client: Client,
     ohttp_relay: Url,
     coords: SharedMailboxCoordinates,
+    /// Parsed PSBT fragments already read and persisted for this session.
+    fragments_read: Arc<Cell<usize>>,
+}
+
+/// Long-poll stream over one [`DirectoryMailbox`].
+pub struct DirectoryMailboxMessages {
+    mailbox: DirectoryMailbox,
+    in_flight: Option<Pin<Box<dyn Future<Output = Result<Vec<Psbt>, DirectoryMailboxError>>>>>,
 }
 
 impl DirectoryMailbox {
     /// Build a mailbox for one session and an OHTTP relay.
+    ///
+    /// `fragments_read` is how many directory PSBT fragments were already read
+    /// and persisted before this driver run (typically
+    /// [`Participant::directory_psbt_fragment_count`](payjoin::multiparty::Participant::directory_psbt_fragment_count)
+    /// replayed from the event log).
     pub fn new(
         client: Client,
         ohttp_relay: impl IntoUrl,
         directory: impl IntoUrl,
         ohttp_keys: OhttpKeys,
         session_parameters: &SessionParameters,
+        fragments_read: usize,
     ) -> Result<Self, DirectoryMailboxError> {
         Ok(Self {
             client,
@@ -48,6 +66,7 @@ impl DirectoryMailbox {
                 ohttp_keys,
                 shared_keypair: session_parameters.session_shared_keypair(),
             },
+            fragments_read: Arc::new(Cell::new(fragments_read)),
         })
     }
 
@@ -66,12 +85,49 @@ impl DirectoryMailbox {
         }
         Ok(response.bytes().await?.to_vec())
     }
+
+    /// Long-poll the directory for PSBT fragments past the persisted cursor.
+    async fn fetch_fragments(&self) -> Result<Vec<Psbt>, DirectoryMailboxError> {
+        let skip = self.fragments_read.get();
+        let (request, ohttp_ctx) = read_request(
+            &self.coords.ohttp_keys,
+            &self.coords.directory,
+            self.ohttp_relay.as_str(),
+            &self.coords.shared_keypair.public_key().short_id(),
+            skip,
+        )?;
+        let body = self.post(request).await?;
+        let frames = process_read_response(&body, ohttp_ctx, &self.coords.shared_keypair)?;
+        let fragments: Vec<Psbt> =
+            frames.iter().filter_map(|frame| parse_mailbox_psbt_fragment(frame).ok()).collect();
+        self.fragments_read.set(skip + fragments.len());
+        Ok(fragments)
+    }
+}
+
+impl Stream for DirectoryMailboxMessages {
+    type Item = Result<Vec<Psbt>, DirectoryMailboxError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.in_flight.is_none() {
+            let mailbox = self.mailbox.clone();
+            self.in_flight = Some(Box::pin(async move { mailbox.fetch_fragments().await }));
+        }
+
+        match self.in_flight.as_mut().expect("just initialized").as_mut().poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(result) => {
+                self.in_flight = None;
+                Poll::Ready(Some(result))
+            }
+        }
+    }
 }
 
 impl CollaborativeMessageSet for DirectoryMailbox {
     type Message = Psbt;
     type Error = DirectoryMailboxError;
-    type Messages<'a> = Pin<Box<dyn Stream<Item = Result<Psbt, DirectoryMailboxError>> + 'a>>;
+    type Messages<'a> = Pin<Box<DirectoryMailboxMessages>>;
 
     async fn write(&self, message: Psbt) -> Result<(), Self::Error> {
         let (request, ohttp_ctx) = append_request(
@@ -86,32 +142,8 @@ impl CollaborativeMessageSet for DirectoryMailbox {
         Ok(())
     }
 
-    fn read(&self, skip: usize) -> Self::Messages<'_> {
-        // Clone into the stream so it is self-contained (the directory
-        // returns only the frames past `skip` in one GET, long-polling
-        // server-side if there's nothing new yet; we decrypt, parse, and
-        // yield each valid fragment — invalid frames are dropped here, not by
-        // the state machine).
-        let this = self.clone();
-        let fetch = async move {
-            let (request, ohttp_ctx) = read_request(
-                &this.coords.ohttp_keys,
-                &this.coords.directory,
-                this.ohttp_relay.as_str(),
-                &this.coords.shared_keypair.public_key().short_id(),
-                skip,
-            )?;
-            let body = this.post(request).await?;
-            let frames = process_read_response(&body, ohttp_ctx, &this.coords.shared_keypair)?;
-            let fragments: Vec<Psbt> =
-                frames.iter().filter_map(|frame| parse_mailbox_psbt_fragment(frame).ok()).collect();
-            Ok::<Vec<Psbt>, DirectoryMailboxError>(fragments)
-        };
-        Box::pin(
-            stream::once(fetch)
-                .map_ok(|fragments| stream::iter(fragments.into_iter().map(Ok)))
-                .try_flatten(),
-        )
+    fn read(&self) -> Self::Messages<'_> {
+        Box::pin(DirectoryMailboxMessages { mailbox: self.clone(), in_flight: None })
     }
 }
 

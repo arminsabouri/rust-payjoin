@@ -366,8 +366,9 @@ mod integration {
             ohttp_relay: &str,
         ) -> Result<(), BoxSendSyncError> {
             let (session, _) = replay_event_log(persister)?;
-            match session {
-                MultipartySession::ParticipantHasPlan(_) => {}
+            let fragments_read = match session {
+                MultipartySession::ParticipantHasPlan(participant) =>
+                    participant.directory_psbt_fragment_count(),
                 _ => panic!("participant must have a plan before executing it"),
             };
             let mailbox = DirectoryMailbox::new(
@@ -376,6 +377,7 @@ mod integration {
                 directory_url,
                 ohttp_keys.clone(),
                 session_parameters,
+                fragments_read,
             )?;
             execute_plan(&mailbox, persister).await?;
             Ok(())
@@ -428,7 +430,7 @@ mod integration {
                 MultipartyPjUri::parse(initiator_a.pj_uri().as_str()).expect("multiparty uri");
 
             // A second initiator mailbox / BIP-321 URI so responder B does not POST into A's slot.
-            let initiator_b = InitiatorBuilder::new(directory_url.as_str(), ohttp_keys)?
+            let initiator_b = InitiatorBuilder::new(directory_url.as_str(), ohttp_keys.clone())?
                 .build()
                 .save(&initiator_b_persister)?;
             let multiparty_uri_b =

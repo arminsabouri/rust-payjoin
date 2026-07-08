@@ -6,8 +6,9 @@
 
 use std::cell::Cell;
 use std::pin::Pin;
+use std::task::{Context, Poll};
 
-use futures::{stream, Stream};
+use futures::Stream;
 use payjoin::multiparty::{MultipartySessionEvent, MultipartySessionOutcome, Psbt};
 use payjoin::persist::{InMemoryPersister, SessionPersister};
 use payjoin_driver::participant::execute_plan;
@@ -19,6 +20,16 @@ use payjoin_driver::{CollaborativeMessageSet, DriverError};
 struct CountingMailbox {
     reads: Cell<usize>,
     writes: Cell<usize>,
+}
+
+struct EmptyMailboxMessages;
+
+impl Stream for EmptyMailboxMessages {
+    type Item = Result<Vec<Psbt>, NeverError>;
+
+    fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Pending
+    }
 }
 
 #[derive(Debug)]
@@ -33,16 +44,16 @@ impl std::error::Error for NeverError {}
 impl CollaborativeMessageSet for CountingMailbox {
     type Message = Psbt;
     type Error = NeverError;
-    type Messages<'a> = Pin<Box<dyn Stream<Item = Result<Psbt, NeverError>> + 'a>>;
+    type Messages<'a> = EmptyMailboxMessages;
 
     async fn write(&self, _message: Psbt) -> Result<(), Self::Error> {
         self.writes.set(self.writes.get() + 1);
         Err(NeverError)
     }
 
-    fn read(&self, _skip: usize) -> Self::Messages<'_> {
+    fn read(&self) -> Self::Messages<'_> {
         self.reads.set(self.reads.get() + 1);
-        Box::pin(stream::empty())
+        EmptyMailboxMessages
     }
 }
 

@@ -14,15 +14,15 @@
 //! [`ParticipantEvent::Started`] command, so the driver never writes on its own
 //! initiative.
 //!
-//! The loop is a stream of read rounds ([`stream::try_unfold`]): each round
-//! long-polls the mailbox for the fragments past the persisted cursor, feeds them
-//! to `step`, and drains **every** returned command before reading again. It uses
-//! only `futures` combinators (no tokio, no spawns) and carries no `Send` bounds,
-//! so it runs on single-threaded executors (FFI, WASM) too.
+//! The loop consumes [`CollaborativeMessageSet::read`] as a stream of read rounds:
+//! each poll long-polls when nothing is in flight yet, returning pending while
+//! the request is outstanding so the executor can run other work. Each ready
+//! batch (possibly empty) is fed to `step`, and every returned command is drained
+//! before the next poll.
 
 use std::collections::VecDeque;
 
-use futures::{future, stream, TryStreamExt};
+use futures::TryStreamExt;
 use payjoin::multiparty::{
     replay_event_log, HasPlan, MultipartySession, MultipartySessionEvent, Participant,
     ParticipantCommand, ParticipantEvent, ParticipantStep, Psbt,
@@ -50,27 +50,20 @@ where
             run_commands(mailbox, persister, has_plan, ParticipantEvent::Started).await?,
     }
 
-    // Read rounds: long-poll a batch past the cursor, feed it to `step`, and drain
-    // every resulting command before reading again. Ends when the plan executes.
-    let read_rounds = stream::try_unfold((), move |()| async move {
+    let mut messages = mailbox.read();
+    loop {
         let Some(has_plan) = load_has_plan(persister)? else {
-            return Ok(None);
+            break;
         };
-        let skip = has_plan.directory_psbt_fragment_count();
-        // The read blocks server-side until a fragment past `skip` exists, so the
-        // driver is paced without a client-side timer. `skip` is a parsed-fragment
-        // count; the mailbox skips whole frames, so a dropped invalid frame makes
-        // the two drift. That is a pre-existing bug, preserved here on purpose.
-        let fragments: Vec<Psbt> = mailbox
-            .read(skip)
-            .try_collect()
-            .await
-            .map_err(|e| DriverError::Mailbox(Box::new(e)))?;
+        let fragments = match messages.try_next().await {
+            Ok(Some(fragments)) => fragments,
+            Ok(None) => return Err(DriverError::UnexpectedState),
+            Err(error) => return Err(DriverError::Mailbox(Box::new(error))),
+        };
         run_commands(mailbox, persister, has_plan, ParticipantEvent::FragmentsRead(fragments))
             .await?;
-        Ok(Some(((), ())))
-    });
-    read_rounds.try_for_each(|()| future::ready(Ok(()))).await
+    }
+    Ok(())
 }
 
 /// Replay the log into the live plan state, or `None` once the plan is executed.

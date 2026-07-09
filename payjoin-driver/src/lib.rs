@@ -20,12 +20,14 @@
 //! executors (WASM) as well as multithreaded ones.
 
 pub mod adapters;
+pub mod broadcaster;
 mod error;
 mod mailbox;
 pub mod participant;
 pub mod schedule;
 pub mod signer;
 
+pub use broadcaster::Broadcaster;
 pub use error::DriverError;
 pub use mailbox::CollaborativeMessageSet;
 pub use schedule::Schedule;

@@ -55,7 +55,14 @@ fn trim_trailing_zeros(bytes: &[u8]) -> &[u8] {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Action {
     RegisterInput(InputPair),
-    RegisterOutput { output: bitcoin::TxOut, unique_id: [u8; 32] },
+    RegisterOutput {
+        output: bitcoin::TxOut,
+        unique_id: [u8; 32],
+    },
+    /// Broadcast the finalized witness for one owned input, keyed by its
+    /// outpoint. Carries only the finalized fields so the shared join fills in
+    /// the input's witness on top of the registration fragment.
+    ProvideWitness(psbt_v2::v2::Input),
 }
 
 impl Action {
@@ -67,6 +74,8 @@ impl Action {
                 .build()
                 .output(psbt_v2_output(output.clone(), *unique_id))
                 .into_psbt(),
+            Action::ProvideWitness(input) =>
+                Creator::new().build().input(input.clone()).into_psbt(),
         }
     }
 }
@@ -177,6 +186,46 @@ impl Plan {
     }
 
     pub fn len(&self) -> usize { self.0.len() }
+
+    /// Whether the plan has entered its witness segment (any `ProvideWitness`
+    /// action appended). Distinguishes the registration and witness phases
+    /// without a stored flag.
+    pub(crate) fn has_witness_actions(&self) -> bool {
+        self.0.iter().any(|scheduled| matches!(scheduled.action, Action::ProvideWitness(_)))
+    }
+
+    /// Grow the plan with a witness-broadcast action for each owned input.
+    ///
+    /// After signing, each of this participant's registered inputs carries a
+    /// finalized witness in `signed`. Append one `ProvideWitness` action per
+    /// owned input, continuing the plan's cumulative Poisson schedule so the
+    /// witness segment is paced from where registration left off. The plan is
+    /// grown, never replaced, so `sent_psbt_fragments` keeps spanning both the
+    /// registration and witness fragments.
+    ///
+    // TODO: the fragment currently carries the whole signed input; scrub it down
+    // to just the finalized witness fields once concurrent-psbt's scrubber lands
+    // upstream.
+    pub(crate) fn append_witnesses(&self, signed: &Psbt) -> Plan {
+        let mut rng = thread_rng();
+        let mut send_at = self.0.last().map_or(Duration::ZERO, |scheduled| scheduled.send_at);
+        let mut actions = self.0.clone();
+        for scheduled in &self.0 {
+            let Action::RegisterInput(input) = &scheduled.action else { continue };
+            let outpoint = input.txin.previous_output;
+            let Some(signed_input) = signed.inputs.iter().find(|input| {
+                input.previous_txid == outpoint.txid && input.spent_output_index == outpoint.vout
+            }) else {
+                continue;
+            };
+            send_at += exp_gap(&mut rng, MEAN_ACTION_INTERVAL);
+            actions.push(ScheduledAction {
+                send_at,
+                action: Action::ProvideWitness(signed_input.clone()),
+            });
+        }
+        Plan(actions)
+    }
 }
 
 #[cfg(test)]
@@ -251,6 +300,48 @@ mod tests {
         padded.extend(std::iter::repeat_n(0u8, 16));
 
         parse_mailbox_psbt_fragment(&padded).expect("valid padded PSBT fragment");
+    }
+
+    #[test]
+    fn append_witnesses_grows_plan_one_per_input() {
+        use bitcoin::hashes::Hash;
+        use bitcoin::psbt::Input as PsbtInput;
+        use bitcoin::{Amount, OutPoint, ScriptBuf, TxIn, Txid, Weight, Witness};
+        use concurrent_psbt::constructor::Creator;
+
+        use super::Action;
+        use crate::receive::InputPair;
+
+        let outpoint = OutPoint { txid: Txid::all_zeros(), vout: 0 };
+        let input_pair = InputPair {
+            txin: TxIn { previous_output: outpoint, ..Default::default() },
+            psbtin: PsbtInput {
+                witness_utxo: Some(bitcoin::TxOut {
+                    value: Amount::from_sat(10_000),
+                    script_pubkey: ScriptBuf::new(),
+                }),
+                ..Default::default()
+            },
+            expected_weight: Weight::ZERO,
+        };
+        let plan = PlanBuilder::new().add_input(input_pair).add_output(sample_txout()).build();
+        assert_eq!(plan.len(), 2);
+        assert!(!plan.has_witness_actions());
+
+        // A signed PSBT whose input at `outpoint` is finalized.
+        let mut signed_input = psbt_v2::v2::Input::new(&outpoint);
+        signed_input.final_script_sig = Some(ScriptBuf::new());
+        signed_input.final_script_witness = Some(Witness::new());
+        let signed = Creator::new().build().input(signed_input).into_psbt();
+
+        let grown = plan.append_witnesses(&signed);
+
+        // The original two actions, plus one witness action for the single input.
+        assert_eq!(grown.len(), 3);
+        assert!(grown.has_witness_actions());
+        assert!(matches!(grown.action(2), Some(Action::ProvideWitness(_))));
+        // The witness action's send time continues the plan's schedule.
+        assert!(grown.send_at(2).unwrap() > grown.send_at(1).unwrap());
     }
 
     #[test]

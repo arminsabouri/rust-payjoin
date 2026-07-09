@@ -11,7 +11,7 @@ use crate::multiparty::initiator::{
 };
 use crate::multiparty::participant::{
     HasPlan, HasSessionParameters, Participant, ParticipantAwaitingSessionParameters,
-    ParticipantContext, Plan, PlanExecuted,
+    ParticipantContext, Plan,
 };
 use crate::multiparty::persist::MultipartySessionRegistry;
 use crate::multiparty::responder::{
@@ -38,8 +38,13 @@ pub enum MultipartySessionEvent {
     PlanGenerated(Plan),
     /// Participant read and persisted one validated PSBT fragment from the shared directory.
     PlanDirectoryPsbtFragment(Psbt),
-    /// Participant executed a plan action and advanced to this cursor.
-    PlanExecuted(usize),
+    /// Participant posted a plan action and advanced to this cursor.
+    PlanActionPosted(usize),
+    /// The driver's signed PSBT was folded in, growing the plan with one
+    /// witness-broadcast action per owned input. Carries the whole grown plan
+    /// (registration + witness) so replay is deterministic despite the freshly
+    /// sampled witness schedule.
+    WitnessPlanGenerated(Plan),
     SessionCreatorCreated(SessionCreatorContext),
     SessionCreatorParametersDeliveredTo(HpkePublicKey),
     /// Session parameters were acknowledged by every committed participant.
@@ -69,7 +74,6 @@ pub enum MultipartySession {
     ParticipantAwaitingSessionParameters(ParticipantAwaitingSessionParameters),
     ParticipantHasSessionParameters(Participant<HasSessionParameters>),
     ParticipantHasPlan(Participant<HasPlan>),
-    ParticipantPlanExecuted(Participant<PlanExecuted>),
     SessionCreatorCollectedSessions(SessionCreator<CollectedSessions>),
     Closed(MultipartySessionOutcome),
 }
@@ -124,8 +128,13 @@ impl MultipartySession {
 
             (
                 MultipartySession::ParticipantHasPlan(state),
-                MultipartySessionEvent::PlanExecuted(plan_cursor),
-            ) => Ok(state.apply_with_plan_cursor(plan_cursor)),
+                MultipartySessionEvent::PlanActionPosted(plan_cursor),
+            ) => Ok(state.apply_action_posted(plan_cursor)),
+
+            (
+                MultipartySession::ParticipantHasPlan(state),
+                MultipartySessionEvent::WitnessPlanGenerated(plan),
+            ) => Ok(state.apply_witness_plan(plan)),
 
             (_, MultipartySessionEvent::Closed(outcome)) => Ok(MultipartySession::Closed(outcome)),
 

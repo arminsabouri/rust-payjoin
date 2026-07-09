@@ -6,7 +6,7 @@
 //! driver is the bridge: it performs the I/O the state machine cannot, feeds the
 //! results back as events, and is the *sole* writer to the persister.
 //!
-//! Two effect sources drive the loop, and neither lives in the state machine:
+//! Three effect sources drive the loop, and none lives in the state machine:
 //!
 //! - **Inbound** — [`CollaborativeMessageSet::read`] yields read rounds. Each
 //!   ready batch (possibly empty) is fed to `step` as
@@ -20,10 +20,20 @@
 //!   [`ParticipantEvent::ActionPosted`] — the transition that advances the
 //!   cursor. The schedule only decides *when*; the state machine still decides
 //!   *what*.
+//! - **Signing** — once registration balances to zero the driver hands the
+//!   sorted [`ready_to_sign_psbt`](payjoin::multiparty::PlanPsbtAccumulator::ready_to_sign_psbt)
+//!   to the caller's [`Signer`] and folds the result back via
+//!   [`provide_signed_psbt`](payjoin::multiparty::Participant::provide_signed_psbt),
+//!   which grows the plan with one witness-broadcast action per owned input.
 //!
-//! There is a single authoritative cursor (`plan_cursor`, persisted). The
-//! schedule stream is seeded from it once and holds only an ephemeral view, so
-//! the two cannot durably drift.
+//! The plan runs in two segments — registration, then (after signing) witnesses —
+//! sharing one [`HasPlan`] state and one authoritative cursor (`plan_cursor`,
+//! persisted). The driver derives the phase and the segment's completion from the
+//! replayed state ([`segment_complete`](payjoin::multiparty::Participant::segment_complete),
+//! [`is_witness_phase`](payjoin::multiparty::Participant::is_witness_phase)); only
+//! the non-derivable grown plan is logged. Each segment gets a **fresh** schedule
+//! stream seeded from the current cursor, so growing the plan simply re-enters the
+//! paced loop with a new stream — the stream is never mutated in place.
 
 use futures::future::{select, Either};
 use futures::StreamExt;
@@ -36,38 +46,80 @@ use payjoin::persist::SessionPersister;
 use crate::error::DriverError;
 use crate::mailbox::CollaborativeMessageSet;
 use crate::schedule::Schedule;
+use crate::signer::Signer;
 
-/// Drive a participant's plan to completion.
+/// Drive a participant's plan through registration, signing, and witness
+/// broadcast, until the collaborative transaction is ready to extract.
 ///
-/// Concurrently services inbound mailbox reads and the outbound action schedule,
-/// persisting to `persister`, until the plan is fully executed.
-pub async fn execute_plan<M, S, P>(
+/// Returns once every input carries a witness; the caller extracts the finalized
+/// transaction from the replayed state
+/// ([`final_tx`](payjoin::multiparty::PlanPsbtAccumulator::final_tx)). Broadcasting
+/// it to the bitcoin network is out of scope.
+pub async fn execute_plan<M, S, G, P>(
+    mailbox: &M,
+    schedule: &S,
+    signer: &G,
+    persister: &P,
+) -> Result<(), DriverError>
+where
+    M: CollaborativeMessageSet<Message = Psbt>,
+    S: Schedule,
+    G: Signer,
+    P: SessionPersister<SessionEvent = MultipartySessionEvent>,
+{
+    loop {
+        let has_plan = load_has_plan(persister)?;
+
+        if !has_plan.segment_complete() {
+            // Pace and post the current segment until it is funded (registration)
+            // or fully witnessed. A fresh schedule stream, seeded from the current
+            // cursor, is built inside — so the witness segment gets its own stream.
+            run_segment(mailbox, schedule, persister, &has_plan).await?;
+            continue;
+        }
+
+        if has_plan.is_witness_phase() {
+            // Every witness is in: the collaborative transaction is ready to
+            // extract. Broadcasting to the p2p network is out of scope here.
+            return Ok(());
+        }
+
+        // Registration balanced to zero: sign the accumulated PSBT and fold the
+        // witnesses back in, growing the plan into its witness segment.
+        let signed_psbt = signer
+            .sign(has_plan.ready_to_sign_psbt())
+            .await
+            .map_err(|e| DriverError::Sign(Box::new(e)))?;
+        save(persister, has_plan.provide_signed_psbt(signed_psbt))?;
+    }
+}
+
+/// Pace and post one plan segment, servicing reads concurrently, until the
+/// segment's completion predicate holds (funded, or fully witnessed).
+async fn run_segment<M, S, P>(
     mailbox: &M,
     schedule: &S,
     persister: &P,
+    has_plan: &Participant<HasPlan>,
 ) -> Result<(), DriverError>
 where
     M: CollaborativeMessageSet<Message = Psbt>,
     S: Schedule,
     P: SessionPersister<SessionEvent = MultipartySessionEvent>,
 {
-    let Some(has_plan) = load_has_plan(persister)? else {
-        return Ok(());
-    };
-
-    // The plan (and its send_at schedule) is fixed for the whole execution; clone
-    // it once so the schedule stream can read the offsets for the loop's lifetime.
+    // The plan is fixed for this segment; seed a fresh schedule from the
+    // authoritative cursor (skipping the already-posted prefix on a resume, or the
+    // whole registration prefix in the witness segment).
     let plan = has_plan.plan().clone();
     let mut reads = mailbox.read();
-    // Seed the schedule from the single authoritative cursor; on a resumed plan
-    // this skips the already-posted prefix.
     let mut due = schedule.due_actions(&plan, has_plan.plan_cursor());
     let mut schedule_done = false;
 
     loop {
-        let Some(has_plan) = load_has_plan(persister)? else {
-            break;
-        };
+        let has_plan = load_has_plan(persister)?;
+        if has_plan.segment_complete() {
+            return Ok(());
+        }
 
         if schedule_done {
             let fragments = read_item(reads.next().await)?;
@@ -87,7 +139,6 @@ where
             }
         }
     }
-    Ok(())
 }
 
 /// Translate a mailbox read stream item into the fragments it carries.
@@ -134,26 +185,27 @@ where
 }
 
 /// Persist one state transition, checking the resulting session stays advanceable.
+///
+/// Every plan transition — posting, reading, and folding in the signed PSBT —
+/// stays in [`HasPlan`]; the registration and witness segments share it.
 fn save<P>(persister: &P, transition: ParticipantStepTransition) -> Result<(), DriverError>
 where
     P: SessionPersister<SessionEvent = MultipartySessionEvent>,
 {
     match transition.save(persister).map_err(|e| DriverError::Persist(e.to_string()))? {
-        MultipartySession::ParticipantHasPlan(_)
-        | MultipartySession::ParticipantPlanExecuted(_) => Ok(()),
+        MultipartySession::ParticipantHasPlan(_) => Ok(()),
         _ => Err(DriverError::UnexpectedState),
     }
 }
 
-/// Replay the log into the live plan state, or `None` once the plan is executed.
-fn load_has_plan<P>(persister: &P) -> Result<Option<Participant<HasPlan>>, DriverError>
+/// Replay the log into the live plan state.
+fn load_has_plan<P>(persister: &P) -> Result<Participant<HasPlan>, DriverError>
 where
     P: SessionPersister<SessionEvent = MultipartySessionEvent>,
 {
     let (session, _) = replay_event_log(persister)?;
     match session {
-        MultipartySession::ParticipantHasPlan(has_plan) => Ok(Some(has_plan)),
-        MultipartySession::ParticipantPlanExecuted(_) => Ok(None),
+        MultipartySession::ParticipantHasPlan(has_plan) => Ok(has_plan),
         _ => Err(DriverError::UnexpectedState),
     }
 }

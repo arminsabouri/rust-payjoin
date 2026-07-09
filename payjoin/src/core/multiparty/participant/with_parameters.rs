@@ -1,4 +1,4 @@
-use concurrent_psbt::constructor::{BothModifiable, Constructor, OutputsModifiable};
+use concurrent_psbt::constructor::{BothModifiable, Constructor};
 use concurrent_psbt::global::GlobalSortExt;
 use concurrent_psbt::sort::{Deterministic, Sorter, Unset};
 use psbt_v2::v2::Psbt;
@@ -87,11 +87,6 @@ impl PlanPsbtAccumulator {
         Self { plan, plan_cursor: 0, directory_psbt_fragments: vec![] }
     }
 
-    pub(crate) fn into_executed(mut self) -> Self {
-        self.plan_cursor = self.plan.len();
-        self
-    }
-
     /// The participant's plan, including each action's `send_at` schedule offset.
     pub fn plan(&self) -> &Plan { &self.plan }
 
@@ -163,15 +158,32 @@ impl PlanPsbtAccumulator {
         bitcoin::SignedAmount::from_sat(inputs as i64 - outputs as i64)
     }
 
+    /// Whether every input in the accumulated PSBT carries a finalized witness.
+    ///
+    /// True once all participants (this one included) have broadcast their
+    /// witnesses, i.e. the collaborative transaction is ready to extract.
+    pub fn all_inputs_finalized(&self) -> bool { self.accumulated_psbt().is_finalized() }
+
     pub fn ready_to_sign_psbt(&self) -> Psbt {
-        let mut psbt =
-            Constructor::<OutputsModifiable, Unset>::try_from_psbt(self.accumulated_psbt())
-                .unwrap()
-                .into_inner();
+        let mut psbt = Constructor::<BothModifiable, Unset>::try_from_psbt(self.accumulated_psbt())
+            .unwrap()
+            .into_inner();
         // TODO: Update to use actual sort seed.
         psbt.global.set_sort_seed(vec![0; 32]);
         let sorter: Sorter<Deterministic> = Sorter::from_unordered_psbt(psbt);
         sorter.into_ordered_psbt().expect("sort seed to be set")
+    }
+
+    /// The finalized collaborative transaction, ready to broadcast.
+    ///
+    /// Deterministically orders the accumulated PSBT (the same ordering the
+    /// participants signed) — now carrying every input's witness — and extracts
+    /// the network transaction. Requires [`all_inputs_finalized`](Self::all_inputs_finalized).
+    pub fn final_tx(&self) -> bitcoin::Transaction {
+        psbt_v2::v2::Extractor::new(self.ready_to_sign_psbt())
+            .expect("all inputs finalized before extract")
+            .extract_tx()
+            .expect("finalized collaborative transaction extracts")
     }
 }
 
@@ -227,8 +239,7 @@ impl Participant<HasPlan> {
     /// which advances the cursor.
     pub fn step(&self, event: ParticipantEvent) -> ParticipantStepTransition {
         match event {
-            ParticipantEvent::ActionPosted =>
-                self.record_action_posted().map_outcome(MultipartySession::from),
+            ParticipantEvent::ActionPosted => self.record_action_posted(),
             ParticipantEvent::FragmentsRead(fragments) =>
                 self.record_fragments(&fragments).map_outcome(MultipartySession::from),
         }
@@ -242,13 +253,10 @@ impl Participant<HasPlan> {
         MultipartySession::ParticipantHasPlan(self)
     }
 
-    pub(crate) fn apply_with_plan_cursor(mut self, plan_cursor: usize) -> MultipartySession {
-        if plan_cursor >= self.state.plan.len() {
-            return MultipartySession::ParticipantPlanExecuted(Participant {
-                state: PlanExecuted(self.state.0.clone().into_executed()),
-                context: self.context,
-            });
-        }
+    /// Replay of [`MultipartySessionEvent::PlanActionPosted`]: advance the cursor.
+    /// Never terminal — the plan is done only when the driver observes the
+    /// segment's completion predicate and issues [`complete`](Self::complete).
+    pub(crate) fn apply_action_posted(mut self, plan_cursor: usize) -> MultipartySession {
         self.state.plan_cursor = plan_cursor;
         MultipartySession::ParticipantHasPlan(self)
     }
@@ -259,33 +267,78 @@ impl Participant<HasPlan> {
         self.state.plan.action(self.state.plan_cursor).map(|action| action.as_psbt_fragment())
     }
 
-    /// Record that the current action's fragment was posted to the shared
-    /// mailbox, advancing the plan.
+    /// Whether the plan has entered its witness segment.
+    ///
+    /// Derived from the plan's actions (a signed PSBT has been folded in), so the
+    /// driver can tell a registration `HasPlan` from a witness one without a
+    /// stored phase flag: registration → sign; witness → broadcast.
+    pub fn is_witness_phase(&self) -> bool { self.state.0.plan.has_witness_actions() }
+
+    /// Whether the current plan segment is finished.
+    ///
+    /// Requires the participant's own actions to be fully posted
+    /// (`plan_cursor == plan.len()`), plus the segment's funding condition:
+    /// registration is done when the accumulated PSBT balances to zero; the
+    /// witness segment is done when every input carries a witness. The driver
+    /// evaluates this on the replayed state (the authority) and, when true, either
+    /// signs (registration) or finishes (witness). There is no completion event:
+    /// both outcomes are re-derivable on replay, so only the non-derivable
+    /// [`WitnessPlanGenerated`](MultipartySessionEvent::WitnessPlanGenerated) is
+    /// logged.
+    pub fn segment_complete(&self) -> bool {
+        let accumulator = &self.state.0;
+        if accumulator.plan_cursor < accumulator.plan.len() {
+            return false;
+        }
+        if self.is_witness_phase() {
+            accumulator.all_inputs_finalized()
+        } else {
+            accumulator.balance() == bitcoin::SignedAmount::ZERO
+        }
+    }
+
+    /// Fold the driver's signed PSBT back into the plan.
+    ///
+    /// Called on a registration `HasPlan` once [`segment_complete`](Self::segment_complete)
+    /// holds. Appends one witness-broadcast action per owned input to the *same*
+    /// plan (continuing its schedule) and stays in [`HasPlan`], now in the witness
+    /// segment, so the driver paces and posts the witnesses. The grown plan is
+    /// persisted so replay is deterministic.
+    pub fn provide_signed_psbt(&self, signed_psbt: Psbt) -> ParticipantStepTransition {
+        let plan = self.state.0.plan.append_witnesses(&signed_psbt);
+        ParticipantStepTransition::success(
+            [MultipartySessionEvent::WitnessPlanGenerated(plan.clone())],
+            self.clone().apply_witness_plan(plan),
+        )
+    }
+
+    /// Replay of [`MultipartySessionEvent::WitnessPlanGenerated`]: swap in the
+    /// grown plan and resume plan execution at the witness segment.
+    pub(crate) fn apply_witness_plan(self, plan: Plan) -> MultipartySession {
+        let mut accumulator = self.state.0;
+        accumulator.plan = plan;
+        MultipartySession::ParticipantHasPlan(Participant {
+            state: HasPlan(accumulator),
+            context: self.context,
+        })
+    }
+
+    /// Record that the current action's fragment was posted, advancing the cursor.
     ///
     /// Internal helper behind [`step`](Self::step)'s handling of
     /// [`ParticipantEvent::ActionPosted`]: the driver has confirmed the write, so
-    /// this only advances the cursor and emits the
-    /// [`MultipartySessionEvent::PlanExecuted`] event.
-    pub(crate) fn record_action_posted(&self) -> PlanExecutionTransition {
-        let mut psbt_accumulator = self.state.0.clone();
-        let plan_cursor = psbt_accumulator.plan_cursor + 1;
-        psbt_accumulator.plan_cursor = plan_cursor;
-
-        let execution = if plan_cursor >= psbt_accumulator.plan.len() {
-            PlanExecution::Executed(Participant {
-                state: PlanExecuted(psbt_accumulator.into_executed()),
+    /// this only advances the cursor and emits
+    /// [`MultipartySessionEvent::PlanActionPosted`].
+    pub(crate) fn record_action_posted(&self) -> ParticipantStepTransition {
+        let mut accumulator = self.state.0.clone();
+        accumulator.plan_cursor += 1;
+        let plan_cursor = accumulator.plan_cursor;
+        ParticipantStepTransition::success(
+            [MultipartySessionEvent::PlanActionPosted(plan_cursor)],
+            MultipartySession::ParticipantHasPlan(Participant {
+                state: HasPlan(accumulator),
                 context: self.context.clone(),
-            })
-        } else {
-            PlanExecution::NeedsDirectoryRead(Participant {
-                state: HasPlan(psbt_accumulator),
-                context: self.context.clone(),
-            })
-        };
-
-        PlanExecutionTransition::success(
-            [MultipartySessionEvent::PlanExecuted(plan_cursor)],
-            execution,
+            }),
         )
     }
 
@@ -310,22 +363,6 @@ impl Participant<HasPlan> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PlanExecution {
-    NeedsDirectoryRead(Participant<HasPlan>),
-    Executed(Participant<PlanExecuted>),
-}
-
-impl From<PlanExecution> for MultipartySession {
-    fn from(execution: PlanExecution) -> Self {
-        match execution {
-            PlanExecution::NeedsDirectoryRead(state) =>
-                MultipartySession::ParticipantHasPlan(state),
-            PlanExecution::Executed(state) => MultipartySession::ParticipantPlanExecuted(state),
-        }
-    }
-}
-
 pub type PlanReadTransition =
     EventfulTransition<MultipartySessionEvent, Participant<HasPlan>, ParticipantError>;
 
@@ -334,26 +371,6 @@ pub type PlanReadTransition =
 /// of their concrete next-state type.
 pub type ParticipantStepTransition =
     EventfulTransition<MultipartySessionEvent, MultipartySession, ParticipantError>;
-
-// TODO: evaluate if we want stronger state transition types than just PlanExecution. In the current use case we just have two states: current and next
-// And rn I can't think of any other states we would end up in from process a post res
-pub type PlanExecutionTransition =
-    EventfulTransition<MultipartySessionEvent, PlanExecution, ParticipantError>;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlanExecuted(pub(crate) PlanPsbtAccumulator);
-
-impl std::ops::Deref for PlanExecuted {
-    type Target = PlanPsbtAccumulator;
-
-    fn deref(&self) -> &Self::Target { &self.0 }
-}
-
-impl std::ops::Deref for Participant<PlanExecuted> {
-    type Target = PlanPsbtAccumulator;
-
-    fn deref(&self) -> &Self::Target { &self.state.0 }
-}
 
 #[cfg(test)]
 mod tests {
@@ -420,7 +437,7 @@ mod tests {
             .expect("save plan");
         if cursor > 0 {
             persister
-                .save_event(MultipartySessionEvent::PlanExecuted(cursor))
+                .save_event(MultipartySessionEvent::PlanActionPosted(cursor))
                 .expect("save cursor");
         }
         match replay_event_log(&persister).expect("replay").0 {
@@ -518,19 +535,51 @@ mod tests {
     }
 
     #[test]
-    fn step_action_posted_on_last_action_reaches_terminal() {
+    fn step_action_posted_on_last_action_stays_has_plan() {
         let (persister, has_plan) = seeded(2, 1);
 
         let persist = has_plan.step(ParticipantEvent::ActionPosted);
 
-        // Posting the final action graduates to the terminal executed state.
+        // Posting the final action is no longer terminal: HasPlan keeps reading
+        // until the driver observes the segment's completion predicate.
         assert!(matches!(
             persist.save(&persister).expect("save"),
-            MultipartySession::ParticipantPlanExecuted(_)
+            MultipartySession::ParticipantHasPlan(_)
         ));
-        assert!(matches!(
-            replay_event_log(&persister).expect("replay").0,
-            MultipartySession::ParticipantPlanExecuted(_)
-        ));
+        match replay_event_log(&persister).expect("replay").0 {
+            MultipartySession::ParticipantHasPlan(p) => assert_eq!(p.plan_cursor, 2),
+            other => panic!("expected HasPlan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn segment_complete_registration_requires_full_post_and_zero_balance() {
+        // A registration plan of one zero-value output: balance is inputs (0) −
+        // outputs (0) = 0 once the output is posted.
+        let output = TxOut { value: Amount::from_sat(0), script_pubkey: bitcoin::ScriptBuf::new() };
+        let plan = PlanBuilder::new().add_output(output).build();
+
+        let persister = InMemoryPersister::<MultipartySessionEvent>::default();
+        persister
+            .save_event(MultipartySessionEvent::SessionParametersAdopted(sample_context()))
+            .expect("save adopted");
+        persister.save_event(MultipartySessionEvent::PlanGenerated(plan)).expect("save plan");
+        let has_plan = match replay_event_log(&persister).expect("replay").0 {
+            MultipartySession::ParticipantHasPlan(p) => p,
+            other => panic!("expected HasPlan, got {other:?}"),
+        };
+
+        // Before the action is posted (cursor 0 < len 1) the segment is not done.
+        assert!(!has_plan.segment_complete());
+        assert!(!has_plan.is_witness_phase());
+
+        has_plan.step(ParticipantEvent::ActionPosted).save(&persister).expect("post");
+        let has_plan = match replay_event_log(&persister).expect("replay").0 {
+            MultipartySession::ParticipantHasPlan(p) => p,
+            other => panic!("expected HasPlan, got {other:?}"),
+        };
+        // Posted (cursor == len) and balance zero: registration segment complete.
+        assert!(has_plan.segment_complete());
+        assert!(!has_plan.is_witness_phase());
     }
 }

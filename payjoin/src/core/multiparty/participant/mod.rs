@@ -8,6 +8,5 @@ pub use error::{ParticipantError, ParticipantSessionError};
 pub use plan::{parse_mailbox_psbt_fragment, Plan, PsbtFragmentError};
 pub use with_parameters::{
     HasPlan, HasSessionParameters, Participant, ParticipantContext, ParticipantEvent,
-    ParticipantStepTransition, PlanExecuted, PlanExecution, PlanExecutionTransition,
-    PlanPsbtAccumulator, PlanReadTransition,
+    ParticipantStepTransition, PlanPsbtAccumulator, PlanReadTransition,
 };

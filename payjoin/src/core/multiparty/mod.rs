@@ -18,9 +18,8 @@ pub use initiator::{
 pub use participant::{
     parse_mailbox_psbt_fragment, AwaitingParticipantContext, HasPlan, HasSessionParameters,
     Participant, ParticipantAwaitingSessionParameters, ParticipantContext, ParticipantError,
-    ParticipantEvent, ParticipantSessionError, ParticipantStepTransition, Plan, PlanExecuted,
-    PlanExecution, PlanExecutionTransition, PlanPsbtAccumulator, PlanReadTransition,
-    PsbtFragmentError,
+    ParticipantEvent, ParticipantSessionError, ParticipantStepTransition, Plan,
+    PlanPsbtAccumulator, PlanReadTransition, PsbtFragmentError,
 };
 pub use persist::{
     EventfulTransition, GraduationError, InMemoryMultipartyRegistry,

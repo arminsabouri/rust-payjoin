@@ -12,7 +12,7 @@ use futures::Stream;
 use payjoin::multiparty::{MultipartySessionEvent, MultipartySessionOutcome, Plan, Psbt};
 use payjoin::persist::{InMemoryPersister, SessionPersister};
 use payjoin_driver::participant::execute_plan;
-use payjoin_driver::{CollaborativeMessageSet, DriverError, Schedule};
+use payjoin_driver::{CollaborativeMessageSet, DriverError, Schedule, Signer};
 
 /// A mailbox that records how many times it was read/written. The driver should
 /// not reach it for sessions it can decide on from persisted state alone.
@@ -80,12 +80,22 @@ impl Schedule for PendingSchedule {
     }
 }
 
+/// A signer that never signs. These tests reject the session from persisted
+/// state before registration could complete, so it is never called.
+struct NeverSigner;
+
+impl Signer for NeverSigner {
+    type Error = NeverError;
+
+    async fn sign(&self, _psbt: Psbt) -> Result<Psbt, Self::Error> { Err(NeverError) }
+}
+
 #[tokio::test]
 async fn execute_plan_rejects_empty_log_without_touching_mailbox() {
     let persister = InMemoryPersister::<MultipartySessionEvent>::default();
     let mailbox = CountingMailbox::default();
 
-    let err = execute_plan(&mailbox, &PendingSchedule, &persister)
+    let err = execute_plan(&mailbox, &PendingSchedule, &NeverSigner, &persister)
         .await
         .expect_err("an empty event log cannot be driven");
 
@@ -102,7 +112,7 @@ async fn execute_plan_rejects_non_participant_session_without_touching_mailbox()
         .expect("in-memory save is infallible");
     let mailbox = CountingMailbox::default();
 
-    let err = execute_plan(&mailbox, &PendingSchedule, &persister)
+    let err = execute_plan(&mailbox, &PendingSchedule, &NeverSigner, &persister)
         .await
         .expect_err("a closed session is not a participant with a plan");
 

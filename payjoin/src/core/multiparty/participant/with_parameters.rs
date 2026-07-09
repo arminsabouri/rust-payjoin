@@ -131,6 +131,38 @@ impl PlanPsbtAccumulator {
         psbt.into_psbt()
     }
 
+    /// Net value the accumulated PSBT has available to pay the network fee:
+    /// the sum of every input's value minus the sum of every output's value
+    /// (`inputs - outputs`).
+    ///
+    /// The user-facing goal is a "balance of 0" — the point at which the inputs
+    /// cover the outputs *and* the network fee exactly. This returns the pre-fee
+    /// delta, so that balanced state is reached once the returned amount equals
+    /// the required fee. A negative value means the outputs registered so far
+    /// are not yet covered by the inputs at all.
+    ///
+    /// Input amounts come from each input's funding UTXO, which the participant
+    /// now carries in its input fragments (see `psbt_v2_input`).
+    ///
+    /// TODO: fold in the network fee. Once weight estimation for a partially
+    /// accumulated multiparty PSBT exists, add an `is_balanced()` that returns
+    /// true when `balance() - min_feerate * estimated_weight == 0` (a true zero
+    /// balance). No such weight model exists yet, so for now the caller compares
+    /// this delta against a fee it computes itself.
+    pub fn balance(&self) -> bitcoin::SignedAmount {
+        let psbt = self.accumulated_psbt();
+        // TODO: surface, rather than panic on, a peer fragment that omits its
+        // funding UTXO. Intake validation does not yet guarantee every input
+        // carries its value, so a malformed peer input can panic here.
+        let inputs: u64 = psbt
+            .iter_funding_utxos()
+            .map(|utxo| utxo.expect("accumulated input carries its funding UTXO").value.to_sat())
+            .sum();
+        let outputs: u64 = psbt.outputs.iter().map(|output| output.amount.to_sat()).sum();
+        // Total bitcoin value is bounded well within i64, so neither cast wraps.
+        bitcoin::SignedAmount::from_sat(inputs as i64 - outputs as i64)
+    }
+
     pub fn ready_to_sign_psbt(&self) -> Psbt {
         let mut psbt =
             Constructor::<OutputsModifiable, Unset>::try_from_psbt(self.accumulated_psbt())
@@ -395,6 +427,40 @@ mod tests {
             MultipartySession::ParticipantHasPlan(participant) => (persister, participant),
             other => panic!("expected HasPlan, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn balance_is_inputs_minus_outputs() {
+        use bitcoin::hashes::Hash;
+        use bitcoin::psbt::Input as PsbtInput;
+        use bitcoin::{OutPoint, ScriptBuf, SignedAmount, TxIn, Txid, Weight};
+
+        use crate::receive::InputPair;
+
+        // A single 10_000 sat input carried with its funding UTXO, and a 6_000
+        // sat output — leaving 4_000 sat of value for the fee.
+        let input = InputPair {
+            txin: TxIn {
+                previous_output: OutPoint { txid: Txid::all_zeros(), vout: 0 },
+                ..Default::default()
+            },
+            psbtin: PsbtInput {
+                witness_utxo: Some(TxOut {
+                    value: Amount::from_sat(10_000),
+                    script_pubkey: ScriptBuf::new(),
+                }),
+                ..Default::default()
+            },
+            expected_weight: Weight::ZERO,
+        };
+        let output = TxOut { value: Amount::from_sat(6_000), script_pubkey: ScriptBuf::new() };
+        let plan = PlanBuilder::new().add_input(input).add_output(output).build();
+
+        let mut accumulator = PlanPsbtAccumulator::new(plan);
+        // Mark both actions posted so they contribute to the accumulated PSBT.
+        accumulator.plan_cursor = 2;
+
+        assert_eq!(accumulator.balance(), SignedAmount::from_sat(4_000));
     }
 
     #[test]

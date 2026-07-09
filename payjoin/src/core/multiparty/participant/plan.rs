@@ -75,6 +75,13 @@ fn psbt_v2_input(input: &InputPair) -> psbt_v2::v2::Input {
     let sequence = input.txin.sequence;
     let mut psbt_input = psbt_v2::v2::Input::new(&input.txin.previous_output);
     psbt_input.sequence = Some(sequence);
+    // Carry the spent UTXO so the accumulated PSBT can be valued: computing the
+    // transaction's fee/balance needs each input's amount, which lives in the
+    // funding-utxo field. Copy whichever the `InputPair` holds — `witness_utxo`
+    // for segwit, `non_witness_utxo` for legacy — since both `psbt_v2`'s
+    // `fee()` and `funding_utxo()` read either.
+    psbt_input.witness_utxo = input.psbtin.witness_utxo.clone();
+    psbt_input.non_witness_utxo = input.psbtin.non_witness_utxo.clone();
     psbt_input
 }
 

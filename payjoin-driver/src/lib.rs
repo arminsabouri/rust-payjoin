@@ -24,7 +24,9 @@ mod error;
 mod mailbox;
 pub mod participant;
 pub mod schedule;
+pub mod signer;
 
 pub use error::DriverError;
 pub use mailbox::CollaborativeMessageSet;
 pub use schedule::Schedule;
+pub use signer::Signer;

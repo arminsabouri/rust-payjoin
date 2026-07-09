@@ -196,13 +196,14 @@ mod integration {
         use payjoin::multiparty::{
             replay_event_log, InMemoryMultipartyRegistry, InitiatorBuilder, InputScriptType,
             MultipartyPjUri, MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
-            MultipartySessionRegistry, ParametersDelivery, ResponderBuilder, SessionCreatorBuilder,
-            SessionParameters,
+            MultipartySessionRegistry, ParametersDelivery, Plan, ResponderBuilder,
+            SessionCreatorBuilder, SessionParameters,
         };
         use payjoin::persist::OptionalTransitionOutcome;
         use payjoin::{HpkeKeyPair, OhttpKeys, Request, Url};
         use payjoin_driver::adapters::DirectoryMailbox;
         use payjoin_driver::participant::execute_plan;
+        use payjoin_driver::Schedule;
         use payjoin_test_utils::{
             corepc_node, init_bitcoind_funded_wallets, init_tracing, BoxSendSyncError,
             InMemoryPersister, TestServices,
@@ -210,6 +211,45 @@ mod integration {
         use reqwest::Client;
 
         use super::{input_pair_from_list_unspent, Amount, InputPair, TxOut};
+
+        /// A schedule that releases every remaining plan action immediately.
+        ///
+        /// The end-to-end test only needs each participant's plan to execute; the
+        /// Poisson pacing (the point of the schedule in production) would add
+        /// multi-second sleeps here, so we short-circuit it. Pacing behavior is
+        /// covered separately by the plan's own unit tests.
+        struct ImmediateSchedule;
+
+        struct ImmediateDueActions {
+            next: usize,
+            end: usize,
+        }
+
+        impl futures::Stream for ImmediateDueActions {
+            type Item = Result<usize, std::convert::Infallible>;
+
+            fn poll_next(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                if self.next < self.end {
+                    let index = self.next;
+                    self.next += 1;
+                    std::task::Poll::Ready(Some(Ok(index)))
+                } else {
+                    std::task::Poll::Ready(None)
+                }
+            }
+        }
+
+        impl Schedule for ImmediateSchedule {
+            type Error = std::convert::Infallible;
+            type DueActions<'a> = ImmediateDueActions;
+
+            fn due_actions(&self, plan: &Plan, from_cursor: usize) -> Self::DueActions<'_> {
+                ImmediateDueActions { next: from_cursor, end: plan.len() }
+            }
+        }
 
         fn sample_session_parameters() -> SessionParameters {
             SessionParameters::new(
@@ -379,7 +419,7 @@ mod integration {
                 session_parameters,
                 fragments_read,
             )?;
-            execute_plan(&mailbox, persister).await?;
+            execute_plan(&mailbox, &ImmediateSchedule, persister).await?;
             Ok(())
         }
 

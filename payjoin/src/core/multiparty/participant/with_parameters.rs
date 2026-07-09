@@ -92,6 +92,13 @@ impl PlanPsbtAccumulator {
         self
     }
 
+    /// The participant's plan, including each action's `send_at` schedule offset.
+    pub fn plan(&self) -> &Plan { &self.plan }
+
+    /// Number of plan actions already posted to the shared mailbox — the index of
+    /// the next action to send.
+    pub fn plan_cursor(&self) -> usize { self.plan_cursor }
+
     /// PSBT fragments this participant sent to the shared session mailbox.
     pub fn sent_psbt_fragments(&self) -> impl Iterator<Item = Psbt> + '_ {
         (0..self.plan_cursor.min(self.plan.len()))
@@ -170,55 +177,28 @@ pub enum ParticipantEvent {
     FragmentsRead(Vec<Psbt>),
 }
 
-/// A single thing the driver must do on the state machine's behalf.
-///
-/// Either persists a protocol state transition or broadcasts a network message;
-/// never both. A [`ParticipantStep`] may carry several, and the driver performs
-/// all of them, in order, before reading from the mailbox again.
-pub enum ParticipantCommand {
-    /// Persist a state transition via `.save(persister)`.
-    Persist(ParticipantStepTransition),
-    /// Broadcast this plaintext PSBT fragment to the shared mailbox.
-    Broadcast(Psbt),
-}
-
-/// The ordered batch of commands produced by [`Participant::<HasPlan>::step`].
-pub struct ParticipantStep {
-    /// Commands to perform, in order, before the next mailbox read.
-    pub commands: Vec<ParticipantCommand>,
-}
-
 impl Participant<HasPlan> {
-    /// Advance the plan state machine in response to one [`ParticipantEvent`].
+    /// Advance the plan state machine in response to one [`ParticipantEvent`],
+    /// returning the single state transition to persist.
     ///
     /// This is the single entry point for state transitions: it subsumes the
     /// lower-level `record_*` methods and decides, purely from protocol state,
-    /// what to persist and what to broadcast next.
+    /// what to persist next.
     ///
-    /// Correctness invariant: a [`ParticipantCommand::Broadcast`] returned in the
-    /// same batch as a [`ParticipantCommand::Persist`] is computed from the
-    /// *pre-persist* `self`. That is sound only for [`ParticipantEvent::FragmentsRead`],
-    /// because recording directory fragments does not touch `plan_cursor`
-    /// (see `apply_directory_psbt_fragment`),
-    /// so [`next_action_fragment`](Self::next_action_fragment) reads the same
-    /// value before and after the save. [`ParticipantEvent::ActionPosted`] is
-    /// therefore persist-only: it advances the cursor, so re-broadcasting from
-    /// pre-persist state would post a stale action.
-    pub fn step(&self, event: ParticipantEvent) -> ParticipantStep {
+    /// Both events are persist-only. Inbound reads and outbound broadcasts are
+    /// decoupled: [`ParticipantEvent::FragmentsRead`] only records the fragments
+    /// read from the shared mailbox. Broadcasting is driven separately by the
+    /// driver's schedule (each action posted at its `send_at` offset); the driver
+    /// obtains the fragment from
+    /// [`next_action_fragment`](Self::next_action_fragment), writes it, and
+    /// reports the completed write back as [`ParticipantEvent::ActionPosted`],
+    /// which advances the cursor.
+    pub fn step(&self, event: ParticipantEvent) -> ParticipantStepTransition {
         match event {
-            ParticipantEvent::ActionPosted => {
-                let persist = self.record_action_posted().map_outcome(MultipartySession::from);
-                ParticipantStep { commands: vec![ParticipantCommand::Persist(persist)] }
-            }
-            ParticipantEvent::FragmentsRead(fragments) => {
-                let persist =
-                    self.record_fragments(&fragments).map_outcome(MultipartySession::from);
-                let mut commands = vec![ParticipantCommand::Persist(persist)];
-                if let Some(next) = self.next_action_fragment() {
-                    commands.push(ParticipantCommand::Broadcast(next));
-                }
-                ParticipantStep { commands }
-            }
+            ParticipantEvent::ActionPosted =>
+                self.record_action_posted().map_outcome(MultipartySession::from),
+            ParticipantEvent::FragmentsRead(fragments) =>
+                self.record_fragments(&fragments).map_outcome(MultipartySession::from),
         }
     }
 
@@ -350,10 +330,7 @@ mod tests {
     use bitcoin::{Amount, FeeRate, Sequence, TxOut};
     use concurrent_psbt::constructor::Creator;
 
-    use super::{
-        HasPlan, Participant, ParticipantCommand, ParticipantContext, ParticipantEvent,
-        PlanPsbtAccumulator,
-    };
+    use super::{HasPlan, Participant, ParticipantContext, ParticipantEvent, PlanPsbtAccumulator};
     use crate::multiparty::participant::plan::PlanBuilder;
     use crate::multiparty::session::{MultipartySession, MultipartySessionEvent};
     use crate::multiparty::session_parameters::{InputScriptType, SessionParameters};
@@ -420,34 +397,13 @@ mod tests {
         }
     }
 
-    fn describe(command: Option<&ParticipantCommand>) -> &'static str {
-        match command {
-            None => "nothing",
-            Some(ParticipantCommand::Persist(_)) => "Persist",
-            Some(ParticipantCommand::Broadcast(_)) => "Broadcast",
-        }
-    }
-
     #[test]
-    fn step_fragments_read_persists_the_read_and_broadcasts_the_next_action() {
+    fn step_fragments_read_persists_the_read() {
         let (persister, has_plan) = seeded(2, 0);
-        let expected_broadcast = has_plan.next_action_fragment().expect("action at cursor 0");
 
-        let step = has_plan
+        // FragmentsRead is persist-only: it records the read and never broadcasts.
+        let persist = has_plan
             .step(ParticipantEvent::FragmentsRead(vec![Creator::new().build().into_psbt()]));
-
-        // Ordered batch: persist the read, then broadcast the next action.
-        assert_eq!(step.commands.len(), 2);
-        let mut commands = step.commands.into_iter();
-        let persist = match commands.next() {
-            Some(ParticipantCommand::Persist(persist)) => persist,
-            other => panic!("expected Persist first, got {}", describe(other.as_ref())),
-        };
-        match commands.next() {
-            Some(ParticipantCommand::Broadcast(fragment)) =>
-                assert_eq!(fragment, expected_broadcast),
-            other => panic!("expected Broadcast second, got {}", describe(other.as_ref())),
-        }
 
         // Saving the persist appends one directory fragment and stays HasPlan.
         assert!(matches!(
@@ -462,22 +418,20 @@ mod tests {
     }
 
     #[test]
-    fn step_empty_fragments_read_broadcasts_the_first_action() {
-        let (_persister, has_plan) = seeded(2, 0);
-        let expected_broadcast = has_plan.next_action_fragment().expect("action at cursor 0");
+    fn step_empty_fragments_read_records_nothing() {
+        let (persister, has_plan) = seeded(2, 0);
 
-        let step = has_plan.step(ParticipantEvent::FragmentsRead(vec![]));
+        // An empty read still steps, but records no directory fragments.
+        let persist = has_plan.step(ParticipantEvent::FragmentsRead(vec![]));
 
-        assert_eq!(step.commands.len(), 2);
-        let mut commands = step.commands.into_iter();
-        match commands.next() {
-            Some(ParticipantCommand::Persist(_)) => {}
-            other => panic!("expected Persist first, got {}", describe(other.as_ref())),
-        }
-        match commands.next() {
-            Some(ParticipantCommand::Broadcast(fragment)) =>
-                assert_eq!(fragment, expected_broadcast),
-            other => panic!("expected Broadcast, got {}", describe(other.as_ref())),
+        assert!(matches!(
+            persist.save(&persister).expect("save"),
+            MultipartySession::ParticipantHasPlan(_)
+        ));
+        match replay_event_log(&persister).expect("replay").0 {
+            MultipartySession::ParticipantHasPlan(p) =>
+                assert_eq!(p.directory_psbt_fragment_count(), 0),
+            other => panic!("expected HasPlan, got {other:?}"),
         }
     }
 
@@ -485,14 +439,8 @@ mod tests {
     fn step_action_posted_advances_the_cursor_and_stays_has_plan() {
         let (persister, has_plan) = seeded(2, 0);
 
-        let step = has_plan.step(ParticipantEvent::ActionPosted);
+        let persist = has_plan.step(ParticipantEvent::ActionPosted);
 
-        // ActionPosted mutates the cursor, so it is persist-only (no Broadcast).
-        assert_eq!(step.commands.len(), 1);
-        let persist = match step.commands.into_iter().next() {
-            Some(ParticipantCommand::Persist(persist)) => persist,
-            other => panic!("expected Persist, got {}", describe(other.as_ref())),
-        };
         assert!(matches!(
             persist.save(&persister).expect("save"),
             MultipartySession::ParticipantHasPlan(_)
@@ -507,12 +455,8 @@ mod tests {
     fn step_action_posted_on_last_action_reaches_terminal() {
         let (persister, has_plan) = seeded(2, 1);
 
-        let step = has_plan.step(ParticipantEvent::ActionPosted);
+        let persist = has_plan.step(ParticipantEvent::ActionPosted);
 
-        let persist = match step.commands.into_iter().next() {
-            Some(ParticipantCommand::Persist(persist)) => persist,
-            other => panic!("expected Persist, got {}", describe(other.as_ref())),
-        };
         // Posting the final action graduates to the terminal executed state.
         assert!(matches!(
             persist.save(&persister).expect("save"),

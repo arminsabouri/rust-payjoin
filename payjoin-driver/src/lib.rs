@@ -23,6 +23,8 @@ pub mod adapters;
 mod error;
 mod mailbox;
 pub mod participant;
+pub mod schedule;
 
 pub use error::DriverError;
 pub use mailbox::CollaborativeMessageSet;
+pub use schedule::Schedule;

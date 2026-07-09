@@ -11,6 +11,8 @@ pub enum DriverError {
     Replay(ReplayError<MultipartySession, MultipartySessionEvent>),
     /// The shared mailbox failed to read or write.
     Mailbox(Box<dyn StdError + Send + Sync>),
+    /// The action schedule's timer/clock failed.
+    Schedule(Box<dyn StdError + Send + Sync>),
     /// Persisting a state transition failed, or the protocol reached a fatal state.
     Persist(String),
     /// The replayed session was not in a state this driver can advance.
@@ -22,6 +24,7 @@ impl fmt::Display for DriverError {
         match self {
             Self::Replay(e) => write!(f, "replay error: {e}"),
             Self::Mailbox(e) => write!(f, "mailbox error: {e}"),
+            Self::Schedule(e) => write!(f, "schedule error: {e}"),
             Self::Persist(e) => write!(f, "persistence error: {e}"),
             Self::UnexpectedState =>
                 write!(f, "session is not in a state the participant driver can advance"),
@@ -33,7 +36,7 @@ impl StdError for DriverError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::Replay(e) => Some(e),
-            Self::Mailbox(e) => Some(e.as_ref()),
+            Self::Mailbox(e) | Self::Schedule(e) => Some(e.as_ref()),
             Self::Persist(_) | Self::UnexpectedState => None,
         }
     }

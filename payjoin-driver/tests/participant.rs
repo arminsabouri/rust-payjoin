@@ -9,10 +9,10 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use futures::Stream;
-use payjoin::multiparty::{MultipartySessionEvent, MultipartySessionOutcome, Psbt};
+use payjoin::multiparty::{MultipartySessionEvent, MultipartySessionOutcome, Plan, Psbt};
 use payjoin::persist::{InMemoryPersister, SessionPersister};
 use payjoin_driver::participant::execute_plan;
-use payjoin_driver::{CollaborativeMessageSet, DriverError};
+use payjoin_driver::{CollaborativeMessageSet, DriverError, Schedule};
 
 /// A mailbox that records how many times it was read/written. The driver should
 /// not reach it for sessions it can decide on from persisted state alone.
@@ -57,13 +57,37 @@ impl CollaborativeMessageSet for CountingMailbox {
     }
 }
 
+/// A schedule that never yields. These tests reject the session from persisted
+/// state before any action could become due, so the schedule is never polled.
+struct PendingSchedule;
+
+struct PendingDueActions;
+
+impl Stream for PendingDueActions {
+    type Item = Result<usize, NeverError>;
+
+    fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Pending
+    }
+}
+
+impl Schedule for PendingSchedule {
+    type Error = NeverError;
+    type DueActions<'a> = PendingDueActions;
+
+    fn due_actions(&self, _plan: &Plan, _from_cursor: usize) -> Self::DueActions<'_> {
+        PendingDueActions
+    }
+}
+
 #[tokio::test]
 async fn execute_plan_rejects_empty_log_without_touching_mailbox() {
     let persister = InMemoryPersister::<MultipartySessionEvent>::default();
     let mailbox = CountingMailbox::default();
 
-    let err =
-        execute_plan(&mailbox, &persister).await.expect_err("an empty event log cannot be driven");
+    let err = execute_plan(&mailbox, &PendingSchedule, &persister)
+        .await
+        .expect_err("an empty event log cannot be driven");
 
     assert!(matches!(err, DriverError::Replay(_)), "got {err:?}");
     assert_eq!(mailbox.reads.get(), 0);
@@ -78,7 +102,7 @@ async fn execute_plan_rejects_non_participant_session_without_touching_mailbox()
         .expect("in-memory save is infallible");
     let mailbox = CountingMailbox::default();
 
-    let err = execute_plan(&mailbox, &persister)
+    let err = execute_plan(&mailbox, &PendingSchedule, &persister)
         .await
         .expect_err("a closed session is not a participant with a plan");
 

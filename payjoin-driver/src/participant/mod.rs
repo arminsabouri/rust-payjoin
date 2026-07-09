@@ -25,6 +25,15 @@
 //!   to the caller's [`Signer`] and folds the result back via
 //!   [`provide_signed_psbt`](payjoin::multiparty::Participant::provide_signed_psbt),
 //!   which grows the plan with one witness-broadcast action per owned input.
+//! - **Broadcasting** — once the witness segment completes (every input carries a
+//!   witness) the driver extracts the finalized
+//!   [`final_tx`](payjoin::multiparty::PlanPsbtAccumulator::final_tx), hands it to
+//!   the caller's [`Broadcaster`], and records the terminus via
+//!   [`broadcast_complete`](payjoin::multiparty::Participant::broadcast_complete).
+//!   There is no intermediate "ready to broadcast" event or state: readiness is
+//!   derived from the replayed fragments and broadcasting is idempotent, so only
+//!   the closing [`Complete`](payjoin::multiparty::MultipartySessionOutcome::Complete)
+//!   outcome is logged.
 //!
 //! The plan runs in two segments — registration, then (after signing) witnesses —
 //! sharing one [`HasPlan`] state and one authoritative cursor (`plan_cursor`,
@@ -38,59 +47,67 @@
 use futures::future::{select, Either};
 use futures::StreamExt;
 use payjoin::multiparty::{
-    replay_event_log, HasPlan, MultipartySession, MultipartySessionEvent, Participant,
-    ParticipantEvent, ParticipantStepTransition, Psbt,
+    replay_event_log, HasPlan, MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
+    Participant, ParticipantEvent, ParticipantStepTransition, Psbt,
 };
 use payjoin::persist::SessionPersister;
 
+use crate::broadcaster::Broadcaster;
 use crate::error::DriverError;
 use crate::mailbox::CollaborativeMessageSet;
 use crate::schedule::Schedule;
 use crate::signer::Signer;
 
-/// Drive a participant's plan through registration, signing, and witness
-/// broadcast, until the collaborative transaction is ready to extract.
+/// Drive a participant's plan through registration, signing, witness broadcast,
+/// and finally broadcasting the collaborative transaction to the network.
 ///
-/// Returns once every input carries a witness; the caller extracts the finalized
-/// transaction from the replayed state
-/// ([`final_tx`](payjoin::multiparty::PlanPsbtAccumulator::final_tx)). Broadcasting
-/// it to the bitcoin network is out of scope.
-pub async fn execute_plan<M, S, G, P>(
+/// Returns once the finalized transaction has been handed to `broadcaster` and the
+/// session is recorded [`Complete`](payjoin::multiparty::MultipartySessionOutcome::Complete).
+pub async fn execute_plan<M, S, G, B, P>(
     mailbox: &M,
     schedule: &S,
     signer: &G,
+    broadcaster: &B,
     persister: &P,
 ) -> Result<(), DriverError>
 where
     M: CollaborativeMessageSet<Message = Psbt>,
     S: Schedule,
     G: Signer,
+    B: Broadcaster,
     P: SessionPersister<SessionEvent = MultipartySessionEvent>,
 {
     loop {
-        let has_plan = load_has_plan(persister)?;
+        let (session, _) = replay_event_log(persister)?;
+        let has_plan = match session {
+            MultipartySession::ParticipantHasPlan(has_plan) => has_plan,
+            // Broadcast recorded: the collaborative transaction is on the network.
+            MultipartySession::Closed(MultipartySessionOutcome::Complete) => return Ok(()),
+            _ => return Err(DriverError::UnexpectedState),
+        };
 
         if !has_plan.segment_complete() {
             // Pace and post the current segment until it is funded (registration)
             // or fully witnessed. A fresh schedule stream, seeded from the current
             // cursor, is built inside — so the witness segment gets its own stream.
             run_segment(mailbox, schedule, persister, &has_plan).await?;
-            continue;
+        } else if has_plan.is_witness_phase() {
+            // Every witness is in: extract the finalized transaction, broadcast it
+            // (idempotently), and record the terminus.
+            broadcaster
+                .broadcast(has_plan.final_tx())
+                .await
+                .map_err(|e| DriverError::Broadcast(Box::new(e)))?;
+            save(persister, has_plan.broadcast_complete())?;
+        } else {
+            // Registration balanced to zero: sign the accumulated PSBT and fold the
+            // witnesses back in, growing the plan into its witness segment.
+            let signed_psbt = signer
+                .sign(has_plan.ready_to_sign_psbt())
+                .await
+                .map_err(|e| DriverError::Sign(Box::new(e)))?;
+            save(persister, has_plan.provide_signed_psbt(signed_psbt))?;
         }
-
-        if has_plan.is_witness_phase() {
-            // Every witness is in: the collaborative transaction is ready to
-            // extract. Broadcasting to the p2p network is out of scope here.
-            return Ok(());
-        }
-
-        // Registration balanced to zero: sign the accumulated PSBT and fold the
-        // witnesses back in, growing the plan into its witness segment.
-        let signed_psbt = signer
-            .sign(has_plan.ready_to_sign_psbt())
-            .await
-            .map_err(|e| DriverError::Sign(Box::new(e)))?;
-        save(persister, has_plan.provide_signed_psbt(signed_psbt))?;
     }
 }
 
@@ -187,13 +204,16 @@ where
 /// Persist one state transition, checking the resulting session stays advanceable.
 ///
 /// Every plan transition — posting, reading, and folding in the signed PSBT —
-/// stays in [`HasPlan`]; the registration and witness segments share it.
+/// stays in [`HasPlan`], shared by the registration and witness segments. The one
+/// terminal transition is the post-broadcast close to
+/// [`Complete`](MultipartySessionOutcome::Complete).
 fn save<P>(persister: &P, transition: ParticipantStepTransition) -> Result<(), DriverError>
 where
     P: SessionPersister<SessionEvent = MultipartySessionEvent>,
 {
     match transition.save(persister).map_err(|e| DriverError::Persist(e.to_string()))? {
-        MultipartySession::ParticipantHasPlan(_) => Ok(()),
+        MultipartySession::ParticipantHasPlan(_)
+        | MultipartySession::Closed(MultipartySessionOutcome::Complete) => Ok(()),
         _ => Err(DriverError::UnexpectedState),
     }
 }

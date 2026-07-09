@@ -203,7 +203,7 @@ mod integration {
         use payjoin::{HpkeKeyPair, OhttpKeys, Request, Url};
         use payjoin_driver::adapters::DirectoryMailbox;
         use payjoin_driver::participant::execute_plan;
-        use payjoin_driver::{Schedule, Signer};
+        use payjoin_driver::{Broadcaster, Schedule, Signer};
         use payjoin_test_utils::{
             corepc_node, init_bitcoind_funded_wallets, init_tracing, BoxSendSyncError,
             InMemoryPersister, TestServices,
@@ -264,6 +264,24 @@ mod integration {
                 _psbt: payjoin::multiparty::Psbt,
             ) -> Result<payjoin::multiparty::Psbt, Self::Error> {
                 unimplemented!("witness-provision signing is not yet wired in the integration test")
+            }
+        }
+
+        /// Placeholder broadcaster for the parked witness-provision flow (see the
+        /// TODO in `participant_execute_plan`). The finalized transaction is never
+        /// reached here, so this is never invoked.
+        struct UnimplementedBroadcaster;
+
+        impl Broadcaster for UnimplementedBroadcaster {
+            type Error = std::convert::Infallible;
+
+            async fn broadcast(
+                &self,
+                _tx: payjoin::bitcoin::Transaction,
+            ) -> Result<(), Self::Error> {
+                unimplemented!(
+                    "witness-provision broadcast is not yet wired in the integration test"
+                )
             }
         }
 
@@ -441,7 +459,14 @@ mod integration {
             // concurrent orchestration of the participants (execute_plan now
             // blocks until balance()==0, i.e. every contribution is in, so the
             // three can no longer be driven to completion one after another).
-            execute_plan(&mailbox, &ImmediateSchedule, &UnimplementedSigner, persister).await?;
+            execute_plan(
+                &mailbox,
+                &ImmediateSchedule,
+                &UnimplementedSigner,
+                &UnimplementedBroadcaster,
+                persister,
+            )
+            .await?;
             Ok(())
         }
 

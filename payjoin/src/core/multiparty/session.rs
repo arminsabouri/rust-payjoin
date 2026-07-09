@@ -59,6 +59,8 @@ pub enum MultipartySessionOutcome {
     Failure,
     /// Pre-parameters phase complete; session parameters continue in a new log.
     Graduated(SessionParameters),
+    /// The collaborative transaction was finalized and broadcast to the network.
+    Complete,
 }
 
 impl MultipartySessionEvent {

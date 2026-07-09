@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use super::plan::PlanBuilder;
 use super::{ParticipantError, Plan};
 use crate::multiparty::persist::EventfulTransition;
-use crate::multiparty::session::{MultipartySession, MultipartySessionEvent};
+use crate::multiparty::session::{
+    MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
+};
 use crate::multiparty::session_parameters::SessionParameters;
 use crate::persist::NextStateTransition;
 use crate::receive::InputPair;
@@ -312,6 +314,21 @@ impl Participant<HasPlan> {
         )
     }
 
+    /// Close the session once every input carries a witness.
+    ///
+    /// Called on a witness `HasPlan` after the driver has broadcast the finalized
+    /// transaction ([`final_tx`](PlanPsbtAccumulator::final_tx)). There is no
+    /// intermediate "ready to broadcast" state or event: readiness is derived from
+    /// [`segment_complete`](Self::segment_complete) on the replayed fragments, and
+    /// broadcasting is idempotent, so the only thing worth recording is the
+    /// terminus. Emits [`MultipartySessionOutcome::Complete`].
+    pub fn broadcast_complete(&self) -> ParticipantStepTransition {
+        ParticipantStepTransition::success(
+            [MultipartySessionEvent::Closed(MultipartySessionOutcome::Complete)],
+            MultipartySession::Closed(MultipartySessionOutcome::Complete),
+        )
+    }
+
     /// Replay of [`MultipartySessionEvent::WitnessPlanGenerated`]: swap in the
     /// grown plan and resume plan execution at the witness segment.
     pub(crate) fn apply_witness_plan(self, plan: Plan) -> MultipartySession {
@@ -550,6 +567,25 @@ mod tests {
             MultipartySession::ParticipantHasPlan(p) => assert_eq!(p.plan_cursor, 2),
             other => panic!("expected HasPlan, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn broadcast_complete_closes_the_session() {
+        use crate::multiparty::session::MultipartySessionOutcome;
+
+        // The witness segment is done; recording the broadcast closes the session.
+        // (`broadcast_complete` records the terminus unconditionally; readiness is
+        // the driver's call via `segment_complete`.)
+        let (persister, has_plan) = seeded(1, 1);
+
+        let session = has_plan.broadcast_complete().save(&persister).expect("save close");
+        assert!(matches!(session, MultipartySession::Closed(MultipartySessionOutcome::Complete)));
+
+        // Replay lands on the same terminal outcome — no readiness event needed.
+        assert!(matches!(
+            replay_event_log(&persister).expect("replay").0,
+            MultipartySession::Closed(MultipartySessionOutcome::Complete)
+        ));
     }
 
     #[test]

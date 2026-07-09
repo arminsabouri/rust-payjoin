@@ -48,7 +48,7 @@ impl DirectoryMailbox {
     ///
     /// `fragments_read` is how many directory PSBT fragments were already read
     /// and persisted before this driver run (typically
-    /// [`Participant::directory_psbt_fragment_count`](payjoin::multiparty::Participant::directory_psbt_fragment_count)
+    /// [`PlanPsbtAccumulator::directory_psbt_fragment_count`](payjoin::multiparty::PlanPsbtAccumulator::directory_psbt_fragment_count)
     /// replayed from the event log).
     pub fn new(
         client: Client,

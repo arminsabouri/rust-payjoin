@@ -10,7 +10,9 @@ use futures::Stream;
 use payjoin::append_mailbox::{
     append_request, process_append_response, process_read_response, read_request, MailboxError,
 };
-use payjoin::multiparty::{parse_mailbox_psbt_fragment, Psbt, SessionParameters};
+use payjoin::multiparty::{
+    parse_mailbox_psbt_fragment, serialize_mailbox_psbt_fragment, Psbt, SessionParameters,
+};
 use payjoin::{HpkeKeyPair, IntoUrl, IntoUrlError, OhttpKeys, Request, Url};
 use reqwest::Client;
 
@@ -134,7 +136,7 @@ impl CollaborativeMessageSet for DirectoryMailbox {
             &self.coords.ohttp_keys,
             &self.coords.directory,
             self.ohttp_relay.as_str(),
-            &message.serialize(),
+            &serialize_mailbox_psbt_fragment(&message),
             self.coords.shared_keypair.public_key(),
         )?;
         let body = self.post(request).await?;

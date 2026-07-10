@@ -10,9 +10,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::receive::InputPair;
 
+/// Number of bytes in a mailbox fragment's length prefix.
+const FRAGMENT_LENGTH_PREFIX: usize = 4;
+
 /// Error validating a mailbox payload as a concurrent PSBT fragment.
 #[derive(Debug)]
 pub enum PsbtFragmentError {
+    /// The frame is shorter than its length prefix claims, so no PSBT can be
+    /// recovered from it.
+    MalformedFrame,
     Deserialize(DeserializeError),
     InvalidFragment(concurrent_psbt::constructor::ConstructorError),
 }
@@ -20,6 +26,7 @@ pub enum PsbtFragmentError {
 impl fmt::Display for PsbtFragmentError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::MalformedFrame => write!(f, "mailbox frame shorter than its length prefix"),
             Self::Deserialize(err) => write!(f, "invalid PSBT encoding: {err}"),
             Self::InvalidFragment(err) => write!(f, "invalid PSBT fragment: {err}"),
         }
@@ -29,27 +36,51 @@ impl fmt::Display for PsbtFragmentError {
 impl std::error::Error for PsbtFragmentError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::MalformedFrame => None,
             Self::Deserialize(err) => Some(err),
             Self::InvalidFragment(err) => Some(err),
         }
     }
 }
 
+/// Frame a PSBT fragment for the shared mailbox: a little-endian length prefix
+/// followed by the serialized PSBT.
+///
+/// Mailbox frames are a fixed size, zero-padded to hide the payload length. A
+/// serialized PSBT ends in a `0x00` map separator, which is indistinguishable
+/// from that padding, so the reader cannot recover the fragment by trimming
+/// trailing zeros. The explicit length prefix lets [`parse_mailbox_psbt_fragment`]
+/// take exactly the PSBT bytes and ignore the padding.
+pub fn serialize_mailbox_psbt_fragment(psbt: &Psbt) -> Vec<u8> {
+    let bytes = psbt.serialize();
+    let mut framed = Vec::with_capacity(FRAGMENT_LENGTH_PREFIX + bytes.len());
+    framed.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    framed.extend_from_slice(&bytes);
+    framed
+}
+
 /// Parse one HPKE-decrypted mailbox payload into a validated PSBT fragment.
 ///
 /// The mailbox transport calls this so parsing and validation live alongside
-/// decryption, not in the participant state machine.
+/// decryption, not in the participant state machine. The payload is a frame
+/// produced by [`serialize_mailbox_psbt_fragment`], zero-padded to the fixed
+/// frame size; the length prefix delimits the PSBT from the padding.
 pub fn parse_mailbox_psbt_fragment(padded_message: &[u8]) -> Result<Psbt, PsbtFragmentError> {
-    let bytes = trim_trailing_zeros(padded_message);
+    let bytes = unframe_psbt_fragment(padded_message)?;
     let psbt = Psbt::deserialize(bytes).map_err(PsbtFragmentError::Deserialize)?;
     Constructor::<BothModifiable, Unset>::try_from_psbt(psbt.clone())
         .map_err(PsbtFragmentError::InvalidFragment)?;
     Ok(psbt)
 }
 
-fn trim_trailing_zeros(bytes: &[u8]) -> &[u8] {
-    let end = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
-    &bytes[..end]
+/// Recover the exact PSBT bytes from a padded frame using its length prefix.
+fn unframe_psbt_fragment(padded_message: &[u8]) -> Result<&[u8], PsbtFragmentError> {
+    if padded_message.len() < FRAGMENT_LENGTH_PREFIX {
+        return Err(PsbtFragmentError::MalformedFrame);
+    }
+    let (prefix, rest) = padded_message.split_at(FRAGMENT_LENGTH_PREFIX);
+    let len = u32::from_le_bytes(prefix.try_into().expect("prefix is 4 bytes")) as usize;
+    rest.get(..len).ok_or(PsbtFragmentError::MalformedFrame)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,7 +265,10 @@ mod tests {
     use bitcoin::key::rand::SeedableRng;
     use bitcoin::TxOut;
 
-    use super::{exp_gap, parse_mailbox_psbt_fragment, Action, PlanBuilder, MEAN_ACTION_INTERVAL};
+    use super::{
+        exp_gap, parse_mailbox_psbt_fragment, serialize_mailbox_psbt_fragment, Action, PlanBuilder,
+        MEAN_ACTION_INTERVAL,
+    };
 
     fn sample_txout() -> TxOut {
         TxOut { value: bitcoin::Amount::from_sat(10_000), script_pubkey: bitcoin::ScriptBuf::new() }
@@ -288,18 +322,24 @@ mod tests {
 
     #[test]
     fn parse_mailbox_psbt_fragment_accepts_valid_fragment_with_padding() {
+        use bitcoin::hashes::Hash;
+
         let fragment = Action::RegisterOutput {
             output: TxOut {
                 value: bitcoin::Amount::from_sat(42_000),
-                script_pubkey: bitcoin::ScriptBuf::new(),
+                // psbt-v2 requires a present scriptPubKey to round-trip an output.
+                script_pubkey: bitcoin::ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::all_zeros()),
             },
             unique_id: [1u8; 32],
         }
         .as_psbt_fragment();
-        let mut padded = fragment.serialize();
+        // A serialized PSBT ends in a `0x00` separator; the length-prefixed frame
+        // survives zero padding that a trailing-zero trim would eat into.
+        let mut padded = serialize_mailbox_psbt_fragment(&fragment);
         padded.extend(std::iter::repeat_n(0u8, 16));
 
-        parse_mailbox_psbt_fragment(&padded).expect("valid padded PSBT fragment");
+        let parsed = parse_mailbox_psbt_fragment(&padded).expect("valid padded PSBT fragment");
+        assert_eq!(parsed, fragment);
     }
 
     #[test]
@@ -351,7 +391,21 @@ mod tests {
 
     #[test]
     fn parse_mailbox_psbt_fragment_rejects_psbt_without_unique_id() {
-        let psbt = concurrent_psbt::constructor::Creator::new().build().into_psbt();
-        assert!(parse_mailbox_psbt_fragment(&psbt.serialize()).is_err());
+        use bitcoin::hashes::Hash;
+
+        // A valid output fragment with its unique-id proprietary key stripped —
+        // keeping the global output count intact so the output still serializes.
+        // The frame is well formed, so it is rejected by fragment validation, not
+        // by unframing.
+        let mut psbt = Action::RegisterOutput {
+            output: TxOut {
+                value: bitcoin::Amount::from_sat(42_000),
+                script_pubkey: bitcoin::ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::all_zeros()),
+            },
+            unique_id: [1u8; 32],
+        }
+        .as_psbt_fragment();
+        psbt.outputs[0].proprietaries.clear();
+        assert!(parse_mailbox_psbt_fragment(&serialize_mailbox_psbt_fragment(&psbt)).is_err());
     }
 }

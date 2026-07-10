@@ -45,11 +45,15 @@ pub(crate) fn ohttp_encapsulate(
         }
         authority.into_bytes()
     };
+    let path_and_query = match url.query() {
+        Some(query) => format!("{}?{}", url.path(), query),
+        None => url.path().to_string(),
+    };
     let mut bhttp_message = bhttp::Message::request(
         method.as_bytes().to_vec(),
         url.scheme().as_bytes().to_vec(),
         authority_bytes,
-        url.path().as_bytes().to_vec(),
+        path_and_query.into_bytes(),
     );
     // None of our messages include headers, so we don't add them
     if let Some(body) = body {

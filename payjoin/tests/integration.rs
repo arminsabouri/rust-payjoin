@@ -345,6 +345,7 @@ mod integration {
                 self.node
                     .send_raw_transaction(&tx)
                     .map_err(|e| RpcError(format!("sendrawtransaction failed: {e}").into()))?;
+                println!("{:?}", tx);
                 Ok(())
             }
         }
@@ -815,6 +816,19 @@ mod integration {
                 plaintexts,
                 vec![b"hello from A".to_vec(), b"hello from B".to_vec(), b"second from A".to_vec(),],
                 "all appended frames returned in append order"
+            );
+
+            // Reading with `skip` past the OHTTP round trip returns only the
+            // frames appended after the caller's cursor, proving the `skip`
+            // query parameter survives bhttp encapsulation end to end.
+            let (req, ctx) = read_request(&ohttp_keys, &directory, &ohttp_relay, &mailbox, 2)?;
+            let body = send_ohttp_request(&agent, req).await?;
+            let messages = process_read_response(&body, ctx, &shared_secret_context)?;
+            let plaintexts: Vec<Vec<u8>> = messages.iter().map(|m| trim(&m)).collect();
+            assert_eq!(
+                plaintexts,
+                vec![b"second from A".to_vec()],
+                "skip is honored over OHTTP: only frames past the cursor are returned"
             );
 
             // A reader the frames were not sealed to recovers nothing from the

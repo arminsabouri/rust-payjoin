@@ -223,6 +223,7 @@ impl SessionCreatorBuilder {
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn build_from_open_awaiting<P>(
     session_parameters: SessionParameters,
     awaiting: &[(&P, ParticipantAwaitingSessionParameters)],

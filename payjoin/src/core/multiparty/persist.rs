@@ -157,6 +157,7 @@ impl<P, S> MultipartyGraduationTransition<P, S> {
         Self { from, close_event, successor }
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn save<R>(
         self,
         registry: &mut R,
@@ -244,6 +245,7 @@ impl SessionParametersPollTransition {
     ///
     /// Stasis requires no registry mutation. Adoption closes `from` and registers a new log
     /// whose first event is [`MultipartySessionEvent::SessionParametersAdopted`].
+    #[allow(clippy::type_complexity)]
     pub fn save<R>(
         self,
         registry: &mut R,
@@ -270,11 +272,13 @@ impl SessionParametersPollTransition {
 pub enum SessionParametersPollFailure {
     Transient(crate::multiparty::participant::ParticipantSessionError),
     Fatal(
-        MaybeFatalTransitionWithNoResults<
-            MultipartySessionEvent,
-            (),
-            ParticipantAwaitingSessionParameters,
-            crate::multiparty::participant::ParticipantSessionError,
+        Box<
+            MaybeFatalTransitionWithNoResults<
+                MultipartySessionEvent,
+                (),
+                ParticipantAwaitingSessionParameters,
+                crate::multiparty::participant::ParticipantSessionError,
+            >,
         >,
     ),
 }

@@ -95,12 +95,12 @@ impl ParticipantAwaitingSessionParameters {
                     return Err(SessionParametersPollFailure::Transient(e));
                 }
                 _ =>
-                    return Err(SessionParametersPollFailure::Fatal(
+                    return Err(SessionParametersPollFailure::Fatal(Box::new(
                         MaybeFatalTransitionWithNoResults::fatal(
                             MultipartySessionEvent::Closed(MultipartySessionOutcome::Failure),
                             e,
                         ),
-                    )),
+                    ))),
             },
         };
 

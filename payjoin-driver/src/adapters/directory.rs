@@ -42,6 +42,7 @@ pub struct DirectoryMailbox {
 /// Long-poll stream over one [`DirectoryMailbox`].
 pub struct DirectoryMailboxMessages {
     mailbox: DirectoryMailbox,
+    #[allow(clippy::type_complexity)]
     in_flight: Option<Pin<Box<dyn Future<Output = Result<Vec<Psbt>, DirectoryMailboxError>>>>>,
 }
 
@@ -68,6 +69,7 @@ impl DirectoryMailbox {
                 ohttp_keys,
                 shared_keypair: session_parameters.session_shared_keypair(),
             },
+            #[allow(clippy::arc_with_non_send_sync)]
             fragments_read: Arc::new(Cell::new(fragments_read)),
         })
     }

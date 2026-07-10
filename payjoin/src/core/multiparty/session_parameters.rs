@@ -114,7 +114,7 @@ impl SessionParameters {
     }
 
     pub fn session_shared_secret_key(&self) -> HpkeSecretKey {
-        HpkeSecretKey(SecretKey::from_bytes(&self.session_secret.to_vec()).unwrap())
+        HpkeSecretKey(SecretKey::from_bytes(self.session_secret.as_ref()).unwrap())
     }
 
     pub fn session_shared_keypair(&self) -> HpkeKeyPair {

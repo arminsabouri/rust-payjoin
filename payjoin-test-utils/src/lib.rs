@@ -185,11 +185,17 @@ pub fn local_cert_key() -> rcgen::CertifiedKey<rcgen::KeyPair> {
         .expect("Failed to generate cert")
 }
 
-pub fn init_bitcoind() -> Result<corepc_node::Node, BoxError> {
+pub fn init_bitcoind() -> Result<corepc_node::Node, BoxError> { init_bitcoind_with_extra_args(&[]) }
+
+/// Like [`init_bitcoind`], but appends `extra_args` to the node's launch flags
+/// (e.g. `-minrelaytxfee=0` to accept the zero-fee collaborative transaction the
+/// multiparty participant driver produces).
+pub fn init_bitcoind_with_extra_args(extra_args: &[&str]) -> Result<corepc_node::Node, BoxError> {
     let bitcoind_exe = corepc_node::exe_path()?;
     let mut conf = corepc_node::Conf::default();
     conf.view_stdout = tracing::enabled!(target: "corepc", Level::TRACE);
     // conf.args.push("-txindex");
+    conf.args.extend_from_slice(extra_args);
     let bitcoind = corepc_node::Node::with_conf(bitcoind_exe, &conf)?;
     Ok(bitcoind)
 }
@@ -211,7 +217,16 @@ pub fn init_bitcoind_sender_receiver(
 pub fn init_bitcoind_funded_wallets<W: AsRef<str>>(
     wallets: Vec<(W, Option<AddressType>)>,
 ) -> Result<(corepc_node::Node, Vec<corepc_node::Client>), BoxError> {
-    let bitcoind = init_bitcoind()?;
+    init_bitcoind_funded_wallets_with_extra_args(&[], wallets)
+}
+
+/// Like [`init_bitcoind_funded_wallets`], but launches the node with
+/// `extra_args` appended (e.g. `-minrelaytxfee=0`).
+pub fn init_bitcoind_funded_wallets_with_extra_args<W: AsRef<str>>(
+    extra_args: &[&str],
+    wallets: Vec<(W, Option<AddressType>)>,
+) -> Result<(corepc_node::Node, Vec<corepc_node::Client>), BoxError> {
+    let bitcoind = init_bitcoind_with_extra_args(extra_args)?;
     let funded_wallets = create_and_fund_wallets(&bitcoind, wallets)?;
     Ok((bitcoind, funded_wallets))
 }

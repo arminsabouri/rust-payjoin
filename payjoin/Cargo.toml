@@ -75,6 +75,7 @@ bhttp = "0.6.1"
 futures = "0.3.31"
 ohttp = { package = "bitcoin-ohttp", version = "0.6.0" }
 once_cell = "1.21.3"
+psbt-v2 = { version = "0.3.0", features = ["serde"] }
 payjoin-driver = { path = "../payjoin-driver" }
 payjoin-test-utils = { path = "../payjoin-test-utils" }
 tokio = { version = "1.47.1", features = ["full"] }

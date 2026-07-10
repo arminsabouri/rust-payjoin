@@ -205,8 +205,8 @@ mod integration {
         use payjoin_driver::participant::execute_plan;
         use payjoin_driver::{Broadcaster, Schedule, Signer};
         use payjoin_test_utils::{
-            corepc_node, init_bitcoind_funded_wallets, init_tracing, BoxSendSyncError,
-            InMemoryPersister, TestServices,
+            corepc_node, init_bitcoind_funded_wallets_with_extra_args, init_tracing,
+            BoxSendSyncError, InMemoryPersister, TestServices,
         };
         use reqwest::Client;
 
@@ -251,37 +251,101 @@ mod integration {
             }
         }
 
-        /// Placeholder signer for the parked witness-provision flow (see the
-        /// TODO in `participant_execute_plan`). The end-to-end witness path is not
-        /// yet driven here, so this is never invoked.
-        struct UnimplementedSigner;
+        /// A concrete [`std::error::Error`] for the driver dependency traits, whose
+        /// associated `Error` must be `Error + Send + Sync + 'static` — which a bare
+        /// boxed error is not. Wraps whatever the RPC round-trip produced.
+        #[derive(Debug)]
+        struct RpcError(BoxSendSyncError);
 
-        impl Signer for UnimplementedSigner {
-            type Error = std::convert::Infallible;
+        impl std::fmt::Display for RpcError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.0.fmt(f) }
+        }
 
-            async fn sign(
+        impl std::error::Error for RpcError {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(self.0.as_ref()) }
+        }
+
+        /// Signs this participant's own inputs in the accumulated collaborative PSBT.
+        ///
+        /// The state machine works in psbt-v2, but bitcoind's wallet RPCs
+        /// (`walletprocesspsbt` / `finalizepsbt`) speak BIP-174 v0. A finalized
+        /// witness is format-agnostic, so we bridge only for the RPC round-trip:
+        /// derive the unsigned transaction from the deterministically ordered v2
+        /// PSBT, wrap it as a v0 PSBT carrying each input's funding UTXO, let this
+        /// participant's wallet sign and finalize (it only touches inputs it owns),
+        /// then copy the resulting witnesses back onto the v2 inputs by position.
+        /// [`provide_signed_psbt`](payjoin::multiparty::Participant::provide_signed_psbt)
+        /// then keeps only this participant's finalized inputs.
+        struct WalletSigner<'a> {
+            wallet: &'a corepc_node::Client,
+        }
+
+        impl WalletSigner<'_> {
+            fn sign_inner(
                 &self,
-                _psbt: payjoin::multiparty::Psbt,
-            ) -> Result<payjoin::multiparty::Psbt, Self::Error> {
-                unimplemented!("witness-provision signing is not yet wired in the integration test")
+                psbt: payjoin::multiparty::Psbt,
+            ) -> Result<payjoin::multiparty::Psbt, BoxSendSyncError> {
+                let unsigned_tx = psbt_v2::v2::Signer::new(psbt.clone())?.unsigned_tx();
+                let mut v0 = bitcoin::Psbt::from_unsigned_tx(unsigned_tx)?;
+                // The v0 inputs share the v2 input order, so funding UTXOs line up
+                // by index — the wallet needs them to sign the segwit inputs.
+                for (v0_input, v2_input) in v0.inputs.iter_mut().zip(psbt.inputs.iter()) {
+                    v0_input.witness_utxo = v2_input.witness_utxo.clone();
+                }
+                let processed = self.wallet.wallet_process_psbt(&v0)?.into_model()?.psbt;
+                let finalized = self
+                    .wallet
+                    .finalize_psbt(&processed)?
+                    .into_model()?
+                    .psbt
+                    .ok_or("finalizepsbt returned no PSBT")?;
+                let mut signed = psbt;
+                for (v2_input, v0_input) in signed.inputs.iter_mut().zip(finalized.inputs.iter()) {
+                    v2_input.final_script_witness = v0_input.final_script_witness.clone();
+                    // Native segwit finalizes to an empty scriptSig, which
+                    // `finalizepsbt` omits. Record it explicitly: psbt-v2's
+                    // `is_finalized()` requires both the scriptSig and the witness,
+                    // so a witnessed input needs a present (empty) scriptSig too.
+                    v2_input.final_script_sig = v0_input.final_script_sig.clone().or_else(|| {
+                        v0_input.final_script_witness.as_ref().map(|_| bitcoin::ScriptBuf::new())
+                    });
+                }
+                Ok(signed)
             }
         }
 
-        /// Placeholder broadcaster for the parked witness-provision flow (see the
-        /// TODO in `participant_execute_plan`). The finalized transaction is never
-        /// reached here, so this is never invoked.
-        struct UnimplementedBroadcaster;
+        impl Signer for WalletSigner<'_> {
+            type Error = RpcError;
 
-        impl Broadcaster for UnimplementedBroadcaster {
-            type Error = std::convert::Infallible;
+            async fn sign(
+                &self,
+                psbt: payjoin::multiparty::Psbt,
+            ) -> Result<payjoin::multiparty::Psbt, Self::Error> {
+                self.sign_inner(psbt).map_err(RpcError)
+            }
+        }
+
+        /// Broadcasts the finalized collaborative transaction to the regtest node.
+        ///
+        /// A successful `sendrawtransaction` is itself proof the transaction was
+        /// accepted and broadcast; a failure surfaces as a driver error. Every
+        /// participant independently reaches this terminus and submits the same
+        /// transaction, which Bitcoin Core accepts idempotently.
+        struct NodeBroadcaster<'a> {
+            node: &'a corepc_node::Client,
+        }
+
+        impl Broadcaster for NodeBroadcaster<'_> {
+            type Error = RpcError;
 
             async fn broadcast(
                 &self,
-                _tx: payjoin::bitcoin::Transaction,
+                tx: payjoin::bitcoin::Transaction,
             ) -> Result<(), Self::Error> {
-                unimplemented!(
-                    "witness-provision broadcast is not yet wired in the integration test"
-                )
+                self.node
+                    .send_raw_transaction(&tx)
+                    .map_err(|e| RpcError(format!("sendrawtransaction failed: {e}").into()))?;
+                Ok(())
             }
         }
 
@@ -306,21 +370,31 @@ mod integration {
                 Self { name, client }
             }
 
-            fn candidate_inputs(&self) -> Result<Vec<InputPair>, BoxSendSyncError> {
+            /// Registration completes only when the accumulated PSBT balances to
+            /// zero (`balance()` is total inputs minus total outputs, pre-fee).
+            /// Crucially, each participant is deliberately *unbalanced on its own*
+            /// (`output_value != input_value`) — otherwise a participant would reach
+            /// a zero balance from its own fragments alone and sign in isolation,
+            /// over the wrong one-input transaction, never pooling with the others.
+            /// The caller chooses `output_value`s that sum to the total input value
+            /// across all participants, so the collaborative transaction balances
+            /// globally at a zero fee — which is why the node runs with
+            /// `-minrelaytxfee=0`.
+            fn registration(
+                &self,
+                output_value: Amount,
+            ) -> Result<(Vec<InputPair>, Vec<TxOut>), BoxSendSyncError> {
                 let utxos = self.client.list_unspent().map_err(|e| -> BoxSendSyncError {
                     format!("{} list unspent failed: {e}", self.name).into()
                 })?;
-                Ok(utxos.0.into_iter().map(input_pair_from_list_unspent).collect())
-            }
-
-            fn payment_obligations(&self) -> Result<Vec<TxOut>, BoxSendSyncError> {
+                let inputs: Vec<InputPair> =
+                    utxos.0.into_iter().map(input_pair_from_list_unspent).collect();
                 let address = self.client.new_address().map_err(|e| -> BoxSendSyncError {
                     format!("{} new address failed: {e}", self.name).into()
                 })?;
-                Ok(vec![TxOut {
-                    value: Amount::from_sat(50_000),
-                    script_pubkey: address.script_pubkey(),
-                }])
+                let outputs =
+                    vec![TxOut { value: output_value, script_pubkey: address.script_pubkey() }];
+                Ok((inputs, outputs))
             }
         }
 
@@ -414,6 +488,7 @@ mod integration {
         fn participant_generate_plan(
             persister: &InMemoryPersister<MultipartySessionEvent>,
             funded_wallet: &FundedParticipantWallet,
+            output_value: Amount,
         ) -> Result<(), BoxSendSyncError> {
             let (participant_state, _) = replay_event_log(persister)?;
             let participant = match participant_state {
@@ -421,12 +496,8 @@ mod integration {
                 _ => panic!("participant must have session parameters before generating a plan"),
             };
 
-            participant
-                .generate_plan(
-                    funded_wallet.candidate_inputs()?,
-                    funded_wallet.payment_obligations()?,
-                )
-                .save(persister)?;
+            let (inputs, outputs) = funded_wallet.registration(output_value)?;
+            participant.generate_plan(inputs, outputs).save(persister)?;
 
             Ok(())
         }
@@ -434,6 +505,8 @@ mod integration {
         async fn participant_execute_plan(
             agent: &Client,
             persister: &InMemoryPersister<MultipartySessionEvent>,
+            signer: &WalletSigner<'_>,
+            broadcaster: &NodeBroadcaster<'_>,
             directory_url: &str,
             ohttp_keys: &OhttpKeys,
             session_parameters: &SessionParameters,
@@ -453,20 +526,11 @@ mod integration {
                 session_parameters,
                 fragments_read,
             )?;
-            // TODO(witness-provision): drive registration → sign → witness
-            // broadcast. This needs a real v2-PSBT signer (bitcoind's
-            // walletprocesspsbt is BIP-174 v0; psbt-v2 has no clean bridge) and a
-            // concurrent orchestration of the participants (execute_plan now
-            // blocks until balance()==0, i.e. every contribution is in, so the
-            // three can no longer be driven to completion one after another).
-            execute_plan(
-                &mailbox,
-                &ImmediateSchedule,
-                &UnimplementedSigner,
-                &UnimplementedBroadcaster,
-                persister,
-            )
-            .await?;
+            // Registration → sign → witness broadcast → broadcast the finalized
+            // transaction. `execute_plan` blocks until the accumulated PSBT
+            // balances to zero (every participant's contribution is in), so the
+            // three participants must be driven concurrently, not in sequence.
+            execute_plan(&mailbox, &ImmediateSchedule, signer, broadcaster, persister).await?;
             Ok(())
         }
 
@@ -480,11 +544,16 @@ mod integration {
             let ohttp_relay = services.ohttp_relay_url();
 
             let expected_params = sample_session_parameters();
-            let (_bitcoind, wallets) = init_bitcoind_funded_wallets(vec![
-                ("responder_a", Some(corepc_node::AddressType::Bech32)),
-                ("responder_b", Some(corepc_node::AddressType::Bech32)),
-                ("creator", Some(corepc_node::AddressType::Bech32)),
-            ])
+            // The collaborative transaction carries no fee (registration completes
+            // only at a zero pre-fee balance), so the node must relay zero-fee txs.
+            let (_bitcoind, wallets) = init_bitcoind_funded_wallets_with_extra_args(
+                &["-minrelaytxfee=0"],
+                vec![
+                    ("responder_a", Some(corepc_node::AddressType::Bech32)),
+                    ("responder_b", Some(corepc_node::AddressType::Bech32)),
+                    ("creator", Some(corepc_node::AddressType::Bech32)),
+                ],
+            )
             .map_err(|e| -> BoxSendSyncError { e.to_string().into() })?;
             let mut wallets = wallets.into_iter();
             let responder_a_wallet = FundedParticipantWallet::new(
@@ -576,48 +645,78 @@ mod integration {
             )
             .await?;
 
-            participant_generate_plan(&participant_a_persister, &responder_a_wallet)?;
-            participant_generate_plan(&participant_b_persister, &responder_b_wallet)?;
-            participant_generate_plan(&creator_persister, &creator_wallet)?;
-            participant_execute_plan(
-                &agent,
-                &creator_persister,
-                &directory_url,
-                &ohttp_keys,
-                &expected_params,
-                &ohttp_relay,
-            )
-            .await?;
-            participant_execute_plan(
-                &agent,
+            // Each wallet funds a single 50 BTC input. The outputs are individually
+            // unbalanced but sum to the 150 BTC total, so registration only
+            // completes once all three pool — forcing every participant to sign the
+            // full collaborative transaction rather than its own input in isolation.
+            participant_generate_plan(
                 &participant_a_persister,
-                &directory_url,
-                &ohttp_keys,
-                &expected_params,
-                &ohttp_relay,
-            )
-            .await?;
-            participant_execute_plan(
-                &agent,
+                &responder_a_wallet,
+                Amount::from_int_btc(40),
+            )?;
+            participant_generate_plan(
                 &participant_b_persister,
-                &directory_url,
-                &ohttp_keys,
-                &expected_params,
-                &ohttp_relay,
-            )
-            .await?;
-            let (session, _) = replay_event_log(&participant_b_persister)?;
-            let _ = match session {
-                MultipartySession::ParticipantHasPlan(participant) => participant,
-                _ => panic!("participant B should have finished executing its plan"),
-            };
+                &responder_b_wallet,
+                Amount::from_int_btc(40),
+            )?;
+            participant_generate_plan(
+                &creator_persister,
+                &creator_wallet,
+                Amount::from_int_btc(70),
+            )?;
 
+            // Each participant signs with its own wallet; any node client can relay
+            // the shared finalized transaction.
+            let signer_a = WalletSigner { wallet: &responder_a_wallet.client };
+            let signer_b = WalletSigner { wallet: &responder_b_wallet.client };
+            let signer_creator = WalletSigner { wallet: &creator_wallet.client };
+            let broadcaster = NodeBroadcaster { node: &creator_wallet.client };
+
+            // Drive the three participants concurrently: each `execute_plan` blocks
+            // until every contribution is in, so they must make progress together.
+            tokio::try_join!(
+                participant_execute_plan(
+                    &agent,
+                    &creator_persister,
+                    &signer_creator,
+                    &broadcaster,
+                    &directory_url,
+                    &ohttp_keys,
+                    &expected_params,
+                    &ohttp_relay,
+                ),
+                participant_execute_plan(
+                    &agent,
+                    &participant_a_persister,
+                    &signer_a,
+                    &broadcaster,
+                    &directory_url,
+                    &ohttp_keys,
+                    &expected_params,
+                    &ohttp_relay,
+                ),
+                participant_execute_plan(
+                    &agent,
+                    &participant_b_persister,
+                    &signer_b,
+                    &broadcaster,
+                    &directory_url,
+                    &ohttp_keys,
+                    &expected_params,
+                    &ohttp_relay,
+                ),
+            )?;
+
+            // Every participant broadcast the finalized transaction and closed.
             for (pre_graduation, post_graduation) in [
                 (responder_a_persister, participant_a_persister),
                 (responder_b_persister, participant_b_persister),
             ] {
                 let (session_state, _) = replay_event_log(&post_graduation)?;
-                assert!(matches!(session_state, MultipartySession::ParticipantHasPlan(_)));
+                assert!(matches!(
+                    session_state,
+                    MultipartySession::Closed(MultipartySessionOutcome::Complete)
+                ));
 
                 let (session_state, _) = replay_event_log(&pre_graduation)?;
                 assert!(matches!(
@@ -627,7 +726,10 @@ mod integration {
             }
 
             let (session_state, _) = replay_event_log(&creator_persister)?;
-            assert!(matches!(session_state, MultipartySession::ParticipantHasPlan(_)));
+            assert!(matches!(
+                session_state,
+                MultipartySession::Closed(MultipartySessionOutcome::Complete)
+            ));
 
             let (session_state, _) = replay_event_log(&initiator_a_persister)?;
             assert!(matches!(
@@ -643,11 +745,6 @@ mod integration {
             Ok(())
         }
 
-        // TODO(witness-provision): re-enable once the witness flow is driven
-        // end-to-end. execute_plan now blocks until balance()==0 and then signs +
-        // broadcasts witnesses, so this test needs (1) a real v2-PSBT signer and
-        // (2) the three participants driven concurrently rather than in sequence.
-        #[ignore = "witness-provision flow not yet wired end-to-end (see TODO)"]
         #[tokio::test]
         async fn three_participants_initiator_session_creator() -> Result<(), BoxSendSyncError> {
             init_tracing();

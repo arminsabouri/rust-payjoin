@@ -198,7 +198,3 @@ impl Initiator<Initialized> {
         )
     }
 }
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HasReplyKey {}
-impl Initiator<HasReplyKey> {}

@@ -195,8 +195,3 @@ impl Responder<Initialized> {
         )
     }
 }
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SentReplyKey {}
-
-impl Responder<SentReplyKey> {}

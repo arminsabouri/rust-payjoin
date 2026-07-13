@@ -30,8 +30,6 @@ pub struct InitiatorContext {
     initiator_key: HpkeKeyPair,
     directory: Url,
     ohttp_keys: OhttpKeys,
-    /// Responder reply key from message A, once the initiator has polled the directory.
-    pub(crate) responder_public_key: Option<HpkePublicKey>,
 }
 
 impl InitiatorContext {
@@ -67,12 +65,7 @@ impl InitiatorBuilder {
         ohttp_keys: OhttpKeys,
     ) -> Result<Self, crate::into_url::Error> {
         let initiator_key = HpkeKeyPair::gen_keypair();
-        Ok(Self(InitiatorContext {
-            initiator_key,
-            directory: directory.into_url()?,
-            ohttp_keys,
-            responder_public_key: None,
-        }))
+        Ok(Self(InitiatorContext { initiator_key, directory: directory.into_url()?, ohttp_keys }))
     }
 
     pub fn build(self) -> NextStateTransition<MultipartySessionEvent, Initiator<Initialized>> {

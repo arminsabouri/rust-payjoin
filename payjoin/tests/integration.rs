@@ -663,7 +663,7 @@ mod integration {
             participant_generate_plan(
                 &creator_persister,
                 &creator_wallet,
-                Amount::from_int_btc(70),
+                Amount::from_int_btc(70) - Amount::from_sat(308),
             )?;
 
             // Each participant signs with its own wallet; any node client can relay

@@ -113,6 +113,9 @@ impl SessionParameters {
         }
     }
 
+    /// Minimum feerate each participant must meet for their contributed weight (sat/vB).
+    pub fn min_feerate(&self) -> FeeRate { self.min_feerate }
+
     pub fn session_shared_secret_key(&self) -> HpkeSecretKey {
         HpkeSecretKey(SecretKey::from_bytes(self.session_secret.as_ref()).unwrap())
     }

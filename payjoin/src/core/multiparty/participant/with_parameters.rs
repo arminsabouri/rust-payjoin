@@ -1,3 +1,5 @@
+use bitcoin::transaction::{predict_weight, InputWeightPrediction};
+use bitcoin::{FeeRate, ScriptBuf, Weight};
 use concurrent_psbt::constructor::{BothModifiable, Constructor};
 use concurrent_psbt::global::GlobalSortExt;
 use concurrent_psbt::sort::{Deterministic, Sorter, Unset};
@@ -140,12 +142,6 @@ impl PlanPsbtAccumulator {
     ///
     /// Input amounts come from each input's funding UTXO, which the participant
     /// now carries in its input fragments (see `psbt_v2_input`).
-    ///
-    /// TODO: fold in the network fee. Once weight estimation for a partially
-    /// accumulated multiparty PSBT exists, add an `is_balanced()` that returns
-    /// true when `balance() - min_feerate * estimated_weight == 0` (a true zero
-    /// balance). No such weight model exists yet, so for now the caller compares
-    /// this delta against a fee it computes itself.
     pub fn balance(&self) -> bitcoin::SignedAmount {
         let psbt = self.accumulated_psbt();
         // TODO: surface, rather than panic on, a peer fragment that omits its
@@ -158,6 +154,38 @@ impl PlanPsbtAccumulator {
         let outputs: u64 = psbt.outputs.iter().map(|output| output.amount.to_sat()).sum();
         // Total bitcoin value is bounded well within i64, so neither cast wraps.
         bitcoin::SignedAmount::from_sat(inputs as i64 - outputs as i64)
+    }
+
+    /// Whether [`balance`](Self::balance) exactly covers the network fee
+    /// `min_feerate` requires for the accumulated PSBT's estimated weight.
+    ///
+    /// Deliberately an exact match, not `balance() >= required_fee`: an exact
+    /// match from one participant's own partial view (its own fragments plus
+    /// whatever it has read so far) is as good as impossible to hit by
+    /// accident, so — like the old `balance() == 0` check it replaces — it
+    /// still forces every participant to wait for the full pool rather than
+    /// letting a participant whose own slice happens to be in surplus
+    /// conclude it's done from a tiny, still-partial transaction. `>=` does
+    /// not have this property: a participant that is a net payer relative to
+    /// its own output can *always* trivially cover its own tiny local
+    /// estimated fee alone, well before any peer fragment arrives.
+    ///
+    /// `None` if the weight can't yet be estimated (an input's scriptPubKey is
+    /// not one of the types [`estimate_weight`] recognizes) — treated as
+    /// "not balanced yet" by the caller rather than a hard error, since more
+    /// directory fragments may still resolve it.
+    ///
+    /// TODO: this whole estimated-weight detour should be removed once the
+    /// protocol grows pseudo-outputs. A pseudo-output makes the fee an
+    /// explicit, negotiated output value instead of an off-band estimate every
+    /// participant has to (re)compute identically pre-signing; `is_balanced`
+    /// would then just be `balance() == 0` against a real output, and
+    /// [`estimate_weight`] disappears entirely.
+    fn is_balanced(&self, min_feerate: FeeRate) -> Option<bool> {
+        let weight = estimate_weight(&self.accumulated_psbt())?;
+        let required_fee = min_feerate.fee_wu(weight)?.to_sat() as i64;
+        let balance = self.balance().to_sat();
+        Some(balance == required_fee)
     }
 
     /// Whether every input in the accumulated PSBT carries a finalized witness.
@@ -186,6 +214,41 @@ impl PlanPsbtAccumulator {
             .expect("all inputs finalized before extract")
             .extract_tx()
             .expect("finalized collaborative transaction extracts")
+    }
+}
+
+/// Estimate the weight of the accumulated, not-yet-finalized collaborative
+/// transaction from each input's spent scriptPubKey type and each output's
+/// scriptPubKey length.
+///
+/// Returns `None` if any input's funding UTXO is missing or its scriptPubKey
+/// isn't one of the types [`input_weight_prediction`] recognizes.
+fn estimate_weight(psbt: &Psbt) -> Option<Weight> {
+    let input_predictions = psbt
+        .iter_funding_utxos()
+        .map(|utxo| input_weight_prediction(&utxo.ok()?.script_pubkey))
+        .collect::<Option<Vec<_>>>()?;
+    let output_lens = psbt.outputs.iter().map(|output| output.script_pubkey.len());
+    Some(predict_weight(input_predictions, output_lens))
+}
+
+/// Predict one input's weight from its scriptPubKey's address type, using the
+/// worst-case (largest) signature size for each supported type.
+///
+/// Only the types with a fixed, pre-signing-known maximum witness/scriptSig
+/// size are supported: P2WPKH, legacy P2PKH (compressed key), and P2TR
+/// (key-path spend, the only kind this protocol produces). Anything else
+/// (nested or bare P2SH/P2WSH, P2TR script-path) can't be sized before the
+/// spending witness exists, so this returns `None` for those.
+fn input_weight_prediction(script_pubkey: &ScriptBuf) -> Option<InputWeightPrediction> {
+    if script_pubkey.is_p2wpkh() {
+        Some(InputWeightPrediction::P2WPKH_MAX)
+    } else if script_pubkey.is_p2tr() {
+        Some(InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH)
+    } else if script_pubkey.is_p2pkh() {
+        Some(InputWeightPrediction::P2PKH_COMPRESSED_MAX)
+    } else {
+        None
     }
 }
 
@@ -280,10 +343,13 @@ impl Participant<HasPlan> {
     ///
     /// Requires the participant's own actions to be fully posted
     /// (`plan_cursor == plan.len()`), plus the segment's funding condition:
-    /// registration is done when the accumulated PSBT balances to zero; the
-    /// witness segment is done when every input carries a witness. The driver
-    /// evaluates this on the replayed state (the authority) and, when true, either
-    /// signs (registration) or finishes (witness). There is no completion event:
+    /// registration is done when the accumulated PSBT's balance exactly covers
+    /// the network fee `min_feerate` requires for its estimated weight (see
+    /// [`is_balanced`](PlanPsbtAccumulator::is_balanced) for why this is an
+    /// exact match rather than "at least"); the witness segment is done when
+    /// every input carries a witness. The driver evaluates this on the
+    /// replayed state (the authority) and, when true, either signs
+    /// (registration) or finishes (witness). There is no completion event:
     /// both outcomes are re-derivable on replay, so only the non-derivable
     /// [`WitnessPlanGenerated`](MultipartySessionEvent::WitnessPlanGenerated) is
     /// logged.
@@ -295,7 +361,8 @@ impl Participant<HasPlan> {
         if self.is_witness_phase() {
             accumulator.all_inputs_finalized()
         } else {
-            accumulator.balance() == bitcoin::SignedAmount::ZERO
+            let min_feerate = self.context.session_parameters.min_feerate();
+            accumulator.is_balanced(min_feerate).unwrap_or(false)
         }
     }
 
@@ -588,12 +655,92 @@ mod tests {
         ));
     }
 
+    /// A real P2WPKH scriptPubKey, so [`estimate_weight`] can size an input or
+    /// output built from it — unlike the empty scripts [`sample_txout`] uses
+    /// elsewhere.
+    fn p2wpkh_script() -> bitcoin::ScriptBuf {
+        use bitcoin::hashes::Hash;
+        bitcoin::ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::all_zeros())
+    }
+
+    /// A single P2WPKH `InputPair` funded with `value` sats.
+    fn p2wpkh_input(value: u64) -> crate::receive::InputPair {
+        use bitcoin::hashes::Hash;
+        use bitcoin::psbt::Input as PsbtInput;
+        use bitcoin::{OutPoint, TxIn, Txid, Weight};
+
+        crate::receive::InputPair {
+            txin: TxIn {
+                previous_output: OutPoint { txid: Txid::all_zeros(), vout: 0 },
+                ..Default::default()
+            },
+            psbtin: PsbtInput {
+                witness_utxo: Some(TxOut {
+                    value: Amount::from_sat(value),
+                    script_pubkey: p2wpkh_script(),
+                }),
+                ..Default::default()
+            },
+            expected_weight: Weight::ZERO,
+        }
+    }
+
+    /// The exact fee `is_balanced` requires for a plan of `input_pairs` and
+    /// `output_values`, all P2WPKH — computed the same way `is_balanced` does,
+    /// so tests can hit its exact-match condition instead of guessing at a
+    /// weight by hand.
+    fn required_fee_for(input_values: &[u64], output_values: &[u64]) -> Amount {
+        let mut builder = PlanBuilder::new();
+        for value in input_values {
+            builder = builder.add_input(p2wpkh_input(*value));
+        }
+        for value in output_values {
+            builder = builder.add_output(TxOut {
+                value: Amount::from_sat(*value),
+                script_pubkey: p2wpkh_script(),
+            });
+        }
+        let mut accumulator = PlanPsbtAccumulator::new(builder.build());
+        accumulator.plan_cursor = input_values.len() + output_values.len();
+
+        let weight =
+            super::estimate_weight(&accumulator.accumulated_psbt()).expect("weight estimable");
+        sample_context().session_parameters.min_feerate().fee_wu(weight).expect("fee computable")
+    }
+
+    /// Post a plan's two actions one at a time, replaying between them so each
+    /// `ActionPosted` event advances the persisted cursor from its actual
+    /// current value rather than a stale in-memory copy.
+    fn post_all_actions(
+        persister: &InMemoryPersister<MultipartySessionEvent>,
+        mut has_plan: Participant<HasPlan>,
+        count: usize,
+    ) -> Participant<HasPlan> {
+        for _ in 0..count {
+            has_plan.step(ParticipantEvent::ActionPosted).save(persister).expect("post");
+            has_plan = match replay_event_log(persister).expect("replay").0 {
+                MultipartySession::ParticipantHasPlan(p) => p,
+                other => panic!("expected HasPlan, got {other:?}"),
+            };
+        }
+        has_plan
+    }
+
     #[test]
-    fn segment_complete_registration_requires_full_post_and_zero_balance() {
-        // A registration plan of one zero-value output: balance is inputs (0) −
-        // outputs (0) = 0 once the output is posted.
-        let output = TxOut { value: Amount::from_sat(0), script_pubkey: bitcoin::ScriptBuf::new() };
-        let plan = PlanBuilder::new().add_output(output).build();
+    fn segment_complete_registration_requires_full_post_and_exact_fee_balance() {
+        // An output set exactly `required_fee_for`'s computed fee below the
+        // input: registration is complete once both actions post, because the
+        // balance matches the estimated fee exactly.
+        let fee = required_fee_for(&[100_000], &[0]).to_sat();
+        let output_value = 100_000 - fee;
+
+        let plan = PlanBuilder::new()
+            .add_input(p2wpkh_input(100_000))
+            .add_output(TxOut {
+                value: Amount::from_sat(output_value),
+                script_pubkey: p2wpkh_script(),
+            })
+            .build();
 
         let persister = InMemoryPersister::<MultipartySessionEvent>::default();
         persister
@@ -605,17 +752,85 @@ mod tests {
             other => panic!("expected HasPlan, got {other:?}"),
         };
 
-        // Before the action is posted (cursor 0 < len 1) the segment is not done.
+        // Before both actions are posted (cursor 0 < len 2) the segment is not
+        // done, regardless of balance.
         assert!(!has_plan.segment_complete());
         assert!(!has_plan.is_witness_phase());
 
-        has_plan.step(ParticipantEvent::ActionPosted).save(&persister).expect("post");
+        let has_plan = post_all_actions(&persister, has_plan, 2);
+        // Posted (cursor == len) and balance exactly matches the estimated fee:
+        // registration segment complete.
+        assert!(has_plan.segment_complete());
+        assert!(!has_plan.is_witness_phase());
+    }
+
+    #[test]
+    fn segment_complete_registration_stays_incomplete_when_balance_off_the_exact_fee() {
+        // A zero-fee-remaining balance (inputs == outputs) no longer completes
+        // registration by itself: it covered the old zero-balance check, but
+        // the estimated fee `min_feerate` now requires is nonzero, and
+        // `is_balanced` requires an exact match — one sat over or under still
+        // leaves the segment incomplete.
+        let input = p2wpkh_input(10_000);
+        let output = TxOut { value: Amount::from_sat(10_000), script_pubkey: p2wpkh_script() };
+        let plan = PlanBuilder::new().add_input(input).add_output(output).build();
+
+        let persister = InMemoryPersister::<MultipartySessionEvent>::default();
+        persister
+            .save_event(MultipartySessionEvent::SessionParametersAdopted(sample_context()))
+            .expect("save adopted");
+        persister.save_event(MultipartySessionEvent::PlanGenerated(plan)).expect("save plan");
         let has_plan = match replay_event_log(&persister).expect("replay").0 {
             MultipartySession::ParticipantHasPlan(p) => p,
             other => panic!("expected HasPlan, got {other:?}"),
         };
-        // Posted (cursor == len) and balance zero: registration segment complete.
-        assert!(has_plan.segment_complete());
-        assert!(!has_plan.is_witness_phase());
+
+        let has_plan = post_all_actions(&persister, has_plan, 2);
+        assert_eq!(has_plan.balance(), bitcoin::SignedAmount::ZERO);
+        assert!(!has_plan.segment_complete(), "zero balance no longer covers the estimated fee");
+    }
+
+    #[test]
+    fn segment_complete_stays_incomplete_when_weight_not_estimable() {
+        // An input scriptPubKey outside the supported types (here, empty —
+        // matching `sample_txout`/`balance_is_inputs_minus_outputs`'s
+        // placeholder scripts) makes the weight, and so the required fee,
+        // impossible to estimate. `is_balanced` returns `None` and
+        // `segment_complete` must treat that as "not yet", not panic or
+        // assume done, even though the raw balance covers the outputs.
+        use bitcoin::hashes::Hash;
+        use bitcoin::psbt::Input as PsbtInput;
+        use bitcoin::{OutPoint, ScriptBuf, TxIn, Txid, Weight};
+
+        let input = crate::receive::InputPair {
+            txin: TxIn {
+                previous_output: OutPoint { txid: Txid::all_zeros(), vout: 0 },
+                ..Default::default()
+            },
+            psbtin: PsbtInput {
+                witness_utxo: Some(TxOut {
+                    value: Amount::from_sat(10_000),
+                    script_pubkey: ScriptBuf::new(),
+                }),
+                ..Default::default()
+            },
+            expected_weight: Weight::ZERO,
+        };
+        let output = TxOut { value: Amount::from_sat(6_000), script_pubkey: ScriptBuf::new() };
+        let plan = PlanBuilder::new().add_input(input).add_output(output).build();
+
+        let persister = InMemoryPersister::<MultipartySessionEvent>::default();
+        persister
+            .save_event(MultipartySessionEvent::SessionParametersAdopted(sample_context()))
+            .expect("save adopted");
+        persister.save_event(MultipartySessionEvent::PlanGenerated(plan)).expect("save plan");
+        let has_plan = match replay_event_log(&persister).expect("replay").0 {
+            MultipartySession::ParticipantHasPlan(p) => p,
+            other => panic!("expected HasPlan, got {other:?}"),
+        };
+
+        let has_plan = post_all_actions(&persister, has_plan, 2);
+        assert_eq!(has_plan.balance(), bitcoin::SignedAmount::from_sat(4_000));
+        assert!(!has_plan.segment_complete());
     }
 }

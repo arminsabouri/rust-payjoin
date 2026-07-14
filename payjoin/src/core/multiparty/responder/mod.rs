@@ -3,19 +3,19 @@ mod error;
 pub use error::{ResponderError, ResponderSessionError};
 use serde::{Deserialize, Serialize};
 
-use crate::hpke::{encrypt_message_a, HpkeKeyPair, HpkePublicKey};
+use crate::hpke::{HpkeKeyPair, HpkePublicKey};
+use crate::multiparty::bootstrap_transport::PostIo;
 use crate::multiparty::participant::{
     AwaitingParticipantContext, ParticipantAwaitingSessionParameters,
 };
+use crate::multiparty::persist::EventfulTransition;
 pub use crate::multiparty::session::replay_event_log;
 use crate::multiparty::session::{
     MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
 };
 use crate::multiparty::uri::MultipartyPjUri;
-use crate::ohttp::{ohttp_encapsulate, process_post_res};
-use crate::persist::{MaybeFatalTransition, NextStateTransition};
+use crate::persist::NextStateTransition;
 use crate::uri::PjParam;
-use crate::{IntoUrl, Request};
 
 /// Persistent context for a multiparty responder session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,86 +100,72 @@ impl ResponderBuilder {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Initialized {}
 
+/// Sans-io input to the responder stage.
+///
+/// The state machine never performs transport; an event only reports that some
+/// I/O the driver performed on the machine's behalf has completed.
+#[derive(Debug, Clone)]
+pub enum ResponderEvent {
+    /// The adapter durably posted message A (the responder reply key) to the
+    /// initiator mailbox.
+    ReplyKeyPosted,
+}
+
 impl Responder<Initialized> {
-    fn post_reply_body(
-        &self,
-    ) -> Result<
-        ([u8; crate::directory::ENCAPSULATED_MESSAGE_BYTES], ohttp::ClientResponse),
-        ResponderError,
-    > {
+    /// The message-A post that hands the responder reply key to the initiator.
+    ///
+    /// The driver's mailbox adapter performs the OHTTP/HPKE and HTTP; the responder
+    /// only supplies its exact target mailbox and keys. Message A carries an empty
+    /// payload — its purpose is to convey the responder's reply key (the sender
+    /// key) to the initiator.
+    pub fn post_io(&self) -> Result<PostIo, ResponderError> {
         self.context.ensure_not_expired()?;
-        let PjParam::V2(_) = &self.context.pj_param else {
+        let PjParam::V2(v2) = &self.context.pj_param else {
             return Err(ResponderError::NotV2);
         };
-
-        let (ohttp_keys, initiator_pubkey, mailbox_url) = match &self.context.pj_param {
-            PjParam::V2(v2) => (v2.ohttp_keys(), v2.receiver_pubkey(), v2.endpoint()),
-            #[cfg(feature = "v1")]
-            PjParam::V1(_) => return Err(ResponderError::NotV2),
-        };
-
-        let message_a = encrypt_message_a(
-            Vec::new(),
-            self.context.responder_key.public_key(),
-            initiator_pubkey,
-        )
-        .map_err(ResponderError::Hpke)?;
-
-        ohttp_encapsulate(ohttp_keys, "POST", mailbox_url.as_str(), Some(&message_a))
-            .map_err(ResponderError::OhttpEncapsulation)
+        Ok(PostIo {
+            ohttp_keys: v2.ohttp_keys().clone(),
+            directory: v2.directory().clone(),
+            target: v2.endpoint(),
+            recipient: v2.receiver_pubkey().clone(),
+            sender: self.context.responder_key.clone(),
+            payload: Vec::new(),
+        })
     }
 
-    /// Create an OHTTP encapsulated HTTP POST carrying message A (responder reply key).
-    pub fn create_post_reply_request(
+    /// Advance the responder in response to one [`ResponderEvent`].
+    ///
+    /// Sans-io: the event only reports that I/O the driver performed on the
+    /// machine's behalf has completed. This never performs transport itself.
+    pub fn step(
         &self,
-        ohttp_relay: impl IntoUrl,
-    ) -> Result<(Request, ohttp::ClientResponse), ResponderError> {
-        let (body, ohttp_ctx) = self.post_reply_body()?;
-        let relay_url =
-            crate::ohttp::full_relay_url(ohttp_relay, &self.context.pj_param.endpoint_url())?;
-        let req = Request::new_v2(&relay_url, &body);
-        Ok((req, ohttp_ctx))
+        event: ResponderEvent,
+    ) -> EventfulTransition<MultipartySessionEvent, MultipartySession, ResponderSessionError> {
+        match event {
+            ResponderEvent::ReplyKeyPosted => self.record_reply_key_posted(),
+        }
     }
 
-    /// Process the directory response after posting the responder reply key.
-    pub fn process_post_reply_response(
-        self,
-        body: &[u8],
-        context: ohttp::ClientResponse,
-    ) -> MaybeFatalTransition<
-        MultipartySessionEvent,
-        ParticipantAwaitingSessionParameters,
-        ResponderSessionError,
-    > {
-        let current_state = self.clone();
-        if let Err(directory_error) = process_post_res(body, context) {
-            let err = ResponderError::DirectoryResponse(directory_error);
-            if let ResponderError::DirectoryResponse(ref e) = err {
-                if !e.is_fatal() {
-                    return MaybeFatalTransition::transient(err);
-                }
-            }
-            return MaybeFatalTransition::fatal(
-                MultipartySessionEvent::Closed(MultipartySessionOutcome::Failure),
-                err,
-            );
-        }
-
-        let sent_reply_key = current_state.context.responder_public_key().clone();
-        let participant_context = match current_state.context.participant_context() {
+    fn record_reply_key_posted(
+        &self,
+    ) -> EventfulTransition<MultipartySessionEvent, MultipartySession, ResponderSessionError> {
+        let sent_reply_key = self.context.responder_public_key().clone();
+        let participant_context = match self.context.participant_context() {
             Ok(ctx) => ctx,
             Err(err) =>
-                return MaybeFatalTransition::fatal(
+                return EventfulTransition::fatal(
                     MultipartySessionEvent::Closed(MultipartySessionOutcome::Failure),
                     err,
                 ),
         };
-        MaybeFatalTransition::success(
-            MultipartySessionEvent::ResponderSentReplyKey,
-            ParticipantAwaitingSessionParameters {
-                parameters_mailbox_public_key: sent_reply_key,
-                context: participant_context,
-            },
+        EventfulTransition::success(
+            [MultipartySessionEvent::ResponderSentReplyKey],
+            MultipartySession::ParticipantAwaitingSessionParameters(
+                ParticipantAwaitingSessionParameters {
+                    parameters_mailbox_public_key: sent_reply_key,
+                    context: participant_context,
+                },
+            ),
         )
     }
 

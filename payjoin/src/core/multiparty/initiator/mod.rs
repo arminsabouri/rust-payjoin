@@ -9,20 +9,19 @@ use serde::{Deserialize, Serialize};
 #[cfg(target_arch = "wasm32")]
 use web_time::Duration;
 
-use crate::hpke::{decrypt_message_a, HpkeKeyPair, HpkePublicKey};
+use crate::hpke::{HpkeKeyPair, HpkePublicKey};
+use crate::multiparty::bootstrap_transport::PollIo;
 use crate::multiparty::participant::{
     AwaitingParticipantContext, ParticipantAwaitingSessionParameters,
 };
+use crate::multiparty::persist::EventfulTransition;
 pub use crate::multiparty::session::replay_event_log;
-use crate::multiparty::session::{
-    MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
-};
+use crate::multiparty::session::{MultipartySession, MultipartySessionEvent};
 use crate::multiparty::uri::{build_multiparty_pj_uri, MultipartyPjUri};
-use crate::ohttp::{ohttp_encapsulate, process_get_res};
-use crate::persist::{MaybeFatalTransitionWithNoResults, NextStateTransition};
+use crate::persist::NextStateTransition;
 use crate::receive::v2::mailbox_endpoint;
 use crate::uri::{PjParam, ShortId};
-use crate::{IntoUrl, OhttpKeys, Request, Url};
+use crate::{IntoUrl, OhttpKeys, Url};
 
 /// Persistent context for a multiparty initiator session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +78,18 @@ impl InitiatorBuilder {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Initialized {}
 
+/// Sans-io input to the initiator stage.
+///
+/// The state machine never performs transport; an event only reports that some
+/// I/O the driver performed on the machine's behalf has completed. The "nothing
+/// yet" poll outcome carries no event — the driver simply keeps polling.
+#[derive(Debug, Clone)]
+pub enum InitiatorEvent {
+    /// The adapter polled the initiator mailbox and decrypted the responder's
+    /// reply key.
+    ReplyKeyRead(HpkePublicKey),
+}
+
 fn initiator_pj_param(context: &InitiatorContext) -> PjParam {
     // v2 `pj` endpoints require an EX fragment; session expiration is not modeled yet.
     let expiration = crate::time::Time::from_now(Duration::from_secs(60 * 60 * 24))
@@ -101,89 +112,50 @@ impl Initiator<Initialized> {
     /// BIP-321 Payjoin URI shared with responders (`pj` + `mppj=1`, no address).
     pub fn pj_uri(&self) -> MultipartyPjUri { pj_uri(&self.context) }
 
-    fn poll_req_body(
-        &self,
-    ) -> Result<
-        ([u8; crate::directory::ENCAPSULATED_MESSAGE_BYTES], ohttp::ClientResponse),
-        InitiatorError,
-    > {
-        let poll_target =
-            mailbox_endpoint(&self.context.directory, &self.context.initiator_mailbox_id());
-        ohttp_encapsulate(&self.context.ohttp_keys, "GET", poll_target.as_str(), None)
-            .map_err(InitiatorError::OhttpEncapsulation)
-    }
-
-    /// Create an OHTTP encapsulated HTTP GET request to poll the initiator mailbox.
-    pub fn create_poll_request(
-        &self,
-        ohttp_relay: impl IntoUrl,
-    ) -> Result<(Request, ohttp::ClientResponse), InitiatorError> {
-        let (body, ohttp_ctx) = self.poll_req_body()?;
-        let relay_url = crate::ohttp::full_relay_url(ohttp_relay, &self.context.directory)?;
-        let req = Request::new_v2(&relay_url, &body);
-        Ok((req, ohttp_ctx))
-    }
-
-    /// Process the response to a poll request from the Payjoin Directory.
+    /// The poll of the initiator mailbox that reads the responder's reply key.
     ///
-    /// On success, transitions after decrypting and parsing only the sender's reply key from
-    /// message A. Returns no-results when the directory has nothing yet (HTTP 202 ACCEPTED).
-    pub fn process_poll_request(
-        self,
-        body: &[u8],
-        context: ohttp::ClientResponse,
-    ) -> MaybeFatalTransitionWithNoResults<
-        MultipartySessionEvent,
-        ParticipantAwaitingSessionParameters,
-        Initiator<Initialized>,
-        InitiatorSessionError,
-    > {
-        // TODO: this should transition to a common state where responder and initator are waiting
-        let current_state = self.clone();
-        let responder_public_key = match self.inner_process_poll_res(body, context) {
-            Ok(responder_public_key) => responder_public_key,
-            Err(e) => match &e {
-                InitiatorError::DirectoryResponse(directory_error)
-                    if !directory_error.is_fatal() =>
-                {
-                    return MaybeFatalTransitionWithNoResults::transient(e);
-                }
-                _ =>
-                    return MaybeFatalTransitionWithNoResults::fatal(
-                        MultipartySessionEvent::Closed(MultipartySessionOutcome::Failure),
-                        e,
-                    ),
-            },
-        };
-
-        if let Some(responder_public_key) = responder_public_key {
-            MaybeFatalTransitionWithNoResults::success(
-                MultipartySessionEvent::InitiatorRetrievedReplyKey(responder_public_key.clone()),
-                ParticipantAwaitingSessionParameters {
-                    parameters_mailbox_public_key: responder_public_key.clone(),
-                    context: current_state.context.participant_context(responder_public_key),
-                },
-            )
-        } else {
-            MaybeFatalTransitionWithNoResults::no_results(current_state)
+    /// The driver's mailbox adapter performs the OHTTP/HPKE and HTTP; the initiator
+    /// only supplies its exact mailbox target and the keypair that opens the
+    /// inbound message A. The opened message's *sender* is the responder reply key
+    /// (see [`SessionStage`](crate::multiparty::SessionStage) — the driver feeds it
+    /// back as [`InitiatorEvent::ReplyKeyRead`]).
+    pub fn poll_io(&self) -> PollIo {
+        PollIo {
+            ohttp_keys: self.context.ohttp_keys.clone(),
+            directory: self.context.directory.clone(),
+            target: mailbox_endpoint(&self.context.directory, &self.context.initiator_mailbox_id()),
+            decrypt_key: self.context.initiator_key.clone(),
         }
     }
 
-    fn inner_process_poll_res(
-        self,
-        body: &[u8],
-        context: ohttp::ClientResponse,
-    ) -> Result<Option<HpkePublicKey>, InitiatorError> {
-        let body =
-            match process_get_res(body, context).map_err(InitiatorError::DirectoryResponse)? {
-                Some(body) => body,
-                None => return Ok(None),
-            };
+    /// Advance the initiator in response to one [`InitiatorEvent`].
+    ///
+    /// Sans-io: the event only reports that I/O the driver performed on the
+    /// machine's behalf has completed. This never performs transport itself.
+    // TODO: this should transition to a common state where responder and initiator are waiting.
+    pub fn step(
+        &self,
+        event: InitiatorEvent,
+    ) -> EventfulTransition<MultipartySessionEvent, MultipartySession, InitiatorSessionError> {
+        match event {
+            InitiatorEvent::ReplyKeyRead(responder_public_key) =>
+                self.record_reply_key_read(responder_public_key),
+        }
+    }
 
-        let (_, reply_key) = decrypt_message_a(&body, self.context.initiator_key.secret_key())
-            .map_err(InitiatorError::Hpke)?;
-
-        Ok(Some(reply_key))
+    fn record_reply_key_read(
+        &self,
+        responder_public_key: HpkePublicKey,
+    ) -> EventfulTransition<MultipartySessionEvent, MultipartySession, InitiatorSessionError> {
+        EventfulTransition::success(
+            [MultipartySessionEvent::InitiatorRetrievedReplyKey(responder_public_key.clone())],
+            MultipartySession::ParticipantAwaitingSessionParameters(
+                ParticipantAwaitingSessionParameters {
+                    parameters_mailbox_public_key: responder_public_key.clone(),
+                    context: self.context.participant_context(responder_public_key),
+                },
+            ),
+        )
     }
 
     pub(crate) fn apply_retrieved_reply_key(

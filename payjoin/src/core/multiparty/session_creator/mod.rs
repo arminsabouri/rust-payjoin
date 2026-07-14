@@ -7,7 +7,8 @@ use error::InternalSessionCreatorSessionError;
 pub use error::SessionCreatorSessionError;
 use serde::{Deserialize, Serialize};
 
-use crate::hpke::{encrypt_message_a, HpkeKeyPair, HpkePublicKey};
+use crate::hpke::{HpkeKeyPair, HpkePublicKey};
+use crate::multiparty::bootstrap_transport::PostIo;
 use crate::multiparty::participant::{
     HasSessionParameters, Participant, ParticipantAwaitingSessionParameters, ParticipantContext,
 };
@@ -20,11 +21,11 @@ use crate::multiparty::session::{
     MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
 };
 use crate::multiparty::session_parameters::SessionParameters;
-use crate::ohttp::{ohttp_encapsulate, process_post_res, OhttpEncapsulationError};
+use crate::ohttp::OhttpEncapsulationError;
 use crate::persist::{NextStateTransition, SessionPersister};
 use crate::receive::v2::mailbox_endpoint;
 use crate::uri::ShortId;
-use crate::{IntoUrl, OhttpKeys, Request, Url};
+use crate::{OhttpKeys, Url};
 
 /// Delivery status for a participant awaiting session parameters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,13 +89,6 @@ impl SessionCreatorContext {
 pub struct SessionCreator<State> {
     pub(crate) state: State,
     pub(crate) context: SessionCreatorContext,
-}
-
-/// Outbound session-parameters distribution for one participant.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionParametersDistributionMessage {
-    /// Participant whose mailbox receives the encrypted session parameters.
-    pub recipient: HpkePublicKey,
 }
 
 /// Errors from creating distribution requests before a directory response is processed.
@@ -277,6 +271,16 @@ where
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollectedSessions {}
 
+/// Sans-io input to the session-creator stage.
+///
+/// The state machine never performs transport; an event only reports that some
+/// I/O the driver performed on the machine's behalf has completed.
+#[derive(Debug, Clone)]
+pub enum SessionCreatorEvent {
+    /// The adapter durably posted session parameters to `recipient`'s mailbox.
+    ParametersDeliveredTo(HpkePublicKey),
+}
+
 /// Typed transition after session parameters are acknowledged by one participant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParametersDelivery {
@@ -307,59 +311,56 @@ impl SessionCreator<CollectedSessions> {
         self.context.next_undelivered().map(|p| &p.public_key)
     }
 
-    /// Build the next OHTTP POST carrying HPKE-encrypted session parameters for one participant.
+    /// The message-A post that hands session parameters to the next participant
+    /// still awaiting them, or `None` once every participant has been served.
     ///
-    /// Returns `None` when every participant has already acknowledged delivery.
-    pub fn next_session_parameters_distribution_message(
-        &self,
-        ohttp_relay: impl IntoUrl,
-    ) -> Result<
-        Option<(SessionParametersDistributionMessage, Request, ohttp::ClientResponse)>,
-        SessionCreatorError,
-    > {
-        let recipient = match self.context.next_undelivered() {
-            Some(p) => p.public_key.clone(),
-            None => return Ok(None),
-        };
-
-        let (body, ohttp_ctx) =
-            self.distribution_post_body(&recipient).map_err(SessionCreatorError::from_session)?;
-        let relay_url = crate::ohttp::full_relay_url(ohttp_relay, &self.context.directory)?;
-        let req = Request::new_v2(&relay_url, &body);
-        Ok(Some((SessionParametersDistributionMessage { recipient }, req, ohttp_ctx)))
+    /// The driver's mailbox adapter performs the OHTTP/HPKE and HTTP; the creator
+    /// only supplies its exact target mailbox, keys, and the encoded parameters.
+    /// The recipient is [`PostIo::recipient`]; the driver feeds it back as
+    /// [`SessionCreatorEvent::ParametersDeliveredTo`].
+    pub fn post_io(&self) -> Option<PostIo> {
+        let recipient = self.context.next_undelivered()?.public_key.clone();
+        let target = mailbox_endpoint(
+            &self.context.directory,
+            &SessionCreatorContext::participant_mailbox_id(&recipient),
+        );
+        Some(PostIo {
+            ohttp_keys: self.context.ohttp_keys.clone(),
+            directory: self.context.directory.clone(),
+            target,
+            recipient,
+            sender: self.context.creator_key.clone(),
+            payload: self.context.session_parameters.to_bytes(),
+        })
     }
 
-    /// Process the directory response after posting session parameters to a participant mailbox.
-    pub fn process_session_parameters_distribution_response(
-        self,
-        recipient: HpkePublicKey,
-        body: &[u8],
-        ohttp_context: ohttp::ClientResponse,
-    ) -> ParametersDistributionTransition {
-        match process_post_res(body, ohttp_context) {
-            Ok(()) => {}
-            Err(e) => {
-                let is_fatal = e.is_fatal();
-                let err = InternalSessionCreatorSessionError::DirectoryResponse(e).into();
-                if !is_fatal {
-                    return ParametersDistributionTransition::transient(err);
-                }
-                // TODO: should we should treat all of these as transient and re-try?
-                return ParametersDistributionTransition::fatal(
-                    MultipartySessionEvent::Closed(MultipartySessionOutcome::Failure),
-                    err,
-                );
-            }
+    /// Advance the session creator in response to one [`SessionCreatorEvent`].
+    ///
+    /// Sans-io: the event only reports that I/O the driver performed on the
+    /// machine's behalf has completed. This never performs transport itself.
+    pub fn step(
+        &self,
+        event: SessionCreatorEvent,
+    ) -> EventfulTransition<MultipartySessionEvent, MultipartySession, SessionCreatorSessionError>
+    {
+        match event {
+            SessionCreatorEvent::ParametersDeliveredTo(recipient) =>
+                self.record_parameters_delivered_to(recipient),
         }
+    }
 
-        let delivery = match self.parameters_delivered_to(recipient.clone()) {
+    fn record_parameters_delivered_to(
+        &self,
+        recipient: HpkePublicKey,
+    ) -> EventfulTransition<MultipartySessionEvent, MultipartySession, SessionCreatorSessionError>
+    {
+        let delivery = match self.clone().parameters_delivered_to(recipient.clone()) {
             Ok(delivery) => delivery,
-            Err(e) => {
-                return ParametersDistributionTransition::fatal(
+            Err(e) =>
+                return EventfulTransition::fatal(
                     MultipartySessionEvent::Closed(MultipartySessionOutcome::Failure),
                     e.into(),
-                );
-            }
+                ),
         };
 
         let mut events =
@@ -369,6 +370,7 @@ impl SessionCreator<CollectedSessions> {
         }
 
         ParametersDistributionTransition::success(events, delivery)
+            .map_outcome(MultipartySession::from)
     }
 
     fn parameters_delivered_to(
@@ -384,26 +386,6 @@ impl SessionCreator<CollectedSessions> {
         } else {
             ParametersDelivery::Collecting(SessionCreator { state: CollectedSessions {}, context })
         })
-    }
-
-    fn distribution_post_body(
-        &self,
-        recipient: &HpkePublicKey,
-    ) -> Result<
-        ([u8; crate::directory::ENCAPSULATED_MESSAGE_BYTES], ohttp::ClientResponse),
-        InternalSessionCreatorSessionError,
-    > {
-        let params = self.context.session_parameters.to_bytes();
-        let payload = encrypt_message_a(params, self.context.creator_key.public_key(), recipient)
-            .map_err(InternalSessionCreatorSessionError::Hpke)?;
-
-        let mailbox = mailbox_endpoint(
-            &self.context.directory,
-            &SessionCreatorContext::participant_mailbox_id(recipient),
-        );
-
-        ohttp_encapsulate(&self.context.ohttp_keys, "POST", mailbox.as_str(), Some(&payload))
-            .map_err(InternalSessionCreatorSessionError::OhttpEncapsulation)
     }
 
     pub(crate) fn apply_parameters_delivered(self, recipient: HpkePublicKey) -> MultipartySession {
@@ -425,16 +407,5 @@ impl SessionCreator<CollectedSessions> {
         MultipartySession::ParticipantHasSessionParameters(Participant::from_adopted_context(
             self.context.into_participant_context(),
         ))
-    }
-}
-
-impl SessionCreatorError {
-    fn from_session(err: InternalSessionCreatorSessionError) -> Self {
-        match err {
-            InternalSessionCreatorSessionError::ParseUrl(e) => Self::ParseUrl(e),
-            InternalSessionCreatorSessionError::OhttpEncapsulation(e) =>
-                Self::OhttpEncapsulation(e),
-            _ => unreachable!("distribution_post_body only returns URL, OHTTP, or HPKE errors"),
-        }
     }
 }

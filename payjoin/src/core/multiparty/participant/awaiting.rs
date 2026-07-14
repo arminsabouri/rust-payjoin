@@ -2,17 +2,13 @@ use bitcoin::hashes::{sha256, Hash};
 use serde::{Deserialize, Serialize};
 
 use super::ParticipantError;
-use crate::hpke::{decrypt_message_a, HpkeKeyPair, HpkePublicKey};
-use crate::multiparty::persist::{
-    ParticipantParametersAdoption, SessionParametersPollFailure, SessionParametersPollTransition,
-};
-use crate::multiparty::session::{MultipartySessionEvent, MultipartySessionOutcome};
+use crate::hpke::{HpkeKeyPair, HpkePublicKey};
+use crate::multiparty::bootstrap_transport::PollIo;
+use crate::multiparty::persist::{ParticipantParametersAdoption, SessionParametersPollTransition};
 use crate::multiparty::session_parameters::SessionParameters;
-use crate::ohttp::{ohttp_encapsulate, process_get_res};
-use crate::persist::MaybeFatalTransitionWithNoResults;
 use crate::receive::v2::mailbox_endpoint;
 use crate::uri::ShortId;
-use crate::{IntoUrl, OhttpKeys, Request, Url};
+use crate::{OhttpKeys, Url};
 
 /// Persistent context for a multiparty participant awaiting session parameters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +38,18 @@ pub struct ParticipantAwaitingSessionParameters {
     pub(crate) context: AwaitingParticipantContext,
 }
 
+/// Sans-io input to the awaiting-participant stage.
+///
+/// The state machine never performs transport; an event only reports that some
+/// I/O the driver performed on the machine's behalf has completed. The "nothing
+/// yet" poll outcome carries no event — the driver simply keeps polling.
+#[derive(Debug, Clone)]
+pub enum ParticipantAwaitingEvent {
+    /// The adapter polled this participant's mailbox and decrypted the session
+    /// parameters the creator distributed.
+    ParametersRead(SessionParameters),
+}
+
 impl ParticipantAwaitingSessionParameters {
     /// Mailbox where the session creator POSTs parameters and this participant polls.
     pub(crate) fn parameters_mailbox_public_key(&self) -> &HpkePublicKey {
@@ -52,86 +60,45 @@ impl ParticipantAwaitingSessionParameters {
         sha256::Hash::hash(&self.parameters_mailbox_public_key.to_compressed_bytes()).into()
     }
 
-    fn session_parameters_poll_body(
-        &self,
-    ) -> Result<
-        ([u8; crate::directory::ENCAPSULATED_MESSAGE_BYTES], ohttp::ClientResponse),
-        ParticipantError,
-    > {
-        let poll_target =
-            mailbox_endpoint(&self.context.directory, &self.parameters_mailbox_short_id());
-        ohttp_encapsulate(&self.context.ohttp_keys, "GET", poll_target.as_str(), None)
-            .map_err(ParticipantError::OhttpEncapsulation)
-    }
-
-    /// Create an OHTTP encapsulated HTTP GET request to poll this participant's mailbox for
-    /// HPKE-encrypted session parameters from the session creator.
-    pub fn create_session_parameters_poll_request(
-        &self,
-        ohttp_relay: impl IntoUrl,
-    ) -> Result<(Request, ohttp::ClientResponse), ParticipantError> {
-        let (body, ohttp_ctx) = self.session_parameters_poll_body()?;
-        let relay_url = crate::ohttp::full_relay_url(ohttp_relay, &self.context.directory)?;
-        let req = Request::new_v2(&relay_url, &body);
-        Ok((req, ohttp_ctx))
-    }
-
-    /// Process the directory response after polling for session parameters.
+    /// The poll of this participant's mailbox that reads the creator's session
+    /// parameters.
     ///
-    /// Returns no-results when the directory has nothing yet (HTTP 202 ACCEPTED).
-    pub fn process_session_parameters_poll_response(
-        self,
-        body: &[u8],
-        context: ohttp::ClientResponse,
-    ) -> Result<SessionParametersPollTransition, SessionParametersPollFailure> {
-        let current_state = self.clone();
-        let session_parameters = match self.inner_process_session_parameters_poll_res(body, context)
-        {
-            Ok(session_parameters) => session_parameters,
-            Err(e) => match &e {
-                ParticipantError::DirectoryResponse(directory_error)
-                    if !directory_error.is_fatal() =>
-                {
-                    return Err(SessionParametersPollFailure::Transient(e));
-                }
-                _ =>
-                    return Err(SessionParametersPollFailure::Fatal(Box::new(
-                        MaybeFatalTransitionWithNoResults::fatal(
-                            MultipartySessionEvent::Closed(MultipartySessionOutcome::Failure),
-                            e,
-                        ),
-                    ))),
-            },
-        };
-
-        if let Some(session_parameters) = session_parameters {
-            Ok(SessionParametersPollTransition::Adoption(
-                ParticipantParametersAdoption::from_awaiting_participant(
-                    &current_state,
-                    session_parameters,
-                ),
-            ))
-        } else {
-            Ok(SessionParametersPollTransition::Stasis(current_state))
+    /// The driver's mailbox adapter performs the OHTTP/HPKE and HTTP; the
+    /// participant only supplies its exact mailbox target and the keypair that
+    /// opens the inbound message A. The opened message's *payload* decodes to the
+    /// [`SessionParameters`] (see [`parse_parameters`](Self::parse_parameters)).
+    pub fn poll_io(&self) -> PollIo {
+        PollIo {
+            ohttp_keys: self.context.ohttp_keys.clone(),
+            directory: self.context.directory.clone(),
+            target: mailbox_endpoint(&self.context.directory, &self.parameters_mailbox_short_id()),
+            decrypt_key: self.context.mailbox_key.clone(),
         }
     }
 
-    fn inner_process_session_parameters_poll_res(
-        self,
-        body: &[u8],
-        context: ohttp::ClientResponse,
-    ) -> Result<Option<SessionParameters>, ParticipantError> {
-        let body =
-            match process_get_res(body, context).map_err(ParticipantError::DirectoryResponse)? {
-                Some(body) => body,
-                None => return Ok(None),
-            };
+    /// Decode the session parameters from a polled message-A payload.
+    pub fn parse_parameters(&self, payload: &[u8]) -> Result<SessionParameters, ParticipantError> {
+        SessionParameters::from_message_a_body(payload).map_err(ParticipantError::SessionParameters)
+    }
 
-        let (params_bytes, _creator_pubkey) =
-            decrypt_message_a(&body, self.context.mailbox_key.secret_key())
-                .map_err(ParticipantError::Hpke)?;
-        let session_parameters = SessionParameters::from_message_a_body(&params_bytes)
-            .map_err(ParticipantError::SessionParameters)?;
-        Ok(Some(session_parameters))
+    /// Advance the awaiting participant in response to one
+    /// [`ParticipantAwaitingEvent`].
+    ///
+    /// Sans-io: the event only reports that I/O the driver performed on the
+    /// machine's behalf has completed. Adopting parameters is a *graduation* — it
+    /// closes this log and opens a successor — so the returned transition is
+    /// saved against the registry, not a single persister (see
+    /// [`SessionParametersPollTransition::save`]). The "nothing yet" poll outcome
+    /// carries no event; the driver simply keeps polling.
+    pub fn step(&self, event: ParticipantAwaitingEvent) -> SessionParametersPollTransition {
+        match event {
+            ParticipantAwaitingEvent::ParametersRead(session_parameters) =>
+                SessionParametersPollTransition::Adoption(
+                    ParticipantParametersAdoption::from_awaiting_participant(
+                        self,
+                        session_parameters,
+                    ),
+                ),
+        }
     }
 }

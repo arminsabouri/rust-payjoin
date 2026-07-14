@@ -60,6 +60,9 @@ struct EventfulSuccess<Event, Outcome> {
 }
 
 enum EventfulError<Event, Err> {
+    // Reintroduced by the generic bootstrap driver, which classifies retryable
+    // directory errors now that transport lives outside the state machines.
+    #[allow(dead_code)]
     Transient(Err),
     Fatal(Event, Err),
 }
@@ -77,6 +80,8 @@ where
         Self(Ok(EventfulSuccess { events: events.into_iter().collect(), outcome }))
     }
 
+    // Reintroduced by the generic bootstrap driver (see `EventfulError::Transient`).
+    #[allow(dead_code)]
     pub(crate) fn transient(error: Err) -> Self { Self(Err(EventfulError::Transient(error))) }
 
     pub(crate) fn fatal(event: Event, error: Err) -> Self {

@@ -3,7 +3,9 @@ mod error;
 mod plan;
 mod with_parameters;
 
-pub use awaiting::{AwaitingParticipantContext, ParticipantAwaitingSessionParameters};
+pub use awaiting::{
+    AwaitingParticipantContext, ParticipantAwaitingEvent, ParticipantAwaitingSessionParameters,
+};
 pub use error::{ParticipantError, ParticipantSessionError};
 pub use plan::{
     parse_mailbox_psbt_fragment, serialize_mailbox_psbt_fragment, Plan, PsbtFragmentError,

@@ -196,12 +196,12 @@ mod integration {
         use payjoin::multiparty::{
             replay_event_log, InMemoryMultipartyRegistry, InitiatorBuilder, InputScriptType,
             MultipartyPjUri, MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
-            MultipartySessionRegistry, ParametersDelivery, Plan, ResponderBuilder,
-            SessionCreatorBuilder, SessionParameters,
+            MultipartySessionRegistry, Plan, ResponderBuilder, SessionCreatorBuilder,
+            SessionParameters,
         };
-        use payjoin::persist::OptionalTransitionOutcome;
         use payjoin::{HpkeKeyPair, OhttpKeys, Request, Url};
         use payjoin_driver::adapters::DirectoryMailbox;
+        use payjoin_driver::bootstrap::{drive_poll, drive_post, DirectoryBootstrapMailbox};
         use payjoin_driver::participant::execute_plan;
         use payjoin_driver::{Broadcaster, Schedule, Signer};
         use payjoin_test_utils::{
@@ -424,14 +424,14 @@ mod integration {
             ohttp_relay: &str,
         ) -> Result<(), BoxSendSyncError> {
             let responder = ResponderBuilder::from_uri(multiparty_uri.clone())?.save(persister)?;
-            let (req, ctx) = responder.create_post_reply_request(ohttp_relay)?;
-            let body = send_ohttp_request(agent, req).await?;
-            responder.process_post_reply_response(&body, ctx).save(persister)?;
+            let mailbox = DirectoryBootstrapMailbox::new(agent.clone(), Url::parse(ohttp_relay)?);
+            drive_post(&mailbox, responder, persister).await?;
             Ok(())
         }
 
         async fn initiator_poll_reply_key(
             agent: &Client,
+            registry: &mut InMemoryMultipartyRegistry,
             persister: &InMemoryPersister<MultipartySessionEvent>,
             ohttp_relay: &str,
         ) -> Result<(), BoxSendSyncError> {
@@ -441,14 +441,11 @@ mod integration {
                 _ => panic!("initiator must be initialized before poll"),
             };
 
-            let (req, ctx) = initiator.create_poll_request(ohttp_relay)?;
-            let body = send_ohttp_request(agent, req).await?;
-            match initiator.process_poll_request(&body, ctx).save(persister)? {
-                OptionalTransitionOutcome::Progress(_) => Ok(()),
-                OptionalTransitionOutcome::Stasis(_) => panic!(
-                    "initiator poll should retrieve reply key immediately after responder post"
-                ),
-            }
+            let mailbox = DirectoryBootstrapMailbox::new(agent.clone(), Url::parse(ohttp_relay)?);
+            // The initiator never graduates here, so the registry is unused; the
+            // generic poll driver still takes one for the awaiting-participant case.
+            drive_poll(&mailbox, initiator, registry, persister).await?;
+            Ok(())
         }
 
         async fn participant_poll_session_parameters(
@@ -464,26 +461,15 @@ mod integration {
                 _ => panic!("participant must await session parameters"),
             };
 
-            let (req, ctx) = participant.create_session_parameters_poll_request(ohttp_relay)?;
-            let body = send_ohttp_request(agent, req).await?;
-            match participant.process_session_parameters_poll_response(&body, ctx) {
-                Ok(transition) => match transition.save(registry, persister)? {
-                    OptionalTransitionOutcome::Progress(adopted_persister) => {
-                        let (session_state, _) = replay_event_log(&adopted_persister)?;
-                        let MultipartySession::ParticipantHasSessionParameters(participant) =
-                            session_state
-                        else {
-                            panic!("graduated log must replay to participant with parameters");
-                        };
-                        assert_eq!(participant.session_parameters(), expected);
-                        Ok(adopted_persister)
-                    }
-                    OptionalTransitionOutcome::Stasis(_) => panic!(
-                        "participant poll should retrieve session parameters immediately after creator distribution"
-                    ),
-                },
-                _ => panic!("unexpected session-parameters poll response"),
-            }
+            let mailbox = DirectoryBootstrapMailbox::new(agent.clone(), Url::parse(ohttp_relay)?);
+            let adopted_persister = drive_poll(&mailbox, participant, registry, persister).await?;
+            let (session_state, _) = replay_event_log(&adopted_persister)?;
+            let MultipartySession::ParticipantHasSessionParameters(participant) = session_state
+            else {
+                panic!("graduated log must replay to participant with parameters");
+            };
+            assert_eq!(participant.session_parameters(), expected);
+            Ok(adopted_persister)
         }
 
         fn participant_generate_plan(
@@ -605,29 +591,19 @@ mod integration {
                 .await?;
 
             // For each initiator, poll until we get the reply keys
-            initiator_poll_reply_key(&agent, &initiator_a_persister, &ohttp_relay).await?;
-            initiator_poll_reply_key(&agent, &initiator_b_persister, &ohttp_relay).await?;
+            initiator_poll_reply_key(&agent, &mut registry, &initiator_a_persister, &ohttp_relay)
+                .await?;
+            initiator_poll_reply_key(&agent, &mut registry, &initiator_b_persister, &ohttp_relay)
+                .await?;
 
-            let (creator_persister, mut creator) =
+            let (creator_persister, creator) =
                 SessionCreatorBuilder::build_and_promote(&registry, expected_params.clone())?
                     .save(&mut registry)?;
 
-            // Distribute session parameters to responders
-            loop {
-                let Some((message, req, ctx)) =
-                    creator.next_session_parameters_distribution_message(&ohttp_relay)?
-                else {
-                    break;
-                };
-                let body = send_ohttp_request(&agent, req).await?;
-                let delivery = creator
-                    .process_session_parameters_distribution_response(message.recipient, &body, ctx)
-                    .save(&creator_persister)?;
-                match delivery {
-                    ParametersDelivery::Collecting(next) => creator = next,
-                    ParametersDelivery::Distributed(_) => break,
-                }
-            }
+            // Distribute session parameters to every collected participant.
+            let mailbox =
+                DirectoryBootstrapMailbox::new((*agent).clone(), Url::parse(&ohttp_relay)?);
+            drive_post(&mailbox, creator, &creator_persister).await?;
 
             let participant_a_persister = participant_poll_session_parameters(
                 &agent,

@@ -11,6 +11,8 @@ pub enum DriverError {
     Replay(ReplayError<MultipartySession, MultipartySessionEvent>),
     /// The shared mailbox failed to read or write.
     Mailbox(Box<dyn StdError + Send + Sync>),
+    /// A bootstrap stage's transport (poll/post) or its persisted transition failed.
+    Bootstrap(Box<dyn StdError + Send + Sync>),
     /// The action schedule's timer/clock failed.
     Schedule(Box<dyn StdError + Send + Sync>),
     /// The signer failed to sign the accumulated PSBT.
@@ -28,6 +30,7 @@ impl fmt::Display for DriverError {
         match self {
             Self::Replay(e) => write!(f, "replay error: {e}"),
             Self::Mailbox(e) => write!(f, "mailbox error: {e}"),
+            Self::Bootstrap(e) => write!(f, "bootstrap error: {e}"),
             Self::Schedule(e) => write!(f, "schedule error: {e}"),
             Self::Sign(e) => write!(f, "signer error: {e}"),
             Self::Broadcast(e) => write!(f, "broadcaster error: {e}"),
@@ -42,8 +45,11 @@ impl StdError for DriverError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::Replay(e) => Some(e),
-            Self::Mailbox(e) | Self::Schedule(e) | Self::Sign(e) | Self::Broadcast(e) =>
-                Some(e.as_ref()),
+            Self::Mailbox(e)
+            | Self::Bootstrap(e)
+            | Self::Schedule(e)
+            | Self::Sign(e)
+            | Self::Broadcast(e) => Some(e.as_ref()),
             Self::Persist(_) | Self::UnexpectedState => None,
         }
     }

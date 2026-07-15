@@ -87,6 +87,8 @@ struct NeverSigner;
 impl Signer for NeverSigner {
     type Error = NeverError;
 
+    async fn plan(&self) -> Result<payjoin::multiparty::Plan, Self::Error> { Err(NeverError) }
+
     async fn sign(&self, _psbt: Psbt) -> Result<Psbt, Self::Error> { Err(NeverError) }
 }
 

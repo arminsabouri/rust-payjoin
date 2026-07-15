@@ -6,7 +6,6 @@ use concurrent_psbt::sort::{Deterministic, Sorter, Unset};
 use psbt_v2::v2::Psbt;
 use serde::{Deserialize, Serialize};
 
-use super::plan::PlanBuilder;
 use super::{ParticipantError, Plan};
 use crate::multiparty::persist::EventfulTransition;
 use crate::multiparty::session::{
@@ -14,7 +13,6 @@ use crate::multiparty::session::{
 };
 use crate::multiparty::session_parameters::SessionParameters;
 use crate::persist::NextStateTransition;
-use crate::receive::InputPair;
 use crate::{OhttpKeys, Url};
 
 /// Persistent context for a multiparty participant after adopting session parameters.
@@ -55,19 +53,14 @@ impl Participant<HasSessionParameters> {
     // We do want to save the first plan we come up with. And as we learn new information from others we will prune the plan and pick
     // a better branch of the decision tree -- based on some cost / privacy metric.
 
-    pub fn generate_plan(
+    /// Supply the plan this state has been waiting for and advance to [`HasPlan`].
+    ///
+    /// The plan is assembled outside the state machine (see
+    /// [`Plan::from_registration`]); this step only records it and transitions.
+    pub fn provide_plan(
         &self,
-        candidate_inputs: impl IntoIterator<Item = InputPair>,
-        payment_obligations: impl IntoIterator<Item = bitcoin::TxOut>,
+        plan: Plan,
     ) -> NextStateTransition<MultipartySessionEvent, Participant<HasPlan>> {
-        let mut plan = PlanBuilder::new();
-        for input in candidate_inputs {
-            plan = plan.add_input(input);
-        }
-        for output in payment_obligations {
-            plan = plan.add_output(output);
-        }
-        let plan = plan.build();
         NextStateTransition::success(
             MultipartySessionEvent::PlanGenerated(plan.clone()),
             Participant {

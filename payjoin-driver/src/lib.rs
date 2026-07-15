@@ -20,15 +20,19 @@
 //! executors (WASM) as well as multithreaded ones.
 
 pub mod adapters;
+pub mod bootstrap;
 pub mod broadcaster;
 mod error;
 mod mailbox;
 pub mod participant;
+mod request_sender;
 pub mod schedule;
 pub mod signer;
 
+pub use bootstrap::drive_to_plan;
 pub use broadcaster::Broadcaster;
 pub use error::DriverError;
 pub use mailbox::CollaborativeMessageSet;
+pub use request_sender::RequestSender;
 pub use schedule::Schedule;
 pub use signer::Signer;

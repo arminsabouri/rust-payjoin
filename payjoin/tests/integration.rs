@@ -196,14 +196,14 @@ mod integration {
         use payjoin::multiparty::{
             replay_event_log, InMemoryMultipartyRegistry, InitiatorBuilder, InputScriptType,
             MultipartyPjUri, MultipartySession, MultipartySessionEvent, MultipartySessionOutcome,
-            MultipartySessionRegistry, ParametersDelivery, Plan, ResponderBuilder,
-            SessionCreatorBuilder, SessionParameters,
+            MultipartySessionRegistry, Plan, ResponderBuilder, SessionCreatorBuilder,
+            SessionParameters,
         };
         use payjoin::persist::OptionalTransitionOutcome;
         use payjoin::{HpkeKeyPair, OhttpKeys, Request, Url};
-        use payjoin_driver::adapters::DirectoryMailbox;
+        use payjoin_driver::adapters::{DirectoryMailbox, ReqwestSender};
         use payjoin_driver::participant::execute_plan;
-        use payjoin_driver::{Broadcaster, Schedule, Signer};
+        use payjoin_driver::{drive_to_plan, Broadcaster, Schedule, Signer};
         use payjoin_test_utils::{
             corepc_node, init_bitcoind_funded_wallets_with_extra_args, init_tracing,
             BoxSendSyncError, InMemoryPersister, TestServices,
@@ -278,6 +278,9 @@ mod integration {
         /// then keeps only this participant's finalized inputs.
         struct WalletSigner<'a> {
             wallet: &'a corepc_node::Client,
+            /// This participant's deliberately-unbalanced output value (see
+            /// [`FundedParticipantWallet::registration`]).
+            output_value: Amount,
         }
 
         impl WalletSigner<'_> {
@@ -316,6 +319,24 @@ mod integration {
 
         impl Signer for WalletSigner<'_> {
             type Error = RpcError;
+
+            async fn plan(&self) -> Result<Plan, Self::Error> {
+                let utxos = self
+                    .wallet
+                    .list_unspent()
+                    .map_err(|e| RpcError(format!("list unspent failed: {e}").into()))?;
+                let inputs: Vec<InputPair> =
+                    utxos.0.into_iter().map(input_pair_from_list_unspent).collect();
+                let address = self
+                    .wallet
+                    .new_address()
+                    .map_err(|e| RpcError(format!("new address failed: {e}").into()))?;
+                let outputs = vec![TxOut {
+                    value: self.output_value,
+                    script_pubkey: address.script_pubkey(),
+                }];
+                Ok(Plan::from_registration(inputs, outputs))
+            }
 
             async fn sign(
                 &self,
@@ -362,41 +383,11 @@ mod integration {
         }
 
         struct FundedParticipantWallet {
-            name: &'static str,
             client: corepc_node::Client,
         }
 
         impl FundedParticipantWallet {
-            fn new(name: &'static str, client: corepc_node::Client) -> Self {
-                Self { name, client }
-            }
-
-            /// Registration completes only when the accumulated PSBT balances to
-            /// zero (`balance()` is total inputs minus total outputs, pre-fee).
-            /// Crucially, each participant is deliberately *unbalanced on its own*
-            /// (`output_value != input_value`) — otherwise a participant would reach
-            /// a zero balance from its own fragments alone and sign in isolation,
-            /// over the wrong one-input transaction, never pooling with the others.
-            /// The caller chooses `output_value`s that sum to the total input value
-            /// across all participants, so the collaborative transaction balances
-            /// globally at a zero fee — which is why the node runs with
-            /// `-minrelaytxfee=0`.
-            fn registration(
-                &self,
-                output_value: Amount,
-            ) -> Result<(Vec<InputPair>, Vec<TxOut>), BoxSendSyncError> {
-                let utxos = self.client.list_unspent().map_err(|e| -> BoxSendSyncError {
-                    format!("{} list unspent failed: {e}", self.name).into()
-                })?;
-                let inputs: Vec<InputPair> =
-                    utxos.0.into_iter().map(input_pair_from_list_unspent).collect();
-                let address = self.client.new_address().map_err(|e| -> BoxSendSyncError {
-                    format!("{} new address failed: {e}", self.name).into()
-                })?;
-                let outputs =
-                    vec![TxOut { value: output_value, script_pubkey: address.script_pubkey() }];
-                Ok((inputs, outputs))
-            }
+            fn new(client: corepc_node::Client) -> Self { Self { client } }
         }
 
         async fn send_ohttp_request(
@@ -449,58 +440,6 @@ mod integration {
                     "initiator poll should retrieve reply key immediately after responder post"
                 ),
             }
-        }
-
-        async fn participant_poll_session_parameters(
-            agent: &Client,
-            registry: &mut InMemoryMultipartyRegistry,
-            persister: &InMemoryPersister<MultipartySessionEvent>,
-            ohttp_relay: &str,
-            expected: &SessionParameters,
-        ) -> Result<InMemoryPersister<MultipartySessionEvent>, BoxSendSyncError> {
-            let (participant_state, _) = replay_event_log(persister)?;
-            let participant = match participant_state {
-                MultipartySession::ParticipantAwaitingSessionParameters(state) => state,
-                _ => panic!("participant must await session parameters"),
-            };
-
-            let (req, ctx) = participant.create_session_parameters_poll_request(ohttp_relay)?;
-            let body = send_ohttp_request(agent, req).await?;
-            match participant.process_session_parameters_poll_response(&body, ctx) {
-                Ok(transition) => match transition.save(registry, persister)? {
-                    OptionalTransitionOutcome::Progress(adopted_persister) => {
-                        let (session_state, _) = replay_event_log(&adopted_persister)?;
-                        let MultipartySession::ParticipantHasSessionParameters(participant) =
-                            session_state
-                        else {
-                            panic!("graduated log must replay to participant with parameters");
-                        };
-                        assert_eq!(participant.session_parameters(), expected);
-                        Ok(adopted_persister)
-                    }
-                    OptionalTransitionOutcome::Stasis(_) => panic!(
-                        "participant poll should retrieve session parameters immediately after creator distribution"
-                    ),
-                },
-                _ => panic!("unexpected session-parameters poll response"),
-            }
-        }
-
-        fn participant_generate_plan(
-            persister: &InMemoryPersister<MultipartySessionEvent>,
-            funded_wallet: &FundedParticipantWallet,
-            output_value: Amount,
-        ) -> Result<(), BoxSendSyncError> {
-            let (participant_state, _) = replay_event_log(persister)?;
-            let participant = match participant_state {
-                MultipartySession::ParticipantHasSessionParameters(state) => state,
-                _ => panic!("participant must have session parameters before generating a plan"),
-            };
-
-            let (inputs, outputs) = funded_wallet.registration(output_value)?;
-            participant.generate_plan(inputs, outputs).save(persister)?;
-
-            Ok(())
         }
 
         async fn participant_execute_plan(
@@ -558,17 +497,13 @@ mod integration {
             .map_err(|e| -> BoxSendSyncError { e.to_string().into() })?;
             let mut wallets = wallets.into_iter();
             let responder_a_wallet = FundedParticipantWallet::new(
-                "responder_a",
                 wallets.next().expect("responder_a wallet must exist"),
             );
             let responder_b_wallet = FundedParticipantWallet::new(
-                "responder_b",
                 wallets.next().expect("responder_b wallet must exist"),
             );
-            let creator_wallet = FundedParticipantWallet::new(
-                "creator_wallet",
-                wallets.next().expect("creator wallet must exist"),
-            );
+            let creator_wallet =
+                FundedParticipantWallet::new(wallets.next().expect("creator wallet must exist"));
 
             // Coordinator registry: one initiator wallet indexes every session log it orchestrates.
             let mut registry = InMemoryMultipartyRegistry::new();
@@ -608,70 +543,65 @@ mod integration {
             initiator_poll_reply_key(&agent, &initiator_a_persister, &ohttp_relay).await?;
             initiator_poll_reply_key(&agent, &initiator_b_persister, &ohttp_relay).await?;
 
-            let (creator_persister, mut creator) =
+            let (creator_persister, _) =
                 SessionCreatorBuilder::build_and_promote(&registry, expected_params.clone())?
                     .save(&mut registry)?;
-
-            // Distribute session parameters to responders
-            loop {
-                let Some((message, req, ctx)) =
-                    creator.next_session_parameters_distribution_message(&ohttp_relay)?
-                else {
-                    break;
-                };
-                let body = send_ohttp_request(&agent, req).await?;
-                let delivery = creator
-                    .process_session_parameters_distribution_response(message.recipient, &body, ctx)
-                    .save(&creator_persister)?;
-                match delivery {
-                    ParametersDelivery::Collecting(next) => creator = next,
-                    ParametersDelivery::Distributed(_) => break,
-                }
-            }
-
-            let participant_a_persister = participant_poll_session_parameters(
-                &agent,
-                &mut responder_a_registry,
-                &responder_a_persister,
-                &ohttp_relay,
-                &expected_params,
-            )
-            .await?;
-            let participant_b_persister = participant_poll_session_parameters(
-                &agent,
-                &mut responder_b_registry,
-                &responder_b_persister,
-                &ohttp_relay,
-                &expected_params,
-            )
-            .await?;
 
             // Each wallet funds a single 50 BTC input. The outputs are individually
             // unbalanced but sum to the 150 BTC total, so registration only
             // completes once all three pool — forcing every participant to sign the
             // full collaborative transaction rather than its own input in isolation.
-            participant_generate_plan(
-                &participant_a_persister,
-                &responder_a_wallet,
-                Amount::from_int_btc(40),
-            )?;
-            participant_generate_plan(
-                &participant_b_persister,
-                &responder_b_wallet,
-                Amount::from_int_btc(40),
-            )?;
-            participant_generate_plan(
-                &creator_persister,
-                &creator_wallet,
-                Amount::from_int_btc(70) - Amount::from_sat(308),
-            )?;
+            let participant_a_out = Amount::from_int_btc(40);
+            let participant_b_out = Amount::from_int_btc(40);
+            let creator_out = Amount::from_int_btc(70) - Amount::from_sat(308);
 
-            // Each participant signs with its own wallet; any node client can relay
-            // the shared finalized transaction.
-            let signer_a = WalletSigner { wallet: &responder_a_wallet.client };
-            let signer_b = WalletSigner { wallet: &responder_b_wallet.client };
-            let signer_creator = WalletSigner { wallet: &creator_wallet.client };
+            // Each participant selects its registration and signs with its own
+            // wallet; any node client can relay the shared finalized transaction.
+            let signer_a = WalletSigner {
+                wallet: &responder_a_wallet.client,
+                output_value: participant_a_out,
+            };
+            let signer_b = WalletSigner {
+                wallet: &responder_b_wallet.client,
+                output_value: participant_b_out,
+            };
+            let signer_creator =
+                WalletSigner { wallet: &creator_wallet.client, output_value: creator_out };
             let broadcaster = NodeBroadcaster { node: &creator_wallet.client };
+
+            // Bootstrap driver: distribute parameters (creator), poll for them
+            // (responders), then build each plan out of the wallet's registration.
+            // The creator goes first so the responders' polls find their parameters
+            // already posted. Each call returns the open log now sitting at `HasPlan`.
+            let sender = ReqwestSender::new((*agent).clone());
+            let relay_url = Url::parse(&ohttp_relay)?;
+            let creator_persister = drive_to_plan(
+                &mut registry,
+                creator_persister,
+                &sender,
+                &signer_creator,
+                relay_url.clone(),
+            )
+            .await?;
+            // Clone the awaiting persisters in: adoption graduates to a fresh log
+            // (the returned `participant_*_persister`), leaving the original handle
+            // pointing at the now-closed awaiting log for the assertions below.
+            let participant_a_persister = drive_to_plan(
+                &mut responder_a_registry,
+                responder_a_persister.clone(),
+                &sender,
+                &signer_a,
+                relay_url.clone(),
+            )
+            .await?;
+            let participant_b_persister = drive_to_plan(
+                &mut responder_b_registry,
+                responder_b_persister.clone(),
+                &sender,
+                &signer_b,
+                relay_url,
+            )
+            .await?;
 
             // Drive the three participants concurrently: each `execute_plan` blocks
             // until every contribution is in, so they must make progress together.

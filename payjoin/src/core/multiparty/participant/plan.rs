@@ -207,6 +207,26 @@ impl PlanBuilder {
 pub struct Plan(Vec<ScheduledAction>);
 
 impl Plan {
+    /// Build a plan registering `candidate_inputs` and `payment_obligations`.
+    ///
+    /// This is the assembly step a participant runs *outside* the state machine:
+    /// coin selection and output policy live in the caller, and the finished plan
+    /// is then handed to
+    /// [`Participant::<HasSessionParameters>::provide_plan`](super::Participant::provide_plan).
+    pub fn from_registration(
+        candidate_inputs: impl IntoIterator<Item = InputPair>,
+        payment_obligations: impl IntoIterator<Item = bitcoin::TxOut>,
+    ) -> Self {
+        let mut builder = PlanBuilder::new();
+        for input in candidate_inputs {
+            builder = builder.add_input(input);
+        }
+        for output in payment_obligations {
+            builder = builder.add_output(output);
+        }
+        builder.build()
+    }
+
     pub fn action(&self, index: usize) -> Option<&Action> {
         self.0.get(index).map(|scheduled| &scheduled.action)
     }

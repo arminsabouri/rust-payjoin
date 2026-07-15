@@ -16,7 +16,9 @@ use payjoin::multiparty::{
 use payjoin::{HpkeKeyPair, IntoUrl, IntoUrlError, OhttpKeys, Request, Url};
 use reqwest::Client;
 
+use crate::adapters::ReqwestSender;
 use crate::mailbox::CollaborativeMessageSet;
+use crate::request_sender::RequestSender;
 
 /// Session keys needed to reach one shared mailbox on the Payjoin Directory.
 #[derive(Debug, Clone)]
@@ -32,7 +34,7 @@ struct SharedMailboxCoordinates {
 /// HPKE sealing/decryption, directory addressing, and HTTP.
 #[derive(Clone)]
 pub struct DirectoryMailbox {
-    client: Client,
+    sender: ReqwestSender,
     ohttp_relay: Url,
     coords: SharedMailboxCoordinates,
     /// Parsed PSBT fragments already read and persisted for this session.
@@ -62,7 +64,7 @@ impl DirectoryMailbox {
         fragments_read: usize,
     ) -> Result<Self, DirectoryMailboxError> {
         Ok(Self {
-            client,
+            sender: ReqwestSender::new(client),
             ohttp_relay: ohttp_relay.into_url()?,
             coords: SharedMailboxCoordinates {
                 directory: directory.into_url()?,
@@ -75,19 +77,7 @@ impl DirectoryMailbox {
     }
 
     async fn post(&self, request: Request) -> Result<Vec<u8>, DirectoryMailboxError> {
-        let response = self
-            .client
-            .post(request.url)
-            .header("Content-Type", request.content_type)
-            .body(request.body)
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            return Err(DirectoryMailboxError::Http(
-                response.error_for_status().expect_err("non-success status"),
-            ));
-        }
-        Ok(response.bytes().await?.to_vec())
+        self.sender.send(request).await.map_err(DirectoryMailboxError::Http)
     }
 
     /// Long-poll the directory for PSBT fragments past the persisted cursor.
